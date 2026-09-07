@@ -13,6 +13,8 @@ foreach ($file in @('Start.cmd', 'Start-GUI.cmd', 'RunBackground.ps1', 'Configur
     Copy-Item "$PSScriptRoot/$file" $destination
 }
 Copy-Item "$root/README.md", "$root/LICENSE" $destination
+New-Item -ItemType Directory -Force "$destination/docs" | Out-Null
+Copy-Item "$root/docs/*" "$destination/docs"
 $runtime = Get-Content "$destination/ConnectorWatch.Gui.runtimeconfig.json" -Raw | ConvertFrom-Json
 $cache = if ($env:NUGET_PACKAGES) { $env:NUGET_PACKAGES } else { Join-Path $env:USERPROFILE '.nuget/packages' }
 foreach ($framework in $runtime.runtimeOptions.includedFrameworks) {
