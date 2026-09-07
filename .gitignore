@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+dist/
+artifacts/
+**/data/
+*.user
+*.suo
+.vs/
+config.local.json
+*.log

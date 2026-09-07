@@ -1,0 +1,120 @@
+# ConnectorWatch
+
+ConnectorWatch is an experimental Windows monitor for the 16-pin input-voltage trend of a supported RTX 5090 setup. It consists of a Windows WPF dashboard and a headless .NET 8 daemon. The daemon owns all GPU access, records timestamped telemetry, and evaluates voltage changes within comparable load bands. The dashboard reads the daemon's files and control endpoint.
+
+Release **v1.1.1** is experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Other units of the same board family are experimental, multi-GPU systems fail closed, and other boards or driver versions are unsupported by the direct reader.
+
+![Synthetic dashboard preview](docs/dashboard.png)
+
+*Synthetic preview; it does not show a live hardware reading.*
+
+ConnectorWatch is a voltage trend logger, not a connector-safety detector. Aggregate voltage can remain normal while one contact overheats. The program cannot measure per-pin current, connector temperature, contact resistance, or fast transients, and it cannot guarantee a warning before damage. It does not tune the GPU, change power limits, write hardware settings, or shut down the computer.
+
+Licensed under [MIT](LICENSE). Bundled Microsoft .NET runtimes retain their own licenses and notices in the package's `licenses` directory.
+
+## Download and first run
+
+Download the Windows archive from [GitHub Releases](https://github.com/Shaderx/ConnectorWatch/releases). Extract the complete archive to a directory you control; the package is portable and includes the .NET 8 runtime. A compatible NVIDIA Windows driver is still required for NVML and the direct reader.
+
+Find the UUID of the GPU you intend to monitor in PowerShell:
+
+```powershell
+nvidia-smi --query-gpu=uuid --format=csv,noheader
+```
+
+Copy the UUID for the single GPU into `config.json`. The public sample intentionally leaves the value blank and selects the direct source:
+
+```json
+{
+  "GpuUuid": "",
+  "SampleSeconds": 1,
+  "DataDirectory": "data",
+  "DesktopAlerts": true,
+  "VoltageSource": "direct"
+}
+```
+
+Keep the rest of the package's configuration fields when editing the file. `GpuUuid` is required, and `VoltageSource` must remain `direct` for the validated native path. Do not start the daemon until the UUID has been filled in. Only one daemon may write to a data directory.
+
+Start the dashboard with `ConnectorWatch.Gui.exe` or `Start-GUI.cmd`. It starts one hidden daemon when the data directory is not already owned and attaches to an existing compatible daemon when one is running. To run without a window, start `ConnectorWatch.exe`, `Start.cmd`, or `RunBackground.ps1` from the extracted directory. The headless executable has no tray icon.
+
+Pressing **X** or **Alt+F4** hides the dashboard in the notification area; monitoring continues. Use the tray menu or double-click the icon to restore it. **Exit GUI — keep monitoring** closes the dashboard and leaves the daemon running. **Stop monitoring and exit** requests a graceful daemon stop and waits for its stopped state.
+
+Startup registration is opt-in and is not installed by the release. The dashboard's Settings page can register the GUI or background monitor for the current Windows account, or disable startup. The equivalent package commands are:
+
+```powershell
+.\Configure-Startup.ps1 -Mode Gui
+.\Configure-Startup.ps1 -Mode Monitor
+.\Configure-Startup.ps1 -Mode Remove
+```
+
+Registration does not request elevation. If Windows rejects it, the dashboard reports the error.
+
+## Dashboard and recorded data
+
+The live cards show 16-pin voltage, connector or comparison power, PCIe voltage, and the change from the current reference. History can show 15 minutes, one hour, or 24 hours, with an optional PCIe overlay. Missing readings remain gaps. Minima and maxima are preserved so short dips are not hidden by display averaging. Hover over a point for its exact observation. Open a warning to inspect the time at which it occurred, then use **Back to live** to return to the current range.
+
+The histogram counts distinct voltage samples in the selected load bin and time range. It excludes settling and other ineligible analysis states. Saved median and fifth-percentile markers are shown when available. **All loads** is a descriptive distribution that includes idle samples and does not compare them with a reference. The histogram does not invent a reference distribution from summary statistics.
+
+Warnings describe the detector's comparison state, such as baseline learning, a baseline shift, a sudden droop, a gap, or unavailable voltage. Acknowledging a warning only marks it read; it does not clear the active condition or alter detector settings. **View all** expands the loaded warning list. **Export visible CSV** exports the observations represented by the selected history view.
+
+The daemon writes these files under `DataDirectory`:
+
+| File | Purpose |
+| --- | --- |
+| `telemetry-YYYY-MM-DD.csv` | UTC observations, NVML telemetry, voltage-source values, analysis fields, and detector status |
+| `status.json` | Most recent complete state, including timestamps and stopped state |
+| `events.csv` | Status transitions and details |
+| `baseline.json` | Persisted reference identity and per-bin learning data |
+| `monitor.lock` | Single-writer guard for the data directory |
+
+The dashboard shows stale or stopped readings as unavailable. It records monitoring loss separately, including when the native daemon terminates. Windows notification settings can suppress tray notifications; the dashboard banner and warning history remain available. When the dashboard owns presentation, only one GUI receives the daemon's heartbeat lease. If it exits unexpectedly, the daemon resumes headless warnings, including for an active warning that began while the GUI owned presentation.
+
+## How the detector should be read
+
+The default analyzer uses 25 W load bins, ignores analysis below 100 W, and waits for five successive fresh samples in a bin. The first 300 eligible readings learn a reference median and fifth percentile for each bin. After learning, the rolling window contains at most 60 eligible readings no older than 30 minutes. The example thresholds are a 0.20 V sustained median or fifth-percentile loss, and a 0.25 V single-reading sudden droop, with five consecutive eligible updates required for a sustained alert.
+
+These thresholds are comparison settings, not electrical safety limits. Recheck a change at similar steady power and temperature. A source gap, restart, repeated timestamp, or load transition interrupts continuity and requires settling again. A saved reference belongs to its source, GPU, and configuration; archive `baseline.json` deliberately after changing a cable, PSU, sensor, GPU, or analysis configuration instead of resetting it merely to silence an alert.
+
+The direct reader is guarded by the target identity and topology checks described in [the architecture](docs/ARCHITECTURE.md). Its native setup is fail-closed: a rejected identity, multiple GPUs, incompatible driver or board, missing library, failed initialization, or possible native timeout records voltage as unavailable and does not retry or silently switch sources. NVML sensor fields that fail independently are left blank. The daemon never converts GPU core voltage or total board power into a connector-voltage measurement.
+
+## Build, publish, and offline checks
+
+The public source tree is organized as follows:
+
+```text
+src/ConnectorWatch       .NET 8 headless daemon and native reader
+src/ConnectorWatch.Gui   Windows WPF dashboard and tray host
+scripts/Publish.ps1      self-contained Windows package publisher
+dist/ConnectorWatch-win-x64
+```
+
+Build from a Windows machine with the .NET 8 SDK. The source projects use the checked-in NuGet configuration; the publish script creates the self-contained package under `dist/ConnectorWatch-win-x64`.
+
+```powershell
+dotnet build .\src\ConnectorWatch\ConnectorWatch.csproj -c Release --configfile .\src\ConnectorWatch\NuGet.Config
+dotnet build .\src\ConnectorWatch.Gui\ConnectorWatch.Gui.csproj -c Release --configfile .\src\ConnectorWatch.Gui\NuGet.Config
+.\scripts\Publish.ps1
+```
+
+The daemon self-test is offline and does not load NVML or touch a GPU:
+
+```powershell
+dotnet run --project .\src\ConnectorWatch\ConnectorWatch.csproj -- --self-test
+```
+
+The WPF demo and UI self-test use synthetic data and do not attach to a live daemon:
+
+```powershell
+dotnet run --project .\src\ConnectorWatch.Gui\ConnectorWatch.Gui.csproj -- --demo --ui-self-test --test-output .\gui-tests.json
+```
+
+See [docs/VALIDATION.md](docs/VALIDATION.md) for the tested behavior and the limits of those checks. A passing offline self-test does not validate a user's GPU, driver, cabling, connector, or public release build.
+
+## Support boundary
+
+The direct native path is intended for Windows x64 and retains the validated hardware identity `PCI0x2B8510DE`, subsystem `0x89EE1043`, with NVIDIA driver `616.56`. The physically validated scope is one ASUS TUF RTX 5090 configuration. Same-board units are experimental until independently checked. Multiple GPUs fail closed. Other boards and other driver versions are unsupported by the direct path and must not be treated as compatible because the card name looks similar.
+
+The daemon's managed NVML telemetry core is portable in principle and can be built for other platforms, but this release supplies the Windows WPF GUI and the Windows direct rail reader. A Linux build may retain ordinary NVML logging where the driver provides `libnvidia-ml.so.1`; it does not provide the Windows native rail path or a Linux GUI.
+
+HWiNFO CSV and newline-delimited JSON are optional source adapters in the daemon for separately validated integrations. They are not a substitute for proving that a value represents the 16-pin input rail. Keep source timestamps and freshness visible when evaluating any external adapter.

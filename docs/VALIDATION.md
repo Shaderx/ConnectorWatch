@@ -1,0 +1,69 @@
+# Validation and release limits
+
+ConnectorWatch v1.1.1 is an experimental release. The checks below describe what can be reproduced offline from the source tree and what remains outside that evidence. A public build is not declared hardware-tested here; hardware validation must be confirmed separately for the exact published artifact and machine.
+
+## Reproduce the offline checks
+
+Run these commands from the repository root on Windows with the .NET 8 SDK:
+
+```powershell
+dotnet run --project .\src\ConnectorWatch\ConnectorWatch.csproj -- --self-test
+dotnet run --project .\src\ConnectorWatch.Gui\ConnectorWatch.Gui.csproj -- --demo --ui-self-test --test-output .\gui-tests.json
+```
+
+The daemon self-test uses parser, analysis, persistence, control, and native-decoder fixtures. It does not initialize NVML, load NVAPI, invoke the direct reader, or query a GPU. The GUI command uses synthetic demo data and checks dashboard/tray behavior without attaching to a live daemon. These are safe offline checks; they do not prove that a physical sensor source is correct.
+
+The current offline results are passing: the daemon control/ABI suite and 21 behavioral checks pass, including zero-device, multiple-device, and error cases for the identity gate; 24 GUI regression checks pass; and seven synthetic UI/tray lifecycle checks pass, including stale-card handling. These results cover the source-tree test runs and do not certify every packaged artifact.
+
+To make a release package after the source checks pass:
+
+```powershell
+.\scripts\Publish.ps1
+```
+
+The intended self-contained output is `dist/ConnectorWatch-win-x64`. The package must be reviewed as a release artifact before making any hardware claim.
+
+## Validation matrix
+
+| Area | Evidence covered by the repository checks | Boundary |
+| --- | --- | --- |
+| Configuration | Required UUID, source mode, numeric ranges, and conflicting source settings are rejected | Does not verify that a user's UUID selects the intended card |
+| NVML telemetry | Managed read and unavailable-field handling are exercised through offline seams | No GPU or driver is loaded by the offline suite |
+| Voltage input | HWiNFO CSV and newline-delimited JSON parsing, freshness, timestamps, gaps, and malformed rows are covered | A parsed value is not proof that the external sensor measures the connector |
+| Direct decoder | ABI fixtures, buffer-size checks, canaries, metadata, freshness markers, and worker timeout ownership are covered offline | The direct native provider still requires the supported Windows board/driver and separate physical validation |
+| Detector | Bin learning, stable-sample gating, persisted references, rolling windows, percentile markers, gaps, repeated timestamps, and threshold transitions are covered | Thresholds are comparisons, not safety limits |
+| Files | Atomic status, daily telemetry, transition events, baseline identity, and single-writer behavior are covered | Disk retention is manual and can grow until archived or deleted |
+| GUI | Synthetic history, histogram eligibility, warning acknowledgement, bounds, truncation, unavailable state, close-to-tray, reopen, and tray lifecycle are covered | WPF rendering and Windows notification behavior can vary by framework and host |
+| Memory hardening | Bounded buffers, FIFO identifier sets, large-record handling, locked-file recovery, pooled history reads, redraw retention, and native worker behavior are covered in finite tests | These tests are not a multi-day driver or WPF reliability certification |
+
+## Memory-hardening results
+
+The 8 September 2026 hardening pass compared the previous and bounded history readers with the same generated input. Both retained 132,626 samples after loading and repeated refreshes. The measured component peaks were:
+
+| Metric | Previous reader | Hardened reader |
+| --- | ---: | ---: |
+| Peak resident memory | 355.6 MiB | 129.7 MiB |
+| Peak private memory | 340.5 MiB | 111.1 MiB |
+| Managed allocation during load | 683.7 MiB | 459.4 MiB |
+| Retained managed memory after collection | 49.7 MiB | 49.5 MiB |
+| Initial load plus six refreshes | 878 ms | 773 ms |
+
+The streaming fixture was capped at 200,000 samples while 200,000 additional synthetic rows were appended. Retained memory stopped following record count. One hundred synthetic WPF redraws kept retained managed memory near 34.5 MiB with 1,633 handles in the measured batches; whole-process residency still rose as framework/rendering caches and heap residency were included.
+
+The native worker reproduction showed the old per-call-thread path at 518 handles before forced collection after 100 calls, versus 233 for the hardened worker. The hardened worker measured 239 before forced collection after 1,000 calls and 233 after collection. This supports removal of the reproduced per-poll growth pattern; it is not proof that every driver or framework allocation is leak-free.
+
+The production limits behind those results include bounded sample and warning insertion, 4,000 notification IDs, 2,000 acknowledgement IDs, 200 GUI monitoring-loss entries, a bounded initial history tail, pooled 16 KiB reads, an 8 MiB per-file refresh budget, and rejection of records over 256 KiB. Older telemetry remains in the original files, so disk retention still requires deliberate operator management.
+
+## Physical support boundary
+
+The only physically validated native target is one ASUS TUF RTX 5090 configuration on Windows x64 with NVIDIA driver `616.56` and the exact native identity `PCI0x2B8510DE`, subsystem `0x89EE1043`. That scope does not certify every card sold under the same product name. Same-board units are experimental until independently checked. Multiple GPUs fail closed. Other boards and driver versions are unsupported by the direct reader.
+
+A bounded read-only smoke check of the public source on that original ASUS TUF RTX 5090/driver combination produced three valid native samples and exited cleanly with exit code 0 and `stopped=true`, `stop_reason=sample_limit`. No production monitor remained running afterward. This finite check does not validate other boards, other driver versions, multi-GPU systems, long-duration operation, or every release-package build.
+
+The public configuration requires the operator's UUID and uses the single-GPU guard in both the NVML and NVAPI paths. The source contains no machine-specific UUID allowlist. A direct setup failure, rejected identity, incompatible driver, possible native timeout, or multiple-GPU topology becomes `VOLTAGE_UNAVAILABLE`; setup is not retried and the daemon does not silently continue with a different provider.
+
+## What these checks cannot establish
+
+No offline or aggregate-voltage check can establish per-pin current balance, connector contact temperature, contact resistance, or protection before a burned connector. GPU temperature is not connector temperature. Total board power includes slot power, and one-hertz samples can miss a transient. A normal status means only that the configured comparison did not trip under the observed conditions.
+
+The repository checks also do not certify long-duration operation across NVIDIA driver updates, arbitrary WPF/runtime versions, sleep/resume cycles, unexpected power loss, or a public package that has not yet been confirmed on the target machine. Revalidate the exact package, board, driver, source timestamp, and cabling before relying on it.

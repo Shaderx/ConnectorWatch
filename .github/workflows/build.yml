@@ -1,0 +1,38 @@
+name: Build and offline tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Daemon offline tests
+        run: dotnet run --project src/ConnectorWatch -c Release -- --self-test
+      - name: GUI offline tests
+        shell: pwsh
+        run: |
+          dotnet build src/ConnectorWatch.Gui -c Release
+          if ($LASTEXITCODE -ne 0) { throw 'GUI build failed' }
+          $p = Start-Process src/ConnectorWatch.Gui/bin/Release/net8.0-windows/ConnectorWatch.Gui.exe -ArgumentList '--self-test --test-output gui-tests.json' -Wait -PassThru -WindowStyle Hidden
+          if ($p.ExitCode -ne 0) { throw (Get-Content gui-tests.json -Raw) }
+      - name: Publish Windows package
+        shell: pwsh
+        run: ./scripts/Publish.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ConnectorWatch-win-x64
+          path: dist/ConnectorWatch-win-x64/
+  portable-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: dotnet run --project src/ConnectorWatch -c Release -- --self-test

@@ -1,0 +1,70 @@
+# ConnectorWatch architecture
+
+ConnectorWatch is split into a headless .NET 8 daemon and a Windows WPF presentation process. The daemon is the only process that owns GPU and voltage-source reads. The GUI consumes persisted telemetry and a small current-user control protocol; it does not call NVML, NVAPI, or the native rail ABI.
+
+```mermaid
+flowchart LR
+    C[config.json<br/>GPU UUID + source] --> D[ConnectorWatch daemon]
+    D --> N[NVML telemetry<br/>power, temperature, utilization, limit]
+    D --> V[Voltage provider]
+    V --> R[Direct NVIDIA rail reader]
+    V --> H[Optional HWiNFO CSV]
+    V --> J[Optional RailJson adapter]
+    N --> A[Load-binned analyzer]
+    V --> A
+    A --> P[(data/ CSV, status, events, baseline)]
+    D --> Q[Current-user control pipe]
+    P --> G[ConnectorWatch.Gui WPF dashboard]
+    Q --> G
+    G --> T[Tray, charts, warnings, settings]
+```
+
+## Daemon
+
+At each sample, the daemon reads NVML board power, temperature, utilization, and requested power limit for the configured GPU UUID. A voltage provider supplies the 16-pin input voltage and, where the source exposes it, a contemporaneous power value and source timestamp. The provider's values remain distinct from GPU core voltage and from PCIe slot voltage.
+
+The default public configuration selects `VoltageSource: "direct"`. The daemon also contains explicit adapters for HWiNFO CSV and newline-delimited JSON. `auto` can be used by an advanced operator who has deliberately configured an external source; an explicit source does not silently change to another provider. A source value is accepted only when its timestamp is fresh and its required fields are valid. Missing or stale values create a monitoring gap instead of a fabricated sample.
+
+The analyzer groups eligible samples into 25 W bins. It waits for stable samples after a load transition, learns a per-bin median and fifth percentile, persists that reference identity, then compares a rolling window of current samples with the saved reference. The analysis result is written beside the raw observation so a consumer can distinguish an observed value, an approximate NVML-aligned value, a gap, and an alert state.
+
+The daemon appends daily telemetry and transition events, atomically replaces `status.json`, and periodically persists `baseline.json`. A lock file prevents multiple writers from using one data directory. On a clean signal, control stop, or finite sample run it marks the status as stopped and saves the reference. File and terminal voltage-source failures are surfaced as process failure; the logger does not continue while claiming that monitoring is live.
+
+## Direct native reader and identity gates
+
+The direct reader is a narrow Windows x64 provider for the validated NVIDIA path. Its retained native identity is:
+
+- PCI identity `PCI0x2B8510DE`;
+- subsystem identity `0x89EE1043`;
+- NVIDIA driver version `616.56`.
+
+The public source does not embed a machine-specific GPU UUID. The user supplies a UUID in `config.json`. Before a direct read is allowed, the managed NVML path and the native NVAPI path apply the single-GPU guard and verify that the configured GPU is the device being served. The guard uses NVML's device-count and UUID query surface; see the [official NVML device queries](https://docs.nvidia.com/deploy/nvml-api/group__nvmlDeviceQueries.html). Multiple visible GPUs fail closed, even if one of them has a familiar model name. The identity checks also reject an unsupported board or driver before any rail call.
+
+Native setup is one-shot. If the driver library is missing, the identity gate fails, initialization returns an unsupported result, or a native call cannot complete within the bounded wait, the daemon records `VOLTAGE_UNAVAILABLE` and stops. It does not retry the setup, fall through after a possible native timeout, unload a library while an in-flight call may still own its buffers, or write a hardware setting. This preserves a clear boundary between a verified direct source and an unavailable one.
+
+The reader's decoder is guarded by request sizes, canaries, expected metadata, and freshness markers. Native work runs through a bounded worker path. A completed call disposes its task resources; an in-flight timed-out call retains ownership until it completes. This is a safety boundary for the process and does not establish a hardware freshness guarantee.
+
+## GUI and control protocol
+
+The WPF process loads the configured data directory, reads the newest bounded portion of daily files, and displays the latest status, history, distributions, and warnings. It can start a hidden daemon when the data directory is free, attach to an existing compatible daemon, or show an unavailable/read-only state. The control endpoint is current-user scoped and carries protocol/version, process, instance, data-directory, and lease information so a second GUI cannot become a competing presentation owner.
+
+The GUI's five-second heartbeat lease controls who presents desktop warnings. If the lease expires, the daemon resumes headless presentation for an active warning. Closing the dashboard releases old chart snapshots while the daemon continues to record data. The dashboard's local placement, range, acknowledgements, and monitoring-loss events are separate from the persisted detector baseline.
+
+History loading is bounded. The GUI considers at most the newest two daily files, caps the initial tail per file, caps retained voltage observations and warning records, rejects oversized records, and reads with pooled chunks. It preserves gaps and reports truncation in the UI. Identifier sets use FIFO bounds, chart brushes are reused and frozen, and warning controls are rebuilt only when their contents change. These limits bound application-owned collections; they do not promise that Windows, WPF, or a future driver has no unrelated cache growth.
+
+## Analysis and persistence contract
+
+The main files are:
+
+| File | Producer | Consumer | Contract |
+| --- | --- | --- | --- |
+| `telemetry-YYYY-MM-DD.csv` | daemon | GUI and offline tools | raw UTC observations plus source, comparison, reference, rolling, and status fields |
+| `status.json` | daemon | GUI, scripts, operators | latest complete state; inspect its timestamp and `stopped` flag |
+| `events.csv` | daemon | GUI and operators | status transitions and details |
+| `baseline.json` | daemon | analyzer | source/GPU/config identity and per-bin reference state |
+| `monitor.lock` | daemon | daemon | single-writer coordination |
+
+The GUI does not infer a reference distribution from aggregate statistics. Its histogram counts eligible stored observations, while its graph keeps missing periods as gaps. Acknowledging a warning is presentation state only; it cannot mutate the analyzer, source, or threshold.
+
+## Trust and physical limits
+
+The native decoder's validated scope is one ASUS TUF RTX 5090 setup. Same-board units are experimental; other boards and drivers are unsupported for direct rails. Aggregate board input voltage can show a trend but cannot locate a hot contact or distinguish current among contacts. GPU temperature is not connector temperature, total board power includes slot-supplied power, and one-hertz observations can miss fast transients. No status value certifies connector safety.
