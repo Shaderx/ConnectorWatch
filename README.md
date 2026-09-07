@@ -2,7 +2,7 @@
 
 ConnectorWatch is an experimental Windows monitor for the 16-pin input-voltage trend of a supported RTX 5090 setup. It consists of a Windows WPF dashboard and a headless .NET 8 daemon. The daemon owns all GPU access, records timestamped telemetry, and evaluates voltage changes within comparable load bands. The dashboard reads the daemon's files and control endpoint.
 
-Release **v1.1.2** is experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Other units of the same board family are experimental, multi-GPU systems fail closed, and other boards or driver versions are unsupported by the direct reader.
+Release **v1.1.3** is experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Other units of the same board family are experimental, multi-GPU systems fail closed, and other boards or driver versions are unsupported by the direct reader.
 
 ![Synthetic dashboard preview](docs/dashboard.png)
 
@@ -16,13 +16,15 @@ Licensed under [MIT](LICENSE). Bundled Microsoft .NET runtimes retain their own 
 
 Download the Windows archive from [GitHub Releases](https://github.com/Shaderx/ConnectorWatch/releases). Extract the complete archive to a directory you control; the package is portable and includes the .NET 8 runtime. A compatible NVIDIA Windows driver is still required for NVML and the direct reader.
 
-Find the UUID of the GPU you intend to monitor in PowerShell:
+For a single NVIDIA GPU, leave `GpuUuid` blank (the default) or set it to `"auto"`, then launch the GUI. The daemon detects the UUID using NVML; no manual configuration or nvidia-smi command is needed. Sensor details shows the resolved UUID. Detection does not modify config.json, and all native board/driver restrictions still apply. Zero or multiple NVIDIA GPUs fail closed in automatic mode.
+
+To pin an explicit UUID instead, find it in PowerShell:
 
 ```powershell
 nvidia-smi --query-gpu=uuid --format=csv,noheader
 ```
 
-Copy the UUID for the single GPU into `config.json`. The public sample intentionally leaves the value blank and selects the direct source:
+Optionally copy that UUID into `config.json`. The public sample selects automatic GPU detection and the direct source:
 
 ```json
 {
@@ -34,7 +36,7 @@ Copy the UUID for the single GPU into `config.json`. The public sample intention
 }
 ```
 
-Keep the rest of the package's configuration fields when editing the file. `GpuUuid` is required, and `VoltageSource` must remain `direct` for the validated native path. Do not start the daemon until the UUID has been filled in. Only one daemon may write to a data directory.
+Keep the rest of the package's configuration fields when editing the file. `VoltageSource` must remain `direct` for the validated native path. An explicit UUID bypasses automatic selection; it does not enable multi-GPU support for direct rails. Only one daemon may write to a data directory.
 
 Start the dashboard with `ConnectorWatch.Gui.exe` or `Start-GUI.cmd`. It starts one hidden daemon when the data directory is not already owned and attaches to an existing compatible daemon when one is running. To run without a window, start `ConnectorWatch.exe`, `Start.cmd`, or `RunBackground.ps1` from the extracted directory. The headless executable has no tray icon.
 

@@ -47,7 +47,7 @@ public sealed class Config
             MinAnalysisWatts < 0 || StableSamples < 1 || BaselineSamples < 5 || BaselineSamples > 10000 ||
             WindowSamples < 3 || WindowSamples > 3600 || WindowMaxAgeSeconds < 1 ||
             ShiftVolts <= 0 || SuddenDroopVolts <= 0 || SustainSamples < 1 ||
-            MaxAgeSeconds < 1 || Delimiter.Length != 1 || string.IsNullOrWhiteSpace(GpuUuid) ||
+            MaxAgeSeconds < 1 || Delimiter.Length != 1 ||
             (HwinfoCsv.Length > 0 && RailJson.Length > 0))
             throw new Exception("Invalid configuration; check numeric ranges and GPU UUID.");
         if (!new[] { "auto", "direct", "nvapi", "hwinfo", "json", "none" }
@@ -87,6 +87,42 @@ public sealed class Nvml : IDisposable
 
     [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)] static extern int nvmlInit_v2();
     [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)] static extern int nvmlShutdown();
+    [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)] static extern int nvmlDeviceGetCount_v2(out uint count);
+    [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)] static extern int nvmlDeviceGetHandleByIndex_v2(uint index, out IntPtr device);
+    [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)] static extern int nvmlDeviceGetUUID(IntPtr device, [Out] StringBuilder uuid, uint length);
+
+    internal static string ResolveUuid(string? configured, Func<string>? detect = null) =>
+        string.IsNullOrWhiteSpace(configured) || configured.Trim().Equals("auto", StringComparison.OrdinalIgnoreCase)
+            ? (detect ?? DetectSingleGpuUuid)() : configured.Trim();
+
+    internal static string SelectAutoUuid(uint count, Func<string> readUuid)
+    {
+        if (count != 1)
+            throw new Exception($"GPU UUID auto-detection requires exactly one NVIDIA GPU; found {count}. Set GpuUuid explicitly for a supported external source. Direct rails do not support multi-GPU systems.");
+        var uuid = readUuid().Trim();
+        if (!uuid.StartsWith("GPU-", StringComparison.Ordinal) || !Guid.TryParseExact(uuid[4..], "D", out _))
+            throw new Exception("NVML returned an invalid physical GPU UUID.");
+        return uuid;
+    }
+
+    static string DetectSingleGpuUuid()
+    {
+        if (nvmlInit_v2() != 0) throw new Exception("NVML initialization failed during GPU auto-detection.");
+        try
+        {
+            if (nvmlDeviceGetCount_v2(out var count) != 0) throw new Exception("NVML GPU enumeration failed.");
+            return SelectAutoUuid(count, () =>
+            {
+                if (nvmlDeviceGetHandleByIndex_v2(0, out var handle) != 0 || handle == IntPtr.Zero)
+                    throw new Exception("NVML could not open the detected GPU.");
+                var uuid = new StringBuilder(96);
+                if (nvmlDeviceGetUUID(handle, uuid, (uint)uuid.Capacity) != 0)
+                    throw new Exception("NVML could not read the detected GPU UUID.");
+                return uuid.ToString();
+            });
+        }
+        finally { nvmlShutdown(); }
+    }
     [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)] static extern int nvmlDeviceGetHandleByUUID([MarshalAs(UnmanagedType.LPStr)] string uuid, out IntPtr device);
     [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)] static extern int nvmlDeviceGetPowerUsage(IntPtr device, out uint value);
     [DllImport("nvml.dll", CallingConvention = CallingConvention.Cdecl)] static extern int nvmlDeviceGetPowerManagementLimit(IntPtr device, out uint value);
@@ -387,6 +423,12 @@ public static class Program
             using var shutdown = RegisterShutdown(stop);
             using var control = new ControlServer(data, stop);
             control.Start();
+            try { c.GpuUuid = Nvml.ResolveUuid(c.GpuUuid); }
+            catch (Exception ex)
+            {
+                return WriteStartupFailure(data, "GPU auto-detection", "GPU selection failed: " + ex.Message,
+                    control.InstanceId, new AnalysisProgress(0, c.BaselineSamples, 0, c.WindowSamples, 0, c.StableSamples));
+            }
             var sourceMode = c.VoltageSource.Trim().ToLowerInvariant();
             DirectNvRails? directSource = null;
             IVoltageSource? voltageSource = null;
@@ -502,6 +544,7 @@ public static class Program
                 var state = new
                 {
                     schema_version = 2,
+                    gpu_uuid = c.GpuUuid,
                     process_id = control.ProcessId,
                     instance_id = control.InstanceId,
                     timestamp_utc = now,

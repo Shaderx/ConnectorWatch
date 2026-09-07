@@ -84,7 +84,7 @@ jobs:
               exit 1
             fi
           else
-            gh release create "$TAG" --verify-tag --draft --prerelease --title "ConnectorWatch $TAG — experimental Windows release" --generate-notes --notes 'Experimental Windows x64 build. Configure your GPU UUID before launch. The direct reader remains restricted to the documented ASUS TUF RTX 5090 identity, driver 616.56, and one NVIDIA GPU. CI tests software behavior; it cannot validate hardware or guarantee warning before connector damage. See README.md and docs/VALIDATION.md.'
+            gh release create "$TAG" --verify-tag --draft --prerelease --title "ConnectorWatch $TAG — experimental Windows release" --generate-notes --notes 'Experimental Windows x64 build. GPU UUID detection is automatic for one NVIDIA GPU; an explicit UUID remains optional. The direct reader remains restricted to the documented ASUS TUF RTX 5090 identity, driver 616.56, and one NVIDIA GPU. CI tests software behavior; it cannot validate hardware or guarantee warning before connector damage. See README.md and docs/VALIDATION.md.'
           fi
           gh release upload "$TAG" ./*.zip SHA256SUMS.txt build-info.json --clobber
           gh release edit "$TAG" --draft=false --prerelease --latest=false

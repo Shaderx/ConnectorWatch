@@ -25,6 +25,7 @@ public sealed class Snapshot
     public string Status { get; set; } = "WAITING_FOR_DATA";
     public string Detail { get; set; } = "";
     public string Source { get; set; } = "";
+    public string GpuUuid { get; set; } = "";
     public double? Voltage { get; set; }
     public double? Pcie { get; set; }
     public double? Current { get; set; }
@@ -48,7 +49,7 @@ public sealed class Snapshot
     {
         using var doc = JsonDocument.Parse(text); var r = doc.RootElement;
         var s = new Snapshot { Time = Date(r, "timestamp_utc") ?? default, Stopped = r.TryGetProperty("stopped", out var stop) && stop.ValueKind == JsonValueKind.True,
-            Detail = Str(r, "detail"), Source = Str(r, "voltage_source"), Schema = (int)(Num(r, "schema_version") ?? 0) };
+            Detail = Str(r, "detail"), Source = Str(r, "voltage_source"), GpuUuid = Str(r, "gpu_uuid"), Schema = (int)(Num(r, "schema_version") ?? 0) };
         if (r.TryGetProperty("voltage", out var v) && v.ValueKind == JsonValueKind.Object)
         {
             s.Voltage = Num(v, "Volts"); s.Power = Num(v, "Power");

@@ -6,6 +6,21 @@ public static class Tests
     {
         int passed = 0;
         void Check(bool ok, string name) { if (!ok) throw new Exception("FAILED: " + name); passed++; }
+        const string fixtureUuid = "GPU-00000000-0000-0000-0000-000000000001";
+        foreach (var setting in new string?[] { null, "", "  ", "auto", " AUTO " })
+            Check(Nvml.ResolveUuid(setting, () => fixtureUuid) == fixtureUuid, "automatic GPU selection");
+        Check(Nvml.ResolveUuid(" " + fixtureUuid + " ", () => throw new Exception("Unexpected enumeration")) == fixtureUuid, "explicit UUID bypasses auto-detection");
+        Check(Nvml.SelectAutoUuid(1, () => fixtureUuid) == fixtureUuid, "single GPU auto-detected");
+        foreach (uint count in new uint[] { 0, 2, 64 })
+        {
+            bool read = false, rejected = false;
+            try { Nvml.SelectAutoUuid(count, () => { read = true; return fixtureUuid; }); } catch { rejected = true; }
+            Check(rejected && !read, "ambiguous or missing GPU rejected before UUID read");
+        }
+        bool malformed = false;
+        try { Nvml.SelectAutoUuid(1, () => "GPU-invalid"); } catch { malformed = true; }
+        Check(malformed, "malformed detected UUID rejected");
+        new Config().Validate();
         var c = new Config { StableSamples = 2, BaselineSamples = 5, WindowSamples = 3, SustainSamples = 2 };
         var a = new Analysis(c); var t = DateTimeOffset.UtcNow;
         Result Add(double w, double v) => a.Add(t = t.AddSeconds(1), w, v);

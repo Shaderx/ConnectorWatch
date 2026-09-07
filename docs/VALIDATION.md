@@ -27,7 +27,7 @@ The intended self-contained output is `dist/ConnectorWatch-win-x64`. The package
 
 | Area | Evidence covered by the repository checks | Boundary |
 | --- | --- | --- |
-| Configuration | Required UUID, source mode, numeric ranges, and conflicting source settings are rejected | Does not verify that a user's UUID selects the intended card |
+| Configuration | Automatic/explicit UUID selection, source mode, numeric ranges, and conflicting source settings are checked | Does not verify that a user's UUID selects the intended card |
 | NVML telemetry | Managed read and unavailable-field handling are exercised through offline seams | No GPU or driver is loaded by the offline suite |
 | Voltage input | HWiNFO CSV and newline-delimited JSON parsing, freshness, timestamps, gaps, and malformed rows are covered | A parsed value is not proof that the external sensor measures the connector |
 | Direct decoder | ABI fixtures, buffer-size checks, canaries, metadata, freshness markers, and worker timeout ownership are covered offline | The direct native provider still requires the supported Windows board/driver and separate physical validation |
@@ -60,10 +60,14 @@ The only physically validated native target is one ASUS TUF RTX 5090 configurati
 
 A bounded read-only smoke check of the public source on that original ASUS TUF RTX 5090/driver combination produced three valid native samples and exited cleanly with exit code 0 and `stopped=true`, `stop_reason=sample_limit`. No production monitor remained running afterward. This finite check does not validate other boards, other driver versions, multi-GPU systems, long-duration operation, or every release-package build.
 
-The public configuration requires the operator's UUID and uses the single-GPU guard in both the NVML and NVAPI paths. The source contains no machine-specific UUID allowlist. A direct setup failure, rejected identity, incompatible driver, possible native timeout, or multiple-GPU topology becomes `VOLTAGE_UNAVAILABLE`; setup is not retried and the daemon does not silently continue with a different provider.
+The public configuration defaults to automatic UUID detection and uses the single-GPU guard in both the NVML and NVAPI paths. The source contains no machine-specific UUID allowlist. A direct setup failure, rejected identity, incompatible driver, possible native timeout, or multiple-GPU topology becomes `VOLTAGE_UNAVAILABLE`; setup is not retried and the daemon does not silently continue with a different provider.
 
 ## What these checks cannot establish
 
 No offline or aggregate-voltage check can establish per-pin current balance, connector contact temperature, contact resistance, or protection before a burned connector. GPU temperature is not connector temperature. Total board power includes slot power, and one-hertz samples can miss a transient. A normal status means only that the configured comparison did not trip under the observed conditions.
 
 The repository checks also do not certify long-duration operation across NVIDIA driver updates, arbitrary WPF/runtime versions, sleep/resume cycles, unexpected power loss, or a public package that has not yet been confirmed on the target machine. Revalidate the exact package, board, driver, source timestamp, and cabling before relying on it.
+
+## v1.1.3 automatic UUID selection
+
+Offline coverage checks blank/null/auto settings, explicit UUID precedence, missing and multiple GPUs, malformed UUIDs, and GUI parsing with and without the new status field. A bounded three-sample live check with a blank UUID succeeded on the original supported GPU and stopped cleanly. Hardware support is unchanged.

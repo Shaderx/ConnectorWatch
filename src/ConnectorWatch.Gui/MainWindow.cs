@@ -306,7 +306,7 @@ public sealed class MainWindow : Window
     void ShowDetails()
     {
         var s = store.Current;
-        ShowText("Sensor details", $"GPU UUID\n{config.GpuUuid}\n\nSource\n{s?.Source}\n\nLast observation\n{s?.Time.LocalDateTime:yyyy-MM-dd HH:mm:ss}\n16-pin {s?.Voltage:F6} V  ·  PCIe {s?.Pcie:F6} V\n16-pin current {s?.Current:F3} A  ·  PCIe current {s?.PcieCurrent:F3} A\nConnector power {s?.Power:F3} W  ·  NVML board power {s?.BoardPower:F3} W\nGPU {s?.Temperature:F0} °C  ·  utilization {s?.Utilization:F0}%  ·  power limit {s?.Limit:F0} W\n\nStatus\n{s?.Status}  ·  schema {s?.Schema}\n{s?.Detail}\n\nTimestamps are host polling time. Native sensor freshness is unverified. GPU temperature is not connector temperature.\n\nData directory\n{data}");
+        ShowText("Sensor details", $"GPU UUID\n{(string.IsNullOrWhiteSpace(s?.GpuUuid) ? (string.IsNullOrWhiteSpace(config.GpuUuid) ? "Automatic (awaiting daemon)" : config.GpuUuid) : s.GpuUuid)}\n\nSource\n{s?.Source}\n\nLast observation\n{s?.Time.LocalDateTime:yyyy-MM-dd HH:mm:ss}\n16-pin {s?.Voltage:F6} V  ·  PCIe {s?.Pcie:F6} V\n16-pin current {s?.Current:F3} A  ·  PCIe current {s?.PcieCurrent:F3} A\nConnector power {s?.Power:F3} W  ·  NVML board power {s?.BoardPower:F3} W\nGPU {s?.Temperature:F0} °C  ·  utilization {s?.Utilization:F0}%  ·  power limit {s?.Limit:F0} W\n\nStatus\n{s?.Status}  ·  schema {s?.Schema}\n{s?.Detail}\n\nTimestamps are host polling time. Native sensor freshness is unverified. GPU temperature is not connector temperature.\n\nData directory\n{data}");
     }
     void ShowSettings()
     {
