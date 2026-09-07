@@ -1,6 +1,7 @@
 {
   "GpuUuid": "",
   "SampleSeconds": 1,
+  "FlushSeconds": 30,
   "DataDirectory": "data",
   "DesktopAlerts": true,
   "VoltageSource": "direct",

@@ -55,7 +55,7 @@ public sealed class ControlClient
             if (command != "hello" && Identity == null) return null;
             await writer.WriteLineAsync(ControlProtocol.Serialize(new ControlRequest(command, id, command == "hello" ? null : Identity?.InstanceId)).AsMemory(), timeout.Token);
             var line = await ReadResponse(pipe, timeout.Token);
-            if (line == null || line.Length > 16384) return null;
+            if (line == null || line.Length > 4 * 1024 * 1024) return null;
             var r = JsonSerializer.Deserialize<ControlResponse>(line, ControlProtocol.Json);
             if (r == null || r.Protocol != 1 || r.Pid <= 0 || string.IsNullOrEmpty(r.InstanceId) || !string.Equals(ControlEndpoint.NormalizeDataDirectory(r.DataDirectory), ControlEndpoint.NormalizeDataDirectory(data), StringComparison.OrdinalIgnoreCase)) return null;
             if (command != "hello" && (Identity == null || Identity.InstanceId != r.InstanceId || Identity.Pid != r.Pid)) return null;
@@ -71,7 +71,7 @@ public sealed class ControlClient
         {
             int read = await stream.ReadAsync(chunk, token); if (read == 0) return null;
             int newline = Array.IndexOf(chunk, (byte)'\n', 0, read); int length = newline < 0 ? read : newline;
-            if (buffer.Length + length > 16384) return null;
+            if (buffer.Length + length > 4 * 1024 * 1024) return null;
             buffer.Write(chunk, 0, length);
             if (newline >= 0) return Encoding.UTF8.GetString(buffer.GetBuffer(), 0, (int)buffer.Length);
         }

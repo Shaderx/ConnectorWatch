@@ -12,6 +12,7 @@ public sealed class Config
 {
     public string GpuUuid { get; set; } = "";
     public double SampleSeconds { get; set; } = 1;
+    public int FlushSeconds { get; set; } = 30;
     public string DataDirectory { get; set; } = "data";
     public bool DesktopAlerts { get; set; } = true;
     // auto prefers a configured external source, then the direct Windows rail
@@ -43,7 +44,7 @@ public sealed class Config
     {
         if (!double.IsFinite(SampleSeconds) || !double.IsFinite(MaxAgeSeconds) ||
             !double.IsFinite(ShiftVolts) || !double.IsFinite(SuddenDroopVolts) ||
-            SampleSeconds < .2 || SampleSeconds > 60 || BinWatts < 1 || BinWatts > 100 ||
+            FlushSeconds < 1 || FlushSeconds > 60 || SampleSeconds < .2 || SampleSeconds > 60 || BinWatts < 1 || BinWatts > 100 ||
             MinAnalysisWatts < 0 || StableSamples < 1 || BaselineSamples < 5 || BaselineSamples > 10000 ||
             WindowSamples < 3 || WindowSamples > 3600 || WindowMaxAgeSeconds < 1 ||
             ShiftVolts <= 0 || SuddenDroopVolts <= 0 || SustainSamples < 1 ||
@@ -506,6 +507,8 @@ public static class Program
             DateTimeOffset? lastSensor = null; string? previousStatus = null;
             bool alertPresentedForCurrentStatus = false;
             var clock = Stopwatch.StartNew(); double next = 0;
+            var storage = new HybridStorage(data, c.FlushSeconds);
+            string? latestState = null;
             Console.WriteLine("ConnectorWatch: read-only telemetry. Ctrl+C/SIGTERM stops. No status certifies connector safety.");
             while (!stop.IsCancellationRequested && (count == 0 || n < count))
             {
@@ -532,14 +535,13 @@ public static class Program
                 { result = analysis.Add(v.Timestamp, analysisPower.Value, v.Volts); lastSensor = v.Timestamp; }
                 else if (v == null || !analysisPower.HasValue)
                 { analysis.Gap(); if (!analysisPower.HasValue && terminalFailure == null) result = result with { Status = "POWER_UNAVAILABLE" }; }
-                string csv = Path.Combine(data, $"telemetry-{now:yyyy-MM-dd}.csv");
-                if (!File.Exists(csv)) File.WriteAllText(csv, "timestamp_utc,gpu_uuid,board_power_w,input_voltage_v,voltage_timestamp_utc,analysis_power_w,analysis_power_source,gpu_temp_c,utilization_pct,power_limit_w,voltage_source,extra_voltages_json,bin_w,reference_v,rolling_median_v,rolling_p05_v,median_drop_v,status,detail\n");
                 string analysisPowerSource = v?.Power != null
                     ? voltageSource is HwinfoLog ? "HWiNFO CSV same row" : (voltageSource?.Description ?? "voltage source") + " same row"
                     : "NVML (approximate time alignment)";
-                File.AppendAllText(csv, Csv.Line(now.ToString("O"), c.GpuUuid, g.Power, v?.Volts, v?.Timestamp.ToString("O"), analysisPower,
+                string row = Csv.Line(now.ToString("O"), c.GpuUuid, g.Power, v?.Volts, v?.Timestamp.ToString("O"), analysisPower,
                     analysisPowerSource, g.Temperature, g.Utilization, g.Limit,
-                    v != null ? voltageSource?.Description : null, v?.Extras, result.Bin, result.Reference, result.Median, result.P05, result.Drop, result.Status, detail) + "\n");
+                    v != null ? voltageSource?.Description : null, v?.Extras, result.Bin, result.Reference, result.Median, result.P05, result.Drop, result.Status, detail) + "\n";
+                storage.Add(now, row);
                 var progress = analysis.Progress;
                 var state = new
                 {
@@ -564,12 +566,15 @@ public static class Program
                     detail,
                     stopped = terminalFailure != null,
                 };
-                Atomic(Path.Combine(data, "status.json"), JsonSerializer.Serialize(state, Json));
+                latestState = JsonSerializer.Serialize(state, Json);
+                control.Publish(latestState, row);
+                bool urgent = result.Status != previousStatus && result.Status is "SUDDEN_DROOP" or "BASELINE_SHIFT" or "VOLTAGE_UNAVAILABLE" or "POWER_UNAVAILABLE";
+
                 bool suppressAlerts = control.AlertsSuppressed;
                 if (result.Status != previousStatus)
                 {
                     Console.WriteLine($"{now:O} {result.Status} | {g.Power:F1} W | {v?.Volts:F3} V | {detail}");
-                    File.AppendAllText(Path.Combine(data, "events.csv"), Csv.Line(now.ToString("O"), result.Status, result.Drop, detail) + "\n");
+                    storage.AddEvent(Csv.Line(now.ToString("O"), result.Status, result.Drop, detail) + "\n");
                     alertPresentedForCurrentStatus = c.DesktopAlerts && DesktopAlerts.ShouldNotify(result.Status) && !suppressAlerts;
                     if (alertPresentedForCurrentStatus)
                         DesktopAlerts.Notify(result.Status, v?.Volts, detail);
@@ -584,12 +589,14 @@ public static class Program
                     DesktopAlerts.Notify(result.Status, v?.Volts, detail);
                     alertPresentedForCurrentStatus = true;
                 }
+                if (storage.Due(clock.Elapsed.TotalSeconds) || urgent || terminalFailure != null)
+                    storage.Flush(clock.Elapsed.TotalSeconds, latestState, JsonSerializer.Serialize(new Saved(identity, analysis.Bins), Json));
                 if (terminalFailure != null)
                 {
                     Atomic(baselinePath, JsonSerializer.Serialize(new Saved(identity, analysis.Bins), Json));
                     throw new Exception("ConnectorWatch stopped after a terminal voltage-source failure.", terminalFailure);
                 }
-                if (++n % 60 == 0) Atomic(baselinePath, JsonSerializer.Serialize(new Saved(identity, analysis.Bins), Json));
+                n++;
                 next += c.SampleSeconds;
                 if (next < clock.Elapsed.TotalSeconds) next = clock.Elapsed.TotalSeconds;
                 while (!stop.IsCancellationRequested && clock.Elapsed.TotalSeconds < next)
@@ -598,16 +605,30 @@ public static class Program
                     if (stop.Token.WaitHandle.WaitOne(milliseconds)) break;
                 }
             }
+            if (latestState != null) storage.Flush(clock.Elapsed.TotalSeconds, latestState, JsonSerializer.Serialize(new Saved(identity, analysis.Bins), Json));
             MarkStopped(Path.Combine(data, "status.json"), control.StopRequested ? "control" : stop.IsCancellationRequested ? "signal" : "sample_limit",
                 control, analysis.Progress);
             Atomic(baselinePath, JsonSerializer.Serialize(new Saved(identity, analysis.Bins), Json));
             if (stop.IsCancellationRequested) Console.WriteLine("ConnectorWatch: shutdown requested; state saved.");
             return 0;
         }
-        catch (Exception ex) { Console.Error.WriteLine("ConnectorWatch stopped: " + ex.Message); return 1; }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("ConnectorWatch stopped: " + ex.Message);
+            try
+            {
+                string logs = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ConnectorWatch", "logs");
+                Directory.CreateDirectory(logs);
+                string log = Path.Combine(logs, "errors.log");
+                if (File.Exists(log) && new FileInfo(log).Length > 1024 * 1024) File.Move(log, log + ".previous", true);
+                File.AppendAllText(log, $"{DateTimeOffset.UtcNow:O} {ex}\n");
+            }
+            catch (Exception logError) { Console.Error.WriteLine("Unable to save diagnostic: " + logError.Message); }
+            return 1;
+        }
     }
     static string? Option(string[] args, string name) { int i = Array.IndexOf(args, name); return i < 0 ? null : i + 1 < args.Length ? args[i + 1] : throw new Exception("Missing value for " + name); }
-    static void Atomic(string path, string value) { File.WriteAllText(path + ".tmp", value); File.Move(path + ".tmp", path, true); }
+    static void Atomic(string path, string value) => HybridStorage.Atomic(path, value);
 
     static void MarkStopped(string path, string reason, ControlServer? control = null,
         AnalysisProgress? progress = null)

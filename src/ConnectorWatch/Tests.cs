@@ -94,6 +94,7 @@ public static class Tests
             DesktopAlerts.ShouldNotify("VOLTAGE_UNAVAILABLE") && !DesktopAlerts.ShouldNotify("NO_SHIFT_DETECTED"),
             "desktop alert status filter");
         ControlServerTests.Run();
+        HybridStorageTests.Run();
         DirectNvRailsTests.Run();
         Console.WriteLine($"PASS: {passed} behavioral checks.");
     }

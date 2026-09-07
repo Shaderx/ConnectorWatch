@@ -50,6 +50,11 @@ public static class ControlServerTests
             var invalid = SendAsync(server, new ControlRequest("unknown", "gui-a")).GetAwaiter().GetResult();
             Check(!invalid.Ok && invalid.Protocol == ControlProtocol.Version, "unknown command rejected");
 
+            for (int i = 0; i < 600; i++) server.Publish("{\"sample\":" + i + "}", i + "\n");
+            var live = SendAsync(server, new ControlRequest("live", "gui-a", hello.InstanceId)).GetAwaiter().GetResult();
+            Check(live.Ok && live.Live?.Rows.Length == 512 && live.Live.Rows[0] == "88\n" && live.Live.Status == "{\"sample\":599}", "live pipe returns bounded latest RAM history and status");
+            var staleLive = SendAsync(server, new ControlRequest("live", "gui-a", "old-instance")).GetAwaiter().GetResult();
+            Check(!staleLive.Ok && staleLive.Live == null, "stale instance cannot receive replacement live data");
             var stopResponse = SendAsync(server, new ControlRequest("stop", "gui-a", hello.InstanceId)).GetAwaiter().GetResult();
             Check(stopResponse.Ok && stop.IsCancellationRequested, "control stop cancels daemon");
             server.Completion.WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();

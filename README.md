@@ -2,7 +2,7 @@
 
 ConnectorWatch is an experimental Windows monitor for the 16-pin input-voltage trend of a supported RTX 5090 setup. It consists of a Windows WPF dashboard and a headless .NET 8 daemon. The daemon owns all GPU access, records timestamped telemetry, and evaluates voltage changes within comparable load bands. The dashboard reads the daemon's files and control endpoint.
 
-Release **v1.1.3** is experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Other units of the same board family are experimental, multi-GPU systems fail closed, and other boards or driver versions are unsupported by the direct reader.
+Release **v1.2.0** is experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Other units of the same board family are experimental, multi-GPU systems fail closed, and other boards or driver versions are unsupported by the direct reader.
 
 ![Synthetic dashboard preview](docs/dashboard.png)
 
@@ -71,6 +71,16 @@ The daemon writes these files under `DataDirectory`:
 | `monitor.lock` | Single-writer guard for the data directory |
 
 The dashboard shows stale or stopped readings as unavailable. It records monitoring loss separately, including when the native daemon terminates. Windows notification settings can suppress tray notifications; the dashboard banner and warning history remain available. When the dashboard owns presentation, only one GUI receives the daemon's heartbeat lease. If it exits unexpectedly, the daemon resumes headless warnings, including for an active warning that began while the GUI owned presentation.
+
+## Hybrid live storage (v1.2.0)
+
+Live status and recent observations stay in bounded daemon RAM and reach the dashboard through the current-user control pipe. The daemon retains at most 512 recent rows (also capped at 512 KiB of text); the GUI merges these with saved history without duplicating samples when batches reach disk.
+
+`FlushSeconds` defaults to 30 and accepts 1–60 seconds. Routine telemetry, transitions, status and baseline checkpoints are written in batches at that interval (or earlier at the buffer threshold). New voltage-trend warnings, unavailable-source transitions and terminal source failures trigger an immediate checkpoint; graceful shutdown flushes pending samples before recording stopped state. Temporary Windows sharing/access conflicts receive bounded retries. Persistent storage failures stop the daemon and record diagnostics under `%LOCALAPPDATA%\ConnectorWatch\logs`, independently of the data directory.
+
+An abrupt process termination can lose the unflushed interval. Checkpoints use normal operating-system file buffering, so power-loss durability is not guaranteed. `status.json` is a disk checkpoint, not the live one-second transport; scripts requiring live state should use the instance-checked `live` control request after `hello`. Upgrade the GUI and daemon together.
+
+**Keep active data outside OneDrive and other cloud-synced directories.** With the default relative `DataDirectory: "data"`, install the entire package in a local, non-synced folder. Existing explicit data paths and baselines are preserved; this release does not migrate storage or automatically detect every sync provider. Copy closed exports to cloud storage only after capture. Less frequent writing does not make a synced runtime directory supported.
 
 ## How the detector should be read
 

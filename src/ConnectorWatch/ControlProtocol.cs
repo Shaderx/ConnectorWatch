@@ -58,7 +58,11 @@ public sealed record ControlResponse(
     [property: JsonPropertyName("pid")] int Pid,
     [property: JsonPropertyName("data_directory")] string DataDirectory,
     [property: JsonPropertyName("instance_id")] string InstanceId,
-    [property: JsonPropertyName("ok")] bool Ok);
+    [property: JsonPropertyName("ok")] bool Ok,
+    [property: JsonPropertyName("live")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] LiveTelemetry? Live = null);
+
+public sealed record LiveTelemetry(string Status, string Header, string[] Rows);
 
 /// <summary>
 /// Derives the per-user/configuration control endpoint from a normalized path.

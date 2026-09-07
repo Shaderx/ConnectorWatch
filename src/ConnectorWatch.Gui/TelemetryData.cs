@@ -72,6 +72,9 @@ public sealed class TelemetryStore
 {
     const int MaxSamples = 200_000;
     readonly string directory;
+    readonly ControlClient liveClient;
+    readonly BoundedIdSet sampleIds = new(MaxSamples + 4096);
+    bool reorder;
     readonly Dictionary<string, Cursor> cursors = new(StringComparer.OrdinalIgnoreCase);
     public BoundedBuffer<PointSample> Samples { get; } = new(MaxSamples);
     public BoundedBuffer<Incident> Incidents { get; } = new(2000);
@@ -80,9 +83,19 @@ public sealed class TelemetryStore
     public bool Limited { get; private set; }
     public string ReadError { get; private set; } = "";
     (long Length, long Ticks)? baselineStamp;
-    public TelemetryStore(string directory) => this.directory = directory;
-    public Task RefreshAsync() => Task.Run(Refresh);
-    void Refresh()
+    public TelemetryStore(string directory) { this.directory = directory; liveClient = new(directory); }
+    public Task RefreshAsync() => Task.Run(async () => {
+        ConnectorWatch.LiveTelemetry? live = null;
+        if (await liveClient.Send("hello") != null) live = (await liveClient.Send("live"))?.Live;
+        Refresh(live);
+    });
+    void AddSample(PointSample p)
+    {
+        if (!sampleIds.Add(p.Time.ToString("O"))) return;
+        if (Samples.Count > 0 && p.Time < Samples[Samples.Count - 1].Time) reorder = true;
+        Samples.Add(p);
+    }
+    void Refresh(ConnectorWatch.LiveTelemetry? live)
     {
         ReadError = "";
         string[] paths = Array.Empty<string>();
@@ -96,7 +109,7 @@ public sealed class TelemetryStore
         {
             if (!Directory.Exists(directory)) return;
             var status = Path.Combine(directory, "status.json");
-            ReadPart(() => { if (File.Exists(status)) Current = Snapshot.Parse(ReadShared(status, 256 * 1024)); });
+            ReadPart(() => { if (live != null) Current = Snapshot.Parse(live.Status); else if (File.Exists(status)) Current = Snapshot.Parse(ReadShared(status, 256 * 1024)); });
             // Keep just the two newest names while enumerating; do not sort all historical files.
             ReadPart(() => {
                 var newest = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -104,6 +117,15 @@ public sealed class TelemetryStore
                 paths = newest.ToArray();
             });
             foreach (var path in paths) ReadPart(() => ReadTelemetry(path));
+            ReadPart(() => {
+                if (live == null) return;
+                var headers = ParseCsv(live.Header.TrimEnd('\r', '\n'));
+                foreach (var row in live.Rows)
+                {
+                    var point = ParseSample(headers, ParseCsv(row.TrimEnd('\r', '\n')));
+                    if (point != null) AddSample(point);
+                }
+            });
             ReadPart(() => ReadEvents(Path.Combine(directory, "events.csv")));
             var baseline = Path.Combine(directory, "baseline.json");
             ReadPart(() => { if (File.Exists(baseline))
@@ -124,6 +146,7 @@ public sealed class TelemetryStore
         { ReadError = ex.Message; }
         finally
         {
+            if (reorder) { var sorted = Samples.OrderBy(p => p.Time).ToArray(); Samples.Clear(); Samples.AddRange(sorted); reorder = false; }
             var cutoff = DateTimeOffset.UtcNow.AddHours(-24);
             Samples.RemoveAll(s => s.Time < cutoff);
             Limited |= Samples.Evictions > 0 || Incidents.Evictions > 0;
@@ -149,7 +172,7 @@ public sealed class TelemetryStore
             while ((ch = r.Read()) >= 0 && ch != '\n') { if (header.Length >= 262144) throw new InvalidDataException("CSV header exceeds dashboard limit."); header.Append((char)ch); }
             c.Headers = ParseCsv(header.ToString().TrimEnd('\r'));
         }
-        foreach (var row in ReadRows(path, c)) { var p = ParseSample(c.Headers, row); if (p != null) Samples.Add(p); }
+        foreach (var row in ReadRows(path, c)) { var p = ParseSample(c.Headers, row); if (p != null) AddSample(p); }
     }
     void ReadEvents(string path)
     {

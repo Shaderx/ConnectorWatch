@@ -76,6 +76,26 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
 
     int runStarted;
     int stopCommandReceived;
+    readonly object liveGate = new();
+    readonly Queue<string> liveRows = new();
+    int liveChars;
+    string? liveStatus;
+
+    public void Publish(string status, string row)
+    {
+        lock (liveGate)
+        {
+            liveStatus = status;
+            liveRows.Enqueue(row); liveChars += row.Length;
+            while (liveRows.Count > 512 || liveChars > 512 * 1024)
+                liveChars -= liveRows.Dequeue().Length;
+        }
+    }
+
+    LiveTelemetry? ReadLive()
+    {
+        lock (liveGate) return liveStatus is null ? null : new(liveStatus, HybridStorage.Header, liveRows.ToArray());
+    }
 
     /// <summary>
     /// Handles a request after validating its command and client identity. The
@@ -102,6 +122,7 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
                 ok = command switch
                 {
                     "hello" => true,
+                    "live" when identityMatches => true,
                     "lease" when identityMatches => GrantLeaseLocked(request.ClientId, now),
                     "release" when identityMatches => ReleaseLeaseLocked(request.ClientId),
                     "stop" when identityMatches => true,
@@ -117,7 +138,8 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
             }
         }
 
-        return new ControlResponse(ControlProtocol.Version, ProcessId, dataDirectory, InstanceId, ok);
+        return new ControlResponse(ControlProtocol.Version, ProcessId, dataDirectory, InstanceId, ok,
+            ok && request?.Command == "live" ? ReadLive() : null);
     }
 
     bool GrantLeaseLocked(string clientId, long now)
@@ -228,7 +250,10 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
         if (line is null) return;
         ControlProtocol.TryParseRequest(line ?? "", out var request);
         var response = HandleRequest(request);
-        await writer.WriteLineAsync(ControlProtocol.Serialize(response)).ConfigureAwait(false);
+        // Stop cancels the sampling token in HandleRequest. Give its acknowledgement
+        // an independent, bounded write window before closing the endpoint.
+        using var writeTimeout = new CancellationTokenSource(ConnectionTimeout);
+        await writer.WriteLineAsync(ControlProtocol.Serialize(response).AsMemory(), writeTimeout.Token).ConfigureAwait(false);
 
         // The response is flushed before cancellation closes the accept loop, so
         // a stop command remains observable to the GUI.
