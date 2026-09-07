@@ -1,5 +1,4 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><OutputType>WinExe</OutputType><TargetFramework>net8.0-windows</TargetFramework><UseWPF>true</UseWPF><UseWindowsForms>true</UseWindowsForms><ImplicitUsings>disable</ImplicitUsings><Nullable>enable</Nullable><AssemblyName>ConnectorWatch.Gui</AssemblyName><ApplicationManifest>app.manifest</ApplicationManifest><ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode></PropertyGroup>
   <ItemGroup><Compile Include="../ConnectorWatch/ControlProtocol.cs" Link="ControlProtocol.cs" /></ItemGroup>
-  <PropertyGroup><Version>1.1.1</Version></PropertyGroup>
 </Project>

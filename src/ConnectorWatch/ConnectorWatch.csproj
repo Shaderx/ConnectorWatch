@@ -5,7 +5,6 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>ConnectorWatch</AssemblyName>
-    <Version>1.1.1</Version>
     <RootNamespace>ConnectorWatch</RootNamespace>
   </PropertyGroup>
 </Project>

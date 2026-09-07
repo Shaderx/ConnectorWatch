@@ -1,38 +1,90 @@
-name: Build and offline tests
+name: Build, test and release
 on:
   push:
+    branches: ['**']
+    tags: ['v*']
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 jobs:
   windows:
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: 8.0.x
-      - name: Daemon offline tests
-        run: dotnet run --project src/ConnectorWatch -c Release -- --self-test
-      - name: GUI offline tests
+      - name: Build and verify release package
         shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          dotnet build src/ConnectorWatch.Gui -c Release
-          if ($LASTEXITCODE -ne 0) { throw 'GUI build failed' }
-          $p = Start-Process src/ConnectorWatch.Gui/bin/Release/net8.0-windows/ConnectorWatch.Gui.exe -ArgumentList '--self-test --test-output gui-tests.json' -Wait -PassThru -WindowStyle Hidden
-          if ($p.ExitCode -ne 0) { throw (Get-Content gui-tests.json -Raw) }
-      - name: Publish Windows package
-        shell: pwsh
-        run: ./scripts/Publish.ps1
-      - uses: actions/upload-artifact@v4
+          $tag = if ($env:REF_TYPE -eq 'tag') { $env:REF_NAME } else { '' }
+          ./scripts/Package.ps1 -ExpectedTag $tag
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ConnectorWatch-win-x64
-          path: dist/ConnectorWatch-win-x64/
+          name: windows-package
+          path: |
+            artifacts/package/*.zip
+            artifacts/package/SHA256SUMS.txt
+            artifacts/package/build-info.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-test-reports
+          path: artifacts/package/*tests.json
+          retention-days: 14
   portable-core:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: 8.0.x
       - run: dotnet run --project src/ConnectorWatch -c Release -- --self-test
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, portable-core]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: windows-package
+          path: package
+      - name: Publish experimental release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd package
+          sha256sum --check SHA256SUMS.txt
+          if gh release view "$TAG" --json isDraft > existing.json 2>/dev/null; then
+            if [ "$(jq -r .isDraft existing.json)" != true ]; then
+              echo 'Release already published; refusing to replace its assets.'
+              exit 1
+            fi
+          else
+            gh release create "$TAG" --verify-tag --draft --prerelease --title "ConnectorWatch $TAG — experimental Windows release" --generate-notes --notes 'Experimental Windows x64 build. Configure your GPU UUID before launch. The direct reader remains restricted to the documented ASUS TUF RTX 5090 identity, driver 616.56, and one NVIDIA GPU. CI tests software behavior; it cannot validate hardware or guarantee warning before connector damage. See README.md and docs/VALIDATION.md.'
+          fi
+          gh release upload "$TAG" ./*.zip SHA256SUMS.txt build-info.json --clobber
+          gh release edit "$TAG" --draft=false --prerelease --latest=false

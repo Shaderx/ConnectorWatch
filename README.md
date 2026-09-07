@@ -2,7 +2,7 @@
 
 ConnectorWatch is an experimental Windows monitor for the 16-pin input-voltage trend of a supported RTX 5090 setup. It consists of a Windows WPF dashboard and a headless .NET 8 daemon. The daemon owns all GPU access, records timestamped telemetry, and evaluates voltage changes within comparable load bands. The dashboard reads the daemon's files and control endpoint.
 
-Release **v1.1.1** is experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Other units of the same board family are experimental, multi-GPU systems fail closed, and other boards or driver versions are unsupported by the direct reader.
+Release **v1.1.2** is experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Other units of the same board family are experimental, multi-GPU systems fail closed, and other boards or driver versions are unsupported by the direct reader.
 
 ![Synthetic dashboard preview](docs/dashboard.png)
 
@@ -118,3 +118,7 @@ The direct native path is intended for Windows x64 and retains the validated har
 The daemon's managed NVML telemetry core is portable in principle and can be built for other platforms, but this release supplies the Windows WPF GUI and the Windows direct rail reader. A Linux build may retain ordinary NVML logging where the driver provides `libnvidia-ml.so.1`; it does not provide the Windows native rail path or a Linux GUI.
 
 HWiNFO CSV and newline-delimited JSON are optional source adapters in the daemon for separately validated integrations. They are not a substitute for proving that a value represents the 16-pin input rail. Keep source timestamps and freshness visible when evaluating any external adapter.
+
+## Automated releases
+
+Pushes and pull requests run Windows and Linux-core checks. Matching version tags publish tested Windows prereleases with checksums and build metadata. See [the release guide](docs/RELEASING.md).
