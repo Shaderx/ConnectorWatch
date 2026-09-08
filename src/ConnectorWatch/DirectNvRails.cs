@@ -16,7 +16,7 @@ namespace ConnectorWatch;
 /// channel metadata.  Every subsequent sample starts with a fresh zeroed A613
 /// buffer and uses that mask as input.
 /// </summary>
-public sealed class DirectNvRails : IVoltageSource, IDisposable
+public sealed class DirectNvRails : IElectricalSource, IDisposable
 {
     public const uint MetadataFunctionId = 0xC12EB19E;
     public const uint StatusFunctionId = 0xF40238EF;
@@ -177,14 +177,12 @@ public sealed class DirectNvRails : IVoltageSource, IDisposable
     public bool TerminalOnFailure => true;
 
     /// <summary>
-    /// Reads one sample.  The returned Voltage uses 12VHPWR as the primary
-    /// rail because that is the connector most at risk; PCIe +12V and both
-    /// rails' current/power are serialized in Extras. The call is synchronous
-    /// to the daemon; its watchdog covers only the private A613 call. The
-    /// sample timestamp is the host polling time, and native freshness is
-    /// unverified.
+    /// Reads one typed sample. Both rails' voltage/current/power remain typed
+    /// through the analysis boundary; power is explicitly marked as derived
+    /// from the same rail's V×I values. The sample timestamp is the host poll
+    /// time because the private payload has no validated hardware timestamp.
     /// </summary>
-    public Voltage Read(DateTimeOffset now)
+    public ElectricalSample ReadElectrical(DateTimeOffset now)
     {
         lock (_gate)
         {
@@ -194,7 +192,7 @@ public sealed class DirectNvRails : IVoltageSource, IDisposable
             {
                 InvokePrivate(_statusCall, statusBuffer, "A613 status");
                 var sample = DecodeStatus(statusBuffer, _metadata, now);
-                return ToVoltage(sample);
+                return ToElectricalSample(sample, Description);
             }
             catch (DirectNvRailsException)
             {
@@ -208,6 +206,13 @@ public sealed class DirectNvRails : IVoltageSource, IDisposable
             }
         }
     }
+
+    /// <summary>
+    /// Legacy adapter retained for existing daemon and package consumers. It
+    /// projects the typed sample back into the original Voltage/Extras shape.
+    /// New analysis code should use ReadElectrical instead of decoding Extras.
+    /// </summary>
+    public Voltage Read(DateTimeOffset now) => ReadElectrical(now).ToLegacyVoltage();
 
     /// <summary>
     /// Creates the exact zeroed A612 request.  This is public so the portable
@@ -301,6 +306,38 @@ public sealed class DirectNvRails : IVoltageSource, IDisposable
         };
         return new Voltage(sample.Timestamp, sample.TwelveVHpwr.Volts, sample.TwelveVHpwr.Watts,
             JsonSerializer.Serialize(extras));
+    }
+
+    /// <summary>
+    /// Converts an already validated direct sample into the typed electrical
+    /// contract.  This method is offline-testable and does not load a native
+    /// library.  The original Extras payload is retained verbatim through the
+    /// legacy projection for additive compatibility.
+    /// </summary>
+    public static ElectricalSample ToElectricalSample(DirectRailSample sample,
+        string source = "direct NVIDIA rails")
+    {
+        if (sample is null) throw new ArgumentNullException(nameof(sample));
+        if (string.IsNullOrWhiteSpace(source)) throw new ArgumentException("A source identity is required.", nameof(source));
+
+        var freshness = FreshnessMetadata.HostPoll(sample.Timestamp, FreshnessMarker);
+        var pcie = ElectricalRailSample.Create(
+            sample.Pcie12V.Volts,
+            sample.Pcie12V.Amps,
+            sample.Pcie12V.Watts,
+            ElectricalPowerProvenance.DerivedFromVoltageAndCurrent,
+            source, sample.Timestamp, freshness);
+        var connector = ElectricalRailSample.Create(
+            sample.TwelveVHpwr.Volts,
+            sample.TwelveVHpwr.Amps,
+            sample.TwelveVHpwr.Watts,
+            ElectricalPowerProvenance.DerivedFromVoltageAndCurrent,
+            source, sample.Timestamp, freshness);
+        var legacy = ToVoltage(sample);
+        return new ElectricalSample(sample.Timestamp, source, connector, pcie,
+            ElectricalPowerReading.Unsupported(source, sample.Timestamp, freshness,
+                "Direct native samples do not provide an independent external power sensor."),
+            freshness, legacy.Extras);
     }
 
     public void Dispose()

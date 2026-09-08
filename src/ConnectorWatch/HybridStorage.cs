@@ -5,7 +5,7 @@ namespace ConnectorWatch;
 /// <summary>Bounded pending history; disk checkpoints never supply the live transport.</summary>
 public sealed class HybridStorage
 {
-    public const string Header = "timestamp_utc,gpu_uuid,board_power_w,input_voltage_v,voltage_timestamp_utc,analysis_power_w,analysis_power_source,gpu_temp_c,utilization_pct,power_limit_w,voltage_source,extra_voltages_json,bin_w,reference_v,rolling_median_v,rolling_p05_v,median_drop_v,status,detail\n";
+    public const string Header = "timestamp_utc,gpu_uuid,board_power_w,input_voltage_v,voltage_timestamp_utc,analysis_power_w,analysis_power_source,gpu_temp_c,utilization_pct,power_limit_w,voltage_source,extra_voltages_json,bin_w,reference_v,rolling_median_v,rolling_p05_v,median_drop_v,status,detail,connector_current_a,connector_power_w,pcie_voltage_v,pcie_current_a,pcie_power_w,electrical_source,electrical_freshness_kind,electrical_source_timestamp_utc,connector_power_provenance,analysis_load_unit\n";
     readonly Dictionary<string, StringBuilder> pending = new();
     int pendingChars;
     double lastFlush;

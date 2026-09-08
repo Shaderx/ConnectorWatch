@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 
 namespace ConnectorWatch;
 
@@ -24,6 +25,10 @@ public sealed class Config
     public string RailJson { get; set; } = "";
     public string VoltageColumn { get; set; } = "";
     public string PowerColumn { get; set; } = "";
+    // Empty preserves the pre-vNext provider-specific basis at startup. Once
+    // resolved, the basis is pinned for the process lifetime and never falls
+    // back when a selected measurement disappears.
+    public string AnalysisLoadSource { get; set; } = "";
     public string[] ExtraVoltageColumns { get; set; } = [];
     public string DateColumn { get; set; } = "Date";
     public string TimeColumn { get; set; } = "Time";
@@ -54,6 +59,8 @@ public sealed class Config
         if (!new[] { "auto", "direct", "nvapi", "hwinfo", "json", "none" }
                 .Contains(VoltageSource, StringComparer.OrdinalIgnoreCase))
             throw new Exception("VoltageSource must be auto, direct, nvapi, hwinfo, json, or none.");
+        if (!string.IsNullOrWhiteSpace(AnalysisLoadSource))
+            _ = AnalysisLoadSourceExtensions.Parse(AnalysisLoadSource);
         _ = CultureInfo.GetCultureInfo(Culture);
     }
 }
@@ -400,7 +407,27 @@ public sealed class Analysis(Config c, Dictionary<int, Bin>? saved = null)
 public sealed record Saved(string Identity, Dictionary<int, Bin> Bins);
 public static class Program
 {
-    static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
+    static readonly JsonSerializerOptions Json = new()
+    {
+        WriteIndented = true,
+        Converters = { new JsonStringEnumConverter() },
+    };
+
+    internal static AnalysisLoadSource ResolveAnalysisLoadSource(Config c, string sourceMode,
+        IVoltageSource? voltageSource)
+    {
+        if (!string.IsNullOrWhiteSpace(c.AnalysisLoadSource))
+            return AnalysisLoadSourceExtensions.Parse(c.AnalysisLoadSource);
+
+        // Compatibility for configurations written before the explicit field:
+        // resolve once from their configured provider, then pin the result.
+        if (voltageSource is DirectNvRails || sourceMode is "direct" or "nvapi")
+            return AnalysisLoadSource.CONNECTOR_POWER;
+        if (voltageSource is RailJsonLog || voltageSource is HwinfoLog && c.PowerColumn.Length > 0)
+            return AnalysisLoadSource.EXTERNAL_SENSOR_POWER;
+        return AnalysisLoadSource.NVML_BOARD_POWER;
+    }
+
     public static int Main(string[] args)
     {
         CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
@@ -490,7 +517,8 @@ public static class Program
             }
             using var directLifetime = directSource;
             var providerIdentity = voltageSource?.Description ?? (sourceSetupError != null ? "direct NVIDIA rails unavailable" : "none");
-            var identity = $"v4|{c.GpuUuid}|source={sourceMode}|provider={providerIdentity}|{c.HwinfoCsv}|{c.RailJson}|{c.VoltageColumn}|{c.PowerColumn}|{c.BinWatts}|{c.BaselineSamples}";
+            var analysisLoadSource = ResolveAnalysisLoadSource(c, sourceMode, voltageSource);
+            var identity = $"v4|{c.GpuUuid}|source={sourceMode}|provider={providerIdentity}|{c.HwinfoCsv}|{c.RailJson}|{c.VoltageColumn}|{c.PowerColumn}|analysis-load={analysisLoadSource.WireName()}|{c.BinWatts}|{c.BaselineSamples}";
             string baselinePath = Path.Combine(data, "baseline.json");
             Saved? saved = File.Exists(baselinePath) ? JsonSerializer.Deserialize<Saved>(File.ReadAllText(baselinePath)) : null;
             if (saved != null && saved.Identity != identity && saved.Bins.Count > 0) throw new Exception("Baseline source/config changed. Archive baseline.json before restarting.");
@@ -512,13 +540,18 @@ public static class Program
             Console.WriteLine("ConnectorWatch: read-only telemetry. Ctrl+C/SIGTERM stops. No status certifies connector safety.");
             while (!stop.IsCancellationRequested && (count == 0 || n < count))
             {
-                var now = DateTimeOffset.UtcNow; var g = nvml.Read(); Voltage? v = null;
+                var now = DateTimeOffset.UtcNow; var g = nvml.Read(); Voltage? v = null; ElectricalSample? electrical = null;
                 string status = sourceSetupError != null ? "VOLTAGE_UNAVAILABLE" : "VOLTAGE_NOT_CONFIGURED";
                 string detail = sourceSetupError ?? "";
                 Exception? terminalFailure = null;
                 if (voltageSource != null)
                 {
-                    try { v = voltageSource.Read(now); status = "WAITING_FOR_FRESH_VOLTAGE"; }
+                    try
+                    {
+                        electrical = voltageSource.ReadElectrical(now, c.MaxAgeSeconds);
+                        v = electrical.ToLegacyVoltage();
+                        status = "WAITING_FOR_FRESH_VOLTAGE";
+                    }
                     catch (Exception ex) when (!voltageSource.TerminalOnFailure &&
                         (ex is IOException or FormatException or JsonException or ArgumentException or UnauthorizedAccessException))
                     { status = "VOLTAGE_UNAVAILABLE"; detail = ex.Message; }
@@ -529,23 +562,36 @@ public static class Program
                         terminalFailure = ex;
                     }
                 }
-                double? analysisPower = v?.Power ?? g.Power;
+                var load = electrical?.SelectAnalysisLoad(analysisLoadSource, g.Power,
+                    FreshnessMetadata.HostPoll(now, "NVML board-power timestamp is the daemon poll time."));
+                double? analysisPower = electrical != null && load != null
+                    ? load.ToAnalysisPowerWatts(electrical)
+                    : null;
                 var result = new Result(status, null, null, null, null, null);
                 if (v != null && analysisPower.HasValue && (!lastSensor.HasValue || v.Timestamp > lastSensor.Value))
                 { result = analysis.Add(v.Timestamp, analysisPower.Value, v.Volts); lastSensor = v.Timestamp; }
                 else if (v == null || !analysisPower.HasValue)
-                { analysis.Gap(); if (!analysisPower.HasValue && terminalFailure == null) result = result with { Status = "POWER_UNAVAILABLE" }; }
-                string analysisPowerSource = v?.Power != null
-                    ? voltageSource is HwinfoLog ? "HWiNFO CSV same row" : (voltageSource?.Description ?? "voltage source") + " same row"
-                    : "NVML (approximate time alignment)";
+                {
+                    analysis.Gap();
+                    if (v != null && terminalFailure == null)
+                    {
+                        result = result with { Status = "ANALYSIS_LOAD_UNAVAILABLE" };
+                        detail = load?.Detail ?? $"Selected {analysisLoadSource.WireName()} is unavailable.";
+                    }
+                }
+                string analysisPowerSource = analysisLoadSource.WireName();
                 string row = Csv.Line(now.ToString("O"), c.GpuUuid, g.Power, v?.Volts, v?.Timestamp.ToString("O"), analysisPower,
                     analysisPowerSource, g.Temperature, g.Utilization, g.Limit,
-                    v != null ? voltageSource?.Description : null, v?.Extras, result.Bin, result.Reference, result.Median, result.P05, result.Drop, result.Status, detail) + "\n";
+                    v != null ? voltageSource?.Description : null, v?.Extras, result.Bin, result.Reference, result.Median, result.P05, result.Drop, result.Status, detail,
+                    electrical?.Connector.CurrentA, electrical?.Connector.PowerW, electrical?.Pcie.VoltageV,
+                    electrical?.Pcie.CurrentA, electrical?.Pcie.PowerW, electrical?.Source,
+                    electrical?.Freshness.Kind, electrical?.Freshness.SourceTimestampUtc?.ToString("O"),
+                    electrical?.Connector.PowerProvenance, load?.Unit) + "\n";
                 storage.Add(now, row);
                 var progress = analysis.Progress;
                 var state = new
                 {
-                    schema_version = 2,
+                    schema_version = 3,
                     gpu_uuid = c.GpuUuid,
                     process_id = control.ProcessId,
                     instance_id = control.InstanceId,
@@ -553,6 +599,8 @@ public static class Program
                     gpu = g,
                     voltage = v,
                     voltage_source = voltageSource?.Description,
+                    electrical,
+                    analysis_load = load,
                     analysis = result,
                     progress = new
                     {
@@ -568,7 +616,7 @@ public static class Program
                 };
                 latestState = JsonSerializer.Serialize(state, Json);
                 control.Publish(latestState, row);
-                bool urgent = result.Status != previousStatus && result.Status is "SUDDEN_DROOP" or "BASELINE_SHIFT" or "VOLTAGE_UNAVAILABLE" or "POWER_UNAVAILABLE";
+                bool urgent = result.Status != previousStatus && result.Status is "SUDDEN_DROOP" or "BASELINE_SHIFT" or "VOLTAGE_UNAVAILABLE" or "POWER_UNAVAILABLE" or "ANALYSIS_LOAD_UNAVAILABLE";
 
                 bool suppressAlerts = control.AlertsSuppressed;
                 if (result.Status != previousStatus)
@@ -644,10 +692,12 @@ public static class Program
                     ["timestamp_utc"] = DateTimeOffset.UtcNow,
                     ["gpu"] = null,
                     ["voltage"] = null,
+                    ["electrical"] = null,
+                    ["analysis_load"] = null,
                     ["analysis"] = null,
                     ["detail"] = "Monitor stopped before the first sample.",
                 };
-            state["schema_version"] = 2;
+            state["schema_version"] = 3;
             state["process_id"] = control?.ProcessId ?? Environment.ProcessId;
             state["instance_id"] = control?.InstanceId ?? Guid.NewGuid().ToString("N");
             if (progress is not null)
@@ -683,13 +733,15 @@ public static class Program
         {
             var state = new
             {
-                schema_version = 2,
+                schema_version = 3,
                 process_id = Environment.ProcessId,
                 instance_id = instanceId ?? Guid.NewGuid().ToString("N"),
                 timestamp_utc = now,
                 gpu = new Gpu(null, null, null, null),
                 voltage = (Voltage?)null,
                 voltage_source = source,
+                electrical = (ElectricalSample?)null,
+                analysis_load = (AnalysisLoadSelection?)null,
                 analysis = result,
                 progress = new
                 {

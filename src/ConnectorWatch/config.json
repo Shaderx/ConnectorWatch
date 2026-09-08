@@ -9,6 +9,7 @@
   "RailJson": "",
   "VoltageColumn": "",
   "PowerColumn": "",
+  "AnalysisLoadSource": "CONNECTOR_POWER",
   "ExtraVoltageColumns": [],
   "DateColumn": "Date",
   "TimeColumn": "Time",
