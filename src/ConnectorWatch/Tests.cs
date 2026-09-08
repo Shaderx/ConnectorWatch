@@ -157,6 +157,7 @@ public static class Tests
         IncidentLatchingTests.Run();
         PowerLimitWatchdogTests.Run();
         RecordedDataCharacterizationTests.Run();
+        EarlyWarningIntegrationTests.Run();
         Console.WriteLine($"PASS: {passed} behavioral checks.");
     }
 }

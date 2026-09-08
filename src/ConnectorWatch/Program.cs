@@ -615,6 +615,146 @@ public sealed class Analysis(Config c, Dictionary<int, Bin>? saved = null)
 }
 
 public sealed record Saved(string Identity, Dictionary<int, Bin> Bins);
+
+/// <summary>
+/// The daemon-side seam for the optional early-warning pipeline.  It keeps
+/// training evidence separate from the immutable accepted artifact and owns
+/// detector continuity state; the legacy <see cref="Analysis"/> remains the
+/// source of the existing status and alert decisions.
+/// </summary>
+internal sealed class DifferentialModelRuntime
+{
+    readonly DifferentialModelOptions options;
+    readonly CompositeResidualDetector detector;
+    readonly List<DifferentialSample> learningSamples = [];
+    readonly int maximumLearningSamples;
+
+    public DifferentialModelRuntime(DifferentialModelOptions options,
+        ResidualDetectorOptions detectorOptions, int maximumLearningSamples = 10_000)
+    {
+        this.options = options ?? throw new ArgumentNullException(nameof(options));
+        this.options.Validate();
+        detector = ResidualDetectorFactory.CreateComposite(detectorOptions);
+        this.maximumLearningSamples = Math.Max(this.options.MinimumSamples, maximumLearningSamples);
+    }
+
+    public DifferentialModelArtifact? Artifact { get; private set; }
+    public int LearningSampleCount => learningSamples.Count;
+    public CompositeResidualDetectorResult? LastDetector { get; private set; }
+    public DifferentialPrediction? LastPrediction { get; private set; }
+    public DifferentialModelOptions Options => options;
+
+    public void Load(DifferentialModelArtifact artifact)
+    {
+        if (artifact is null) throw new ArgumentNullException(nameof(artifact));
+        if (!artifact.Identity.Matches(options.Identity) || artifact.LoadProxy != options.LoadProxy)
+            throw new InvalidDataException("Differential artifact identity does not match the current monitor.");
+        Artifact = artifact;
+        detector.Reset();
+        LastPrediction = null;
+        LastDetector = null;
+    }
+
+    public DifferentialModelFitResult FitAndFreeze(DateTimeOffset acceptedAtUtc)
+    {
+        var fitOptions = options with { ArtifactCreatedAtUtc = acceptedAtUtc.ToUniversalTime() };
+        var result = DifferentialModelTrainer.Fit(learningSamples, fitOptions);
+        Artifact = result.Artifact;
+        learningSamples.Clear();
+        detector.Reset();
+        LastPrediction = null;
+        LastDetector = null;
+        return result;
+    }
+
+    public void Archive()
+    {
+        Artifact = null;
+        learningSamples.Clear();
+        detector.Reset();
+        LastPrediction = null;
+        LastDetector = null;
+    }
+
+    public DifferentialRuntimeObservation Observe(DifferentialSample sample,
+        bool candidateLearning)
+    {
+        if (sample is null) throw new ArgumentNullException(nameof(sample));
+        bool admitted = candidateLearning && IsQualifiedForLearning(sample);
+        if (admitted)
+        {
+            learningSamples.Add(sample);
+            while (learningSamples.Count > maximumLearningSamples)
+                learningSamples.RemoveAt(0);
+        }
+
+        var prediction = Artifact is null
+            ? Unavailable(sample, DifferentialSampleRejectionReason.MISSING_FEATURE,
+                "No matching frozen differential artifact is available.")
+            : Artifact.Predict(sample);
+        var residual = ToResidualObservation(prediction, options.Identity.CanonicalKey);
+        LastPrediction = prediction;
+        LastDetector = detector.Update(residual);
+        return new(admitted, prediction, LastDetector);
+    }
+
+    bool IsQualifiedForLearning(DifferentialSample sample)
+    {
+        if (sample.TimestampUtc == default || sample.InputVoltageV is not double voltage ||
+            !double.IsFinite(voltage) || !sample.IsFresh || !sample.IsSynchronized ||
+            !sample.IsSettled)
+            return false;
+        if (sample.AgeSeconds is double age &&
+            (!double.IsFinite(age) || age < 0 || age > options.MaxSampleAgeSeconds))
+            return false;
+        foreach (var timestamp in new[] { sample.VoltageTimestampUtc, sample.FeatureTimestampUtc })
+        {
+            if (timestamp is DateTimeOffset sourceTimestamp &&
+                (!double.IsFinite((sourceTimestamp - sample.TimestampUtc).TotalSeconds) ||
+                 Math.Abs((sourceTimestamp - sample.TimestampUtc).TotalSeconds) >
+                    options.SynchronizationToleranceSeconds))
+                return false;
+        }
+        var features = new List<DifferentialFeatureKind> { DifferentialFeatureKind.LOAD_PROXY };
+        if (options.IncludeBoardPower && options.LoadProxy != DifferentialLoadProxy.NVML_BOARD_POWER)
+            features.Add(DifferentialFeatureKind.BOARD_POWER);
+        if (options.IncludeTemperature) features.Add(DifferentialFeatureKind.TEMPERATURE);
+        foreach (var feature in features)
+        {
+            if (!sample.Features.TryGet(feature, options.LoadProxy, out var value)) return false;
+            var bounds = options.Bounds.For(feature);
+            if (bounds is not null && !bounds.Contains(value)) return false;
+        }
+        return !options.RejectIdentityMismatch || options.Identity.IsUnspecified ||
+            string.Equals(sample.Identity, options.Identity.CanonicalKey, StringComparison.Ordinal);
+    }
+
+    static DifferentialPrediction Unavailable(DifferentialSample sample,
+        DifferentialSampleRejectionReason reason, string detail)
+    {
+        var qualification = new DifferentialSampleQualification(false, sample.IsFresh,
+            sample.IsSynchronized, false, false, sample.IsSettled, false,
+            new[] { reason }, detail);
+        return new(sample.TimestampUtc, false, qualification, null,
+            sample.InputVoltageV, null, null, null, detail);
+    }
+
+    static ResidualObservation ToResidualObservation(DifferentialPrediction prediction,
+        string identity)
+    {
+        var qualification = prediction.Qualification;
+        return new ResidualObservation(prediction.TimestampUtc, prediction.ResidualVolts,
+            prediction.IsAvailable, qualification.IsFresh, qualification.IsSynchronized,
+            qualification.IsSettled, null, identity, prediction.ExpectedVoltageV,
+            prediction.ObservedVoltageV, prediction.IsAvailable ? null : prediction.Detail);
+    }
+}
+
+internal sealed record DifferentialRuntimeObservation(
+    bool LearningSampleAdmitted,
+    DifferentialPrediction Prediction,
+    CompositeResidualDetectorResult Detector);
+
 public static class Program
 {
     static readonly JsonSerializerOptions Json = new()
@@ -672,6 +812,48 @@ public static class Program
             schemaVersion: 3,
             qualification: qualification);
     }
+
+    internal static DifferentialModelIdentity BuildDifferentialIdentity(ReferenceIdentity referenceIdentity) =>
+        new(gpuUuid: referenceIdentity.GpuUuid,
+            board: referenceIdentity.Board,
+            driver: referenceIdentity.Driver,
+            voltageSource: referenceIdentity.Source,
+            // The reference fingerprint includes the selected source,
+            // qualification gates, and configuration-bearing identity. A
+            // changed reference identity therefore cannot reuse this artifact.
+            configurationId: referenceIdentity.VersionedKey);
+
+    internal static DifferentialModelOptions BuildDifferentialOptions(Config c,
+        ReferenceIdentity referenceIdentity)
+    {
+        var identity = BuildDifferentialIdentity(referenceIdentity);
+        var proxy = DifferentialLoadProxyExtensions.FromAnalysisLoadSource(
+            referenceIdentity.AnalysisLoadSource);
+        return new DifferentialModelOptions
+        {
+            LoadProxy = proxy,
+            IncludeBoardPower = true,
+            IncludeTemperature = true,
+            // The model intentionally shares the source/config identity with
+            // the accepted reference but keeps its own algorithm/schema.
+            Identity = identity,
+            MaxSampleAgeSeconds = c.MaxAgeSeconds,
+            SynchronizationToleranceSeconds = Math.Max(.5, c.SampleSeconds),
+            ExcessDroopAllowanceVolts = 0,
+        };
+    }
+
+    internal static ResidualDetectorOptions BuildResidualDetectorOptions(Config c,
+        DifferentialModelIdentity identity) => new()
+    {
+        FastDroopThresholdVolts = c.SuddenDroopVolts,
+        EwmaDroopThresholdVolts = c.ShiftVolts,
+        EwmaRecoveryThresholdVolts = Math.Min(.05, c.ShiftVolts / 2),
+        EwmaConfirmationSamples = c.SustainSamples,
+        MaximumGapSeconds = Math.Max(c.MaxAgeSeconds, c.SampleSeconds * 3),
+        MaximumSampleAgeSeconds = c.MaxAgeSeconds,
+        ExpectedIdentity = identity.CanonicalKey,
+    };
 
     internal static Dictionary<int, Bin> BuildAnalysisBins(ReferenceLifecycle lifecycle,
         Saved? legacySaved)
@@ -840,6 +1022,60 @@ public static class Program
             var lifecycle = referenceLoad.Lifecycle;
             var referenceGate = new object();
             var analysis = new Analysis(c, BuildAnalysisBins(lifecycle, saved));
+            var differentialIdentity = BuildDifferentialIdentity(referenceIdentity);
+            var differentialOptions = BuildDifferentialOptions(c, referenceIdentity);
+            var differentialRuntime = new DifferentialModelRuntime(differentialOptions,
+                BuildResidualDetectorOptions(c, differentialIdentity));
+            string differentialModelPath = Path.Combine(data, "differential-model.json");
+            string? differentialModelDetail = null;
+            if (lifecycle.Snapshot().CanAnalyze && File.Exists(differentialModelPath))
+            {
+                try
+                {
+                    var persistedArtifact = DifferentialModelPersistence.Deserialize(
+                        File.ReadAllText(differentialModelPath));
+                    if (!persistedArtifact.Identity.Matches(differentialIdentity) ||
+                        persistedArtifact.LoadProxy != differentialOptions.LoadProxy)
+                        differentialModelDetail = "Persisted differential artifact identity does not match; it remains inactive.";
+                    else
+                        differentialRuntime.Load(persistedArtifact);
+                }
+                catch (Exception ex) when (ex is FormatException or NotSupportedException or
+                    InvalidDataException or ArgumentException or IOException)
+                {
+                    // An artifact is immutable and versioned. Never rewrite or
+                    // migrate a malformed, old, or mismatched file at startup.
+                    differentialModelDetail = "Persisted differential artifact is unavailable: " + ex.Message;
+                }
+            }
+            else if (File.Exists(differentialModelPath))
+            {
+                differentialModelDetail = "Differential artifact is held inactive until a matching accepted reference is available.";
+            }
+
+            string incidentsPath = Path.Combine(data, "incidents.json");
+            string incidentIdentity = referenceIdentity.VersionedKey;
+            IncidentLedger incidentLedger;
+            string? incidentLoadDetail = null;
+            if (File.Exists(incidentsPath))
+            {
+                try
+                {
+                    incidentLedger = IncidentLedger.Load(File.ReadAllText(incidentsPath), incidentIdentity);
+                }
+                catch (Exception ex) when (ex is FormatException or JsonException or
+                    InvalidDataException or ArgumentException or IOException)
+                {
+                    // Keep the old ledger on disk for operator forensics, but
+                    // fail closed with a fresh identity-bound ledger in RAM.
+                    incidentLedger = new IncidentLedger(incidentIdentity);
+                    incidentLoadDetail = "Persisted incident ledger is unavailable: " + ex.Message;
+                }
+            }
+            else
+            {
+                incidentLedger = new IncidentLedger(incidentIdentity);
+            }
 
             string BaselineMirror() => JsonSerializer.Serialize(new Saved(identity, analysis.Bins), Json);
             void PersistReferenceLocked()
@@ -850,6 +1086,14 @@ public static class Program
                 // and acceptance metadata live in reference.json.
                 Atomic(baselinePath, BaselineMirror());
             }
+            void PersistDifferentialModelLocked()
+            {
+                if (differentialRuntime.Artifact is not null)
+                    Atomic(differentialModelPath,
+                        DifferentialModelPersistence.Serialize(differentialRuntime.Artifact));
+            }
+            void PersistIncidentsLocked() =>
+                Atomic(incidentsPath, incidentLedger.ToJson());
             ControlCommandResult? HandleReferenceCommand(ControlRequest request)
             {
                 lock (referenceGate)
@@ -868,6 +1112,11 @@ public static class Program
                         if (operation.Succeeded && lifecycle.Accepted is not null)
                         {
                             analysis.ApplyAccepted(lifecycle.Accepted);
+                            // Acceptance is the only operation that may fit
+                            // and replace the immutable differential artifact.
+                            var fit = differentialRuntime.FitAndFreeze(now);
+                            differentialModelDetail = fit.Detail;
+                            PersistDifferentialModelLocked();
                             PersistReferenceLocked();
                         }
                         return new(operation.Succeeded, operation.Detail,
@@ -879,6 +1128,8 @@ public static class Program
                         _ = lifecycle.ArchiveAccepted(now, actor,
                             ReferenceArchiveReason.EXPLICIT, note);
                         analysis.ArchiveReferences();
+                        differentialRuntime.Archive();
+                        differentialModelDetail = "Differential artifact is inactive until the next explicit reference acceptance.";
                         PersistReferenceLocked();
                         return new(true, lifecycle.Detail, lifecycle.State.WireName());
                     }
@@ -889,6 +1140,41 @@ public static class Program
                 }
             }
             control.ReferenceCommand = HandleReferenceCommand;
+            ControlCommandResult? HandleIncidentCommand(ControlRequest request)
+            {
+                lock (referenceGate)
+                {
+                    string command = request.Command.Trim().ToLowerInvariant();
+                    string actor = string.IsNullOrWhiteSpace(request.Operator)
+                        ? request.ClientId : request.Operator.Trim();
+                    string incidentId = request.IncidentId?.Trim() ?? "";
+                    string note = request.Note?.Trim() ?? "";
+                    try
+                    {
+                        if (command == "acknowledge-incident")
+                            _ = incidentLedger.Acknowledge(incidentId,
+                                DateTimeOffset.UtcNow, actor, note);
+                        else if (command == "resolve-incident")
+                            _ = incidentLedger.Resolve(incidentId, DateTimeOffset.UtcNow,
+                                actor, note);
+                        else
+                            return new(false, "Unknown incident command.",
+                                IncidentId: incidentId);
+
+                        var incident = incidentLedger.Get(incidentId);
+                        PersistIncidentsLocked();
+                        return new(true, command + " applied.",
+                            IncidentId: incidentId,
+                            IncidentState: incident?.State.WireName());
+                    }
+                    catch (Exception ex) when (ex is ArgumentException or KeyNotFoundException or
+                        InvalidOperationException)
+                    {
+                        return new(false, ex.Message, IncidentId: incidentId);
+                    }
+                }
+            }
+            control.IncidentCommand = HandleIncidentCommand;
             Nvml nvml;
             try { nvml = new Nvml(c.GpuUuid); }
             catch (Exception ex)
@@ -951,11 +1237,15 @@ public static class Program
                 ReferenceStatusSnapshot referenceStatus;
                 bool referenceChanged;
                 AnalysisProgress analysisProgress;
+                DifferentialRuntimeObservation? differentialObservation = null;
+                IncidentObservationResult? incidentObservation = null;
+                bool newSensor = false;
                 lock (referenceGate)
                 {
                     result = new Result(status, null, null, null, null, null);
                     if (v != null && (!lastSensor.HasValue || v.Timestamp > lastSensor.Value))
                     {
+                        newSensor = true;
                         result = analysis.Add(v.Timestamp, analysisPower, v.Volts,
                             clock.Elapsed.TotalSeconds, electrical?.IsFresh == true);
                         lastSensor = v.Timestamp;
@@ -980,6 +1270,54 @@ public static class Program
                     referenceStatus = lifecycle.Snapshot();
                     referenceChanged = beforeState != referenceStatus.State ||
                         beforeCandidateQualified != (referenceStatus.Candidate?.IsQualified == true);
+
+                    if (newSensor && electrical is not null && v is not null)
+                    {
+                        var differentialSample = DifferentialSample.FromElectricalSample(
+                            electrical,
+                            boardPowerW: g.Power,
+                            temperatureC: g.Temperature,
+                            isSettled: result.LoadQualification?.IsQualified == true,
+                            identity: differentialIdentity.CanonicalKey);
+                        bool candidateLearning = referenceStatus.State ==
+                                ReferenceLifecycleState.REFERENCE_UNVERIFIED &&
+                            referenceStatus.Compatibility is ReferenceCompatibility.COMPATIBLE or
+                                ReferenceCompatibility.RESTART or ReferenceCompatibility.LEGACY;
+                        differentialObservation = differentialRuntime.Observe(differentialSample,
+                            candidateLearning);
+
+                        bool residualAlert = differentialObservation.Detector.IsAlert;
+                        bool legacyAlert = result.Status is "SUDDEN_DROOP" or "BASELINE_SHIFT" or
+                            "GROSS_UNDERVOLTAGE" or "GROSS_OVERVOLTAGE" or "RAPID_VOLTAGE_RISE";
+                        if (residualAlert || legacyAlert)
+                        {
+                            var selected = residualAlert
+                                ? differentialObservation.Detector.Selected
+                                : null;
+                            string incidentStatus = selected?.Status.WireName() ?? result.Status;
+                            string incidentDetector = selected?.Detector ?? "legacy_trend";
+                            string incidentDetail = string.Join("; ", new[]
+                            {
+                                detail,
+                                selected?.Detail,
+                            }.Where(x => !string.IsNullOrWhiteSpace(x)));
+                            var trigger = new IncidentTrigger(incidentDetector,
+                                incidentStatus,
+                                incidentStatus is "SUDDEN_DROOP" or "GROSS_UNDERVOLTAGE"
+                                    ? IncidentSeverity.CRITICAL : IncidentSeverity.WARNING,
+                                dedupeKey: incidentDetector + ":" + incidentStatus,
+                                detail: incidentDetail);
+                            var observation = new IncidentObservation(v.Timestamp,
+                                incidentStatus, v.Volts, analysisPower, incidentDetail);
+                            incidentObservation = incidentLedger.Observe(observation, trigger);
+                        }
+                        else
+                        {
+                            var observation = new IncidentObservation(v.Timestamp,
+                                result.Status, v.Volts, analysisPower, detail);
+                            incidentObservation = incidentLedger.Observe(observation);
+                        }
+                    }
                     analysisProgress = analysis.Progress;
                 }
                 double sampleDuration = priorCompletedPoll.HasValue
@@ -1060,6 +1398,38 @@ public static class Program
                     analysis_load = load,
                     analysis = result,
                     reference_lifecycle = referenceStatus,
+                    differential_model = new
+                    {
+                        is_loaded = differentialRuntime.Artifact is not null,
+                        is_fitted = differentialRuntime.Artifact?.IsFitted == true,
+                        artifact_hash = differentialRuntime.Artifact?.ArtifactHash,
+                        state = differentialRuntime.Artifact?.Diagnostics.State,
+                        apparent_slope_v_per_unit = differentialRuntime.Artifact?.ApparentSlopeVoltsPerUnit,
+                        detail = differentialModelDetail ?? differentialRuntime.Artifact?.Diagnostics.Detail,
+                        learning_samples = differentialRuntime.LearningSampleCount,
+                    },
+                    differential_prediction = differentialObservation?.Prediction,
+                    residual_detector = differentialObservation?.Detector,
+                    incident_ledger = new
+                    {
+                        identity = incidentIdentity,
+                        detail = incidentLoadDetail,
+                    },
+                    // Keep live/status payloads bounded; full pre/post evidence
+                    // remains in incidents.json.
+                    incidents = incidentLedger.Incidents.Select(incident => new
+                    {
+                        incident_id = incident.IncidentId,
+                        incident.Detector,
+                        incident.Status,
+                        incident.Severity,
+                        state = incident.State.WireName(),
+                        incident.TriggeredAtUtc,
+                        acknowledged_at_utc = incident.Acknowledgement?.AcknowledgedAtUtc,
+                        resolved_at_utc = incident.Resolution?.ResolvedAtUtc,
+                        post_complete = incident.Forensic.PostComplete,
+                    }),
+                    incident_event = incidentObservation,
                     acquisition,
                     coverage,
                     poll_timing = pollTiming,
@@ -1078,7 +1448,11 @@ public static class Program
                 };
                 latestState = JsonSerializer.Serialize(state, Json);
                 control.Publish(latestState, row);
-                bool urgent = referenceChanged || result.Status != previousStatus && result.Status is "SUDDEN_DROOP" or "BASELINE_SHIFT" or "VOLTAGE_UNAVAILABLE" or "POWER_UNAVAILABLE" or "ANALYSIS_LOAD_UNAVAILABLE";
+                bool incidentTriggered = incidentObservation?.Triggered == true;
+                bool urgent = referenceChanged || incidentTriggered ||
+                    (result.Status != previousStatus && result.Status is ("SUDDEN_DROOP" or
+                        "BASELINE_SHIFT" or "VOLTAGE_UNAVAILABLE" or "POWER_UNAVAILABLE" or
+                        "ANALYSIS_LOAD_UNAVAILABLE"));
 
                 bool suppressAlerts = control.AlertsSuppressed;
                 if (result.Status != previousStatus)
@@ -1104,12 +1478,19 @@ public static class Program
                     lock (referenceGate)
                     {
                         PersistReferenceLocked();
+                        PersistDifferentialModelLocked();
+                        PersistIncidentsLocked();
                         storage.Flush(clock.Elapsed.TotalSeconds, latestState, BaselineMirror());
                     }
                 }
                 if (terminalFailure != null)
                 {
-                    lock (referenceGate) PersistReferenceLocked();
+                    lock (referenceGate)
+                    {
+                        PersistReferenceLocked();
+                        PersistDifferentialModelLocked();
+                        PersistIncidentsLocked();
+                    }
                     throw new Exception("ConnectorWatch stopped after a terminal voltage-source failure.", terminalFailure);
                 }
                 n++;
@@ -1125,11 +1506,18 @@ public static class Program
             {
                 if (latestState != null) storage.Flush(clock.Elapsed.TotalSeconds, latestState, BaselineMirror());
                 PersistReferenceLocked();
+                PersistDifferentialModelLocked();
+                PersistIncidentsLocked();
             }
             samplingProgress.MarkStopped(control.StopRequested ? "control" : stop.IsCancellationRequested ? "signal" : "sample_limit");
             MarkStopped(Path.Combine(data, "status.json"), control.StopRequested ? "control" : stop.IsCancellationRequested ? "signal" : "sample_limit",
                 control, analysis.Progress, samplingProgress.Snapshot(Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow));
-            lock (referenceGate) PersistReferenceLocked();
+            lock (referenceGate)
+            {
+                PersistReferenceLocked();
+                PersistDifferentialModelLocked();
+                PersistIncidentsLocked();
+            }
             if (stop.IsCancellationRequested) Console.WriteLine("ConnectorWatch: shutdown requested; state saved.");
             return 0;
         }

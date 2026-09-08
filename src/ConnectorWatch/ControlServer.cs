@@ -33,6 +33,10 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
     /// </summary>
     public Func<ControlRequest, ControlCommandResult?>? ReferenceCommand { get; set; }
 
+    /// <summary>Handles explicit incident lifecycle commands separately from
+    /// reference acceptance so acknowledgement cannot alter the reference.</summary>
+    public Func<ControlRequest, ControlCommandResult?>? IncidentCommand { get; set; }
+
     public ControlServer(string dataDirectory, CancellationTokenSource shutdown,
         string? instanceId = null, int? processId = null)
         : this(dataDirectory, shutdown.Token, shutdown.Cancel, instanceId, processId)
@@ -113,6 +117,7 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
         bool ok = false;
         bool stopRequested = false;
         bool referenceCommandRequested = false;
+        bool incidentCommandRequested = false;
         bool identityMatches = false;
         ControlCommandResult? commandResult = null;
         if (request is not null &&
@@ -139,10 +144,16 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
                     "accept-reference" when identityMatches => true,
                     "migrate-reference" when identityMatches => true,
                     "archive-reference" when identityMatches => true,
+                    "acknowledge-incident" when identityMatches &&
+                        !string.IsNullOrWhiteSpace(request.IncidentId) => true,
+                    "resolve-incident" when identityMatches &&
+                        !string.IsNullOrWhiteSpace(request.IncidentId) => true,
                     _ => false,
                 };
                 referenceCommandRequested = identityMatches && command is
-                    "accept-reference" or "migrate-reference" or "archive-reference";
+                    ("accept-reference" or "migrate-reference" or "archive-reference");
+                incidentCommandRequested = identityMatches && command is
+                    ("acknowledge-incident" or "resolve-incident");
                 stopRequested = ok && command == "stop";
             }
 
@@ -161,6 +172,32 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
                 }
             }
 
+            if (incidentCommandRequested)
+            {
+                if (string.IsNullOrWhiteSpace(request.IncidentId))
+                {
+                    commandResult = new ControlCommandResult(false,
+                        "incident_id is required for incident commands.");
+                    ok = false;
+                }
+                else
+                {
+                    try
+                    {
+                        commandResult = IncidentCommand?.Invoke(request) ??
+                            new ControlCommandResult(false,
+                                "Incident operator commands are unavailable during startup.");
+                        ok = commandResult.Ok;
+                    }
+                    catch (Exception ex)
+                    {
+                        commandResult = new ControlCommandResult(false, ex.Message,
+                            IncidentId: request.IncidentId);
+                        ok = false;
+                    }
+                }
+            }
+
             if (stopRequested)
             {
                 Volatile.Write(ref stopCommandReceived, 1);
@@ -171,7 +208,9 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
         return new ControlResponse(ControlProtocol.Version, ProcessId, dataDirectory, InstanceId, ok,
             ok && request is not null && string.Equals(request.Command.Trim(), "live", StringComparison.OrdinalIgnoreCase) ? ReadLive() : null,
             commandResult?.Detail,
-            commandResult?.ReferenceState);
+            commandResult?.ReferenceState,
+            commandResult?.IncidentId,
+            commandResult?.IncidentState);
     }
 
     bool GrantLeaseLocked(string clientId, long now)

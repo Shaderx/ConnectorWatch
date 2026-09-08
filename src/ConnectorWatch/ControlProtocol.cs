@@ -60,12 +60,20 @@ public sealed record ControlRequest(
     string? Note = null,
     [property: JsonPropertyName("explicit_legacy_migration")]
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-    bool ExplicitLegacyMigration = false);
+    bool ExplicitLegacyMigration = false,
+    [property: JsonPropertyName("incident_id")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? IncidentId = null);
 
 /// <summary>Result returned by an identity-bound daemon command. This is kept
 /// separate from the pipe response so the existing hello/live/lease protocol
 /// remains source-compatible for older GUI clients.</summary>
-public sealed record ControlCommandResult(bool Ok, string Detail = "", string? ReferenceState = null);
+public sealed record ControlCommandResult(
+    bool Ok,
+    string Detail = "",
+    string? ReferenceState = null,
+    string? IncidentId = null,
+    string? IncidentState = null);
 
 public sealed record ControlResponse(
     [property: JsonPropertyName("protocol")] int Protocol,
@@ -78,7 +86,11 @@ public sealed record ControlResponse(
     [property: JsonPropertyName("detail")]
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Detail = null,
     [property: JsonPropertyName("reference_state")]
-    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ReferenceState = null);
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ReferenceState = null,
+    [property: JsonPropertyName("incident_id")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? IncidentId = null,
+    [property: JsonPropertyName("incident_state")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? IncidentState = null);
 
 public sealed record LiveTelemetry(string Status, string Header, string[] Rows);
 
