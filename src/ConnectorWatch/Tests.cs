@@ -155,6 +155,7 @@ public static class Tests
         DifferentialModelTests.Run();
         ResidualDetectorTests.Run();
         IncidentLatchingTests.Run();
+        RecordedDataCharacterizationTests.Run();
         Console.WriteLine($"PASS: {passed} behavioral checks.");
     }
 }
