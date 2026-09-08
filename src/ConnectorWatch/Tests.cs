@@ -152,6 +152,7 @@ public static class Tests
         TelemetryPhaseOneTests.Run();
         ReferenceLifecycleTests.Run();
         OfflineReplayTests.Run();
+        DifferentialModelTests.Run();
         Console.WriteLine($"PASS: {passed} behavioral checks.");
     }
 }
