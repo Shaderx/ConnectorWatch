@@ -385,8 +385,13 @@ public sealed class RailJsonLog(Config c) : IVoltageSource
 public sealed class Bin
 {
     public List<double> Learning { get; set; } = [];
+    // Reference is the explicitly accepted, frozen value. CandidateReference
+    // is learned evidence awaiting operator review; it must never be used for
+    // shift detection or be promoted implicitly when the sample count closes.
     public double? Reference { get; set; }
     public double? ReferenceP05 { get; set; }
+    public double? CandidateReference { get; set; }
+    public double? CandidateReferenceP05 { get; set; }
 }
 public sealed record Result(string Status, int? Bin, double? Reference, double? Median, double? P05, double? Drop)
 {
@@ -434,6 +439,79 @@ public sealed class Analysis(Config c, Dictionary<int, Bin>? saved = null)
     {
         coarseGuard.Gap();
         TrendGap();
+    }
+
+    /// <summary>
+    /// Returns a detached candidate snapshot for the lifecycle owner. An
+    /// accepted reference is included as context for already-qualified bins,
+    /// but only bins with CandidateReference indicate newly learned evidence.
+    /// </summary>
+    public ReferenceCandidateModel? BuildCandidate(ReferenceIdentity identity,
+        DateTimeOffset observedAtUtc)
+    {
+        var changed = Bins.Values.Any(b => b.CandidateReference.HasValue);
+        if (!changed) return null;
+
+        var bins = Bins
+            .Where(pair => pair.Value.Reference.HasValue || pair.Value.CandidateReference.HasValue)
+            .ToDictionary(pair => pair.Key, pair =>
+                new ReferenceBinStatistics(pair.Key,
+                    pair.Value.CandidateReference ?? pair.Value.Reference,
+                    pair.Value.CandidateReferenceP05 ?? pair.Value.ReferenceP05,
+                    pair.Value.Learning.Count,
+                    pair.Value.Learning.Count));
+        if (bins.Count == 0) return null;
+
+        var qualified = bins.Values.All(x => x.IsQualified) &&
+            Bins.Values.Where(x => x.CandidateReference.HasValue)
+                .All(x => x.CandidateReference.HasValue);
+        var first = observedAtUtc.AddSeconds(-Math.Max(0, c.BaselineSamples - 1) * c.SampleSeconds);
+        return ReferenceCandidateModel.Learned(identity, bins,
+            qualifiedSamples: Bins.Values.Sum(x => x.CandidateReference.HasValue
+                ? c.BaselineSamples : 0),
+            requiredSamples: c.BaselineSamples,
+            firstObservedAtUtc: first,
+            lastObservedAtUtc: observedAtUtc,
+            isQualified: qualified,
+            detail: qualified
+                ? "A qualified candidate is available; explicit acceptance is still required."
+                : "Reference learning is still in progress; no accepted reference was changed.");
+    }
+
+    /// <summary>Applies only an explicitly accepted snapshot. The lifecycle
+    /// owner calls this after AcceptCandidate succeeds.</summary>
+    public void ApplyAccepted(AcceptedReferenceModel accepted)
+    {
+        if (accepted is null) throw new ArgumentNullException(nameof(accepted));
+        foreach (var pair in accepted.Bins)
+        {
+            if (!Bins.TryGetValue(pair.Key, out var b)) Bins[pair.Key] = b = new();
+            b.Reference = pair.Value.ReferenceVolts;
+            b.ReferenceP05 = pair.Value.ReferenceP05Volts;
+            b.CandidateReference = null;
+            b.CandidateReferenceP05 = null;
+            b.Learning.Clear();
+        }
+        windows.Clear();
+        sustained = 0;
+        Progress = new(0, c.BaselineSamples, 0, c.WindowSamples, 0, c.StableSamples);
+    }
+
+    /// <summary>Removes all accepted and candidate values after an explicit
+    /// archive, forcing a new qualification cycle.</summary>
+    public void ArchiveReferences()
+    {
+        foreach (var b in Bins.Values)
+        {
+            b.Reference = null;
+            b.ReferenceP05 = null;
+            b.CandidateReference = null;
+            b.CandidateReferenceP05 = null;
+            b.Learning.Clear();
+        }
+        windows.Clear();
+        sustained = 0;
+        Progress = new(0, c.BaselineSamples, 0, c.WindowSamples, 0, c.StableSamples);
     }
 
     void TrendGap()
@@ -494,13 +572,22 @@ public sealed class Analysis(Config c, Dictionary<int, Bin>? saved = null)
         double median = Percentile(q.Select(x => x.V), .5), p05 = Percentile(q.Select(x => x.V), .05);
         if (!b.Reference.HasValue)
         {
-            b.Learning.Add(volts);
-            if (b.Learning.Count >= c.BaselineSamples)
+            // A completed candidate remains a candidate until an operator
+            // explicitly accepts it. Continue reporting it, but do not use it
+            // as a baseline and do not keep mutating the frozen statistics.
+            if (!b.CandidateReference.HasValue)
             {
-                b.Reference = Percentile(b.Learning, .5); b.ReferenceP05 = Percentile(b.Learning, .05); b.Learning.Clear();
+                b.Learning.Add(volts);
+                if (b.Learning.Count >= c.BaselineSamples)
+                {
+                    b.CandidateReference = Percentile(b.Learning, .5);
+                    b.CandidateReferenceP05 = Percentile(b.Learning, .05);
+                    b.Learning.Clear();
+                }
             }
-            SetProgress(b.Learning.Count, q.Count);
-            return new("LEARNING_REFERENCE", bin, b.Reference, median, p05, null)
+            SetProgress(b.CandidateReference.HasValue ? 0 : b.Learning.Count, q.Count);
+            return new(b.CandidateReference.HasValue ? "REFERENCE_UNVERIFIED" : "LEARNING_REFERENCE",
+                bin, null, median, p05, null)
                 { CoarseGuard = coarse, LoadQualification = qualification };
         }
         double drop = b.Reference.Value - median;
@@ -550,6 +637,95 @@ public static class Program
             return AnalysisLoadSource.EXTERNAL_SENSOR_POWER;
         return AnalysisLoadSource.NVML_BOARD_POWER;
     }
+
+    internal static ReferenceIdentity BuildReferenceIdentity(Config c, string sourceMode,
+        string providerIdentity, AnalysisLoadSource analysisLoadSource)
+    {
+        bool direct = sourceMode is "direct" or "nvapi" ||
+            providerIdentity.StartsWith("direct NVIDIA rails", StringComparison.OrdinalIgnoreCase);
+        var qualification = new ReferenceQualificationConfig(
+            binWatts: c.BinWatts,
+            minAnalysisWatts: c.MinAnalysisWatts,
+            stableSamples: c.StableSamples,
+            baselineSamples: c.BaselineSamples,
+            windowSamples: c.WindowSamples,
+            windowMaxAgeSeconds: c.WindowMaxAgeSeconds,
+            maxAgeSeconds: c.MaxAgeSeconds,
+            sampleSeconds: c.SampleSeconds,
+            shiftVolts: c.ShiftVolts,
+            suddenDroopVolts: c.SuddenDroopVolts,
+            sustainSamples: c.SustainSamples,
+            loadBoundaryHysteresisWatts: c.LoadBoundaryHysteresisWatts,
+            coarseConfirmationSeconds: c.CoarseConfirmationSeconds,
+            coarseConfirmationSamples: c.CoarseConfirmationSamples,
+            grossUnderVoltageV: c.GrossUnderVoltageV,
+            grossOverVoltageV: c.GrossOverVoltageV);
+        return ReferenceIdentity.Create(
+            gpuUuid: c.GpuUuid,
+            board: direct ? "NVIDIA-target-2B8510DE-89EE1043" : "external-source",
+            driver: direct ? DirectNvRails.ExpectedDriverVersion : "external-source",
+            source: providerIdentity,
+            abiProfile: direct ? "A612-A613-v1" : "external-v1",
+            analysisLoadSource: analysisLoadSource,
+            featureVersion: "electrical-v1",
+            modelVersion: "trend-v1",
+            schemaVersion: 3,
+            qualification: qualification);
+    }
+
+    internal static Dictionary<int, Bin> BuildAnalysisBins(ReferenceLifecycle lifecycle,
+        Saved? legacySaved)
+    {
+        var bins = legacySaved?.Bins is { } oldBins
+            ? oldBins.ToDictionary(pair => pair.Key, pair => CloneBin(pair.Value))
+            : [];
+        foreach (var b in bins.Values)
+        {
+            // baseline.json is a compatibility mirror. The typed lifecycle is
+            // authoritative for deciding whether these values are accepted or
+            // merely a candidate, so clear the old interpretation first.
+            b.Reference = null;
+            b.ReferenceP05 = null;
+            b.CandidateReference = null;
+            b.CandidateReferenceP05 = null;
+        }
+
+        var snapshot = lifecycle.Snapshot();
+        if (snapshot.CanAnalyze && snapshot.Accepted is not null)
+        {
+            foreach (var pair in snapshot.Accepted.Bins)
+            {
+                if (!bins.TryGetValue(pair.Key, out var b)) bins[pair.Key] = b = new();
+                b.Reference = pair.Value.ReferenceVolts;
+                b.ReferenceP05 = pair.Value.ReferenceP05Volts;
+                b.Learning.Clear();
+            }
+        }
+
+        // A candidate is safe to display and continue learning against, but it
+        // is never passed through the accepted Reference fields.
+        if (snapshot.Compatibility != ReferenceCompatibility.MISMATCH &&
+            snapshot.Candidate is not null)
+        {
+            foreach (var pair in snapshot.Candidate.Bins)
+            {
+                if (!bins.TryGetValue(pair.Key, out var b)) bins[pair.Key] = b = new();
+                b.CandidateReference = pair.Value.ReferenceVolts;
+                b.CandidateReferenceP05 = pair.Value.ReferenceP05Volts;
+                if (b.CandidateReference.HasValue) b.Learning.Clear();
+            }
+        }
+        return bins;
+    }
+
+    static Bin CloneBin(Bin source) => new()
+    {
+        Learning = source.Learning.ToList(),
+        Reference = source.Reference,
+        ReferenceP05 = source.ReferenceP05,
+        CandidateReference = source.CandidateReference,
+        CandidateReferenceP05 = source.CandidateReferenceP05,
+    };
 
     public static int Main(string[] args)
     {
@@ -643,15 +819,82 @@ public static class Program
             var analysisLoadSource = ResolveAnalysisLoadSource(c, sourceMode, voltageSource);
             var identity = $"v4|{c.GpuUuid}|source={sourceMode}|provider={providerIdentity}|{c.HwinfoCsv}|{c.RailJson}|{c.VoltageColumn}|{c.PowerColumn}|analysis-load={analysisLoadSource.WireName()}|qualification=hysteresis-v1|bin={c.BinWatts}|hysteresis={c.LoadBoundaryHysteresisWatts:R}|stable={c.StableSamples}|baseline={c.BaselineSamples}";
             string baselinePath = Path.Combine(data, "baseline.json");
-            Saved? saved = File.Exists(baselinePath) ? JsonSerializer.Deserialize<Saved>(File.ReadAllText(baselinePath)) : null;
-            if (saved != null && saved.Identity != identity && saved.Bins.Count > 0) throw new Exception("Baseline source/config changed. Archive baseline.json before restarting.");
-            var analysis = new Analysis(c, saved?.Bins);
+            string referencePath = Path.Combine(data, "reference.json");
+            Saved? saved = null;
+            if (File.Exists(baselinePath))
+            {
+                try { saved = JsonSerializer.Deserialize<Saved>(File.ReadAllText(baselinePath)); }
+                catch (JsonException) { /* typed reference.json remains authoritative */ }
+            }
+            var referenceIdentity = BuildReferenceIdentity(c, sourceMode, providerIdentity, analysisLoadSource);
+            bool hasPersistedReference = File.Exists(referencePath) || File.Exists(baselinePath);
+            string? persistedReferenceJson = File.Exists(referencePath)
+                ? File.ReadAllText(referencePath)
+                : File.Exists(baselinePath) ? File.ReadAllText(baselinePath) : null;
+            var referenceLoad = ReferencePersistence.Load(persistedReferenceJson, referenceIdentity,
+                DateTimeOffset.UtcNow,
+                new ReferenceStartupContext(
+                    IsRestart: hasPersistedReference,
+                    IsDegraded: voltageSource is null || sourceSetupError is not null,
+                    Detail: sourceSetupError ?? ""));
+            var lifecycle = referenceLoad.Lifecycle;
+            var referenceGate = new object();
+            var analysis = new Analysis(c, BuildAnalysisBins(lifecycle, saved));
+
+            string BaselineMirror() => JsonSerializer.Serialize(new Saved(identity, analysis.Bins), Json);
+            void PersistReferenceLocked()
+            {
+                Atomic(referencePath, ReferencePersistence.Serialize(lifecycle));
+                // Keep the historical shape available to existing GUI builds
+                // and package consumers. It is only a mirror; lifecycle state
+                // and acceptance metadata live in reference.json.
+                Atomic(baselinePath, BaselineMirror());
+            }
+            ControlCommandResult? HandleReferenceCommand(ControlRequest request)
+            {
+                lock (referenceGate)
+                {
+                    string command = request.Command.Trim().ToLowerInvariant();
+                    string actor = string.IsNullOrWhiteSpace(request.Operator)
+                        ? request.ClientId : request.Operator.Trim();
+                    string note = request.Note?.Trim() ?? "";
+                    DateTimeOffset now = DateTimeOffset.UtcNow;
+                    ReferenceOperationResult operation;
+                    if (command is "accept-reference" or "migrate-reference")
+                    {
+                        operation = lifecycle.AcceptCandidate(now, actor, note,
+                            explicitLegacyMigration: command == "migrate-reference" ||
+                                request.ExplicitLegacyMigration);
+                        if (operation.Succeeded && lifecycle.Accepted is not null)
+                        {
+                            analysis.ApplyAccepted(lifecycle.Accepted);
+                            PersistReferenceLocked();
+                        }
+                        return new(operation.Succeeded, operation.Detail,
+                            lifecycle.State.WireName());
+                    }
+
+                    try
+                    {
+                        _ = lifecycle.ArchiveAccepted(now, actor,
+                            ReferenceArchiveReason.EXPLICIT, note);
+                        analysis.ArchiveReferences();
+                        PersistReferenceLocked();
+                        return new(true, lifecycle.Detail, lifecycle.State.WireName());
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        return new(false, ex.Message, lifecycle.State.WireName());
+                    }
+                }
+            }
+            control.ReferenceCommand = HandleReferenceCommand;
             Nvml nvml;
             try { nvml = new Nvml(c.GpuUuid); }
             catch (Exception ex)
             {
                 return WriteStartupFailure(data, "NVML", "NVML initialization failed: " + ex.Message,
-                    control.InstanceId, analysis.Progress);
+                    control.InstanceId, analysis.Progress, lifecycle.Snapshot());
             }
             using var nvmlLifetime = nvml;
             int count = int.Parse(Option(args, "--samples") ?? "0"); int n = 0;
@@ -704,18 +947,40 @@ public static class Program
                 double? analysisPower = electrical != null && load != null
                     ? load.ToAnalysisPowerWatts(electrical)
                     : null;
-                var result = new Result(status, null, null, null, null, null);
-                if (v != null && (!lastSensor.HasValue || v.Timestamp > lastSensor.Value))
+                Result result;
+                ReferenceStatusSnapshot referenceStatus;
+                bool referenceChanged;
+                AnalysisProgress analysisProgress;
+                lock (referenceGate)
                 {
-                    result = analysis.Add(v.Timestamp, analysisPower, v.Volts,
-                        clock.Elapsed.TotalSeconds, electrical?.IsFresh == true);
-                    lastSensor = v.Timestamp;
-                    if (result.Status == "ANALYSIS_LOAD_UNAVAILABLE")
-                        detail = load?.Detail ?? $"Selected {analysisLoadSource.WireName()} is unavailable.";
-                }
-                else if (v == null)
-                {
-                    analysis.Gap();
+                    result = new Result(status, null, null, null, null, null);
+                    if (v != null && (!lastSensor.HasValue || v.Timestamp > lastSensor.Value))
+                    {
+                        result = analysis.Add(v.Timestamp, analysisPower, v.Volts,
+                            clock.Elapsed.TotalSeconds, electrical?.IsFresh == true);
+                        lastSensor = v.Timestamp;
+                        if (result.Status == "ANALYSIS_LOAD_UNAVAILABLE")
+                            detail = load?.Detail ?? $"Selected {analysisLoadSource.WireName()} is unavailable.";
+                    }
+                    else if (v == null)
+                    {
+                        analysis.Gap();
+                    }
+                    var beforeState = lifecycle.State;
+                    bool beforeCandidateQualified = lifecycle.Candidate?.IsQualified == true;
+                    if (v is not null)
+                    {
+                        var candidate = analysis.BuildCandidate(referenceIdentity, now);
+                        // ReferenceLifecycle preserves LEGACY_MIGRATION origin
+                        // when refreshing an imported candidate, so sampling
+                        // cannot bypass explicit migration acknowledgement.
+                        if (candidate is not null)
+                            _ = lifecycle.SetCandidate(candidate);
+                    }
+                    referenceStatus = lifecycle.Snapshot();
+                    referenceChanged = beforeState != referenceStatus.State ||
+                        beforeCandidateQualified != (referenceStatus.Candidate?.IsQualified == true);
+                    analysisProgress = analysis.Progress;
                 }
                 double sampleDuration = priorCompletedPoll.HasValue
                     ? MonotonicTime.ElapsedSeconds(priorCompletedPoll.Value, pollEndMonotonic) ?? 0
@@ -742,7 +1007,7 @@ public static class Program
                             electrical is null ? DetectorAvailabilityReason.SOURCE_GAP : DetectorAvailabilityReason.STALE,
                             now, detail: detail),
                     ["legacy_trend"] = DetectorAvailability.FromStatus("legacy_trend", result.Status,
-                        now, analysis.Progress.WindowSamples, c.WindowSamples, detail),
+                        now, analysisProgress.WindowSamples, c.WindowSamples, detail),
                 };
                 bool timestampValid = electrical is not null &&
                     electrical.Freshness.Kind != FreshnessKind.Unavailable &&
@@ -780,7 +1045,7 @@ public static class Program
                     coverage.CurrentUnanalyzedLoadedSeconds, coverage.LongestUnanalyzedLoadedSeconds,
                     progressContract.LastCompletedSampleMonotonic, progressContract.SampleAgeSeconds) + "\n";
                 storage.Add(now, row);
-                var progress = analysis.Progress;
+                var progress = analysisProgress;
                 var state = new
                 {
                     schema_version = 3,
@@ -794,6 +1059,7 @@ public static class Program
                     electrical,
                     analysis_load = load,
                     analysis = result,
+                    reference_lifecycle = referenceStatus,
                     acquisition,
                     coverage,
                     poll_timing = pollTiming,
@@ -812,7 +1078,7 @@ public static class Program
                 };
                 latestState = JsonSerializer.Serialize(state, Json);
                 control.Publish(latestState, row);
-                bool urgent = result.Status != previousStatus && result.Status is "SUDDEN_DROOP" or "BASELINE_SHIFT" or "VOLTAGE_UNAVAILABLE" or "POWER_UNAVAILABLE" or "ANALYSIS_LOAD_UNAVAILABLE";
+                bool urgent = referenceChanged || result.Status != previousStatus && result.Status is "SUDDEN_DROOP" or "BASELINE_SHIFT" or "VOLTAGE_UNAVAILABLE" or "POWER_UNAVAILABLE" or "ANALYSIS_LOAD_UNAVAILABLE";
 
                 bool suppressAlerts = control.AlertsSuppressed;
                 if (result.Status != previousStatus)
@@ -834,10 +1100,16 @@ public static class Program
                     alertPresentedForCurrentStatus = true;
                 }
                 if (storage.Due(clock.Elapsed.TotalSeconds) || urgent || terminalFailure != null)
-                    storage.Flush(clock.Elapsed.TotalSeconds, latestState, JsonSerializer.Serialize(new Saved(identity, analysis.Bins), Json));
+                {
+                    lock (referenceGate)
+                    {
+                        PersistReferenceLocked();
+                        storage.Flush(clock.Elapsed.TotalSeconds, latestState, BaselineMirror());
+                    }
+                }
                 if (terminalFailure != null)
                 {
-                    Atomic(baselinePath, JsonSerializer.Serialize(new Saved(identity, analysis.Bins), Json));
+                    lock (referenceGate) PersistReferenceLocked();
                     throw new Exception("ConnectorWatch stopped after a terminal voltage-source failure.", terminalFailure);
                 }
                 n++;
@@ -849,11 +1121,15 @@ public static class Program
                     if (stop.Token.WaitHandle.WaitOne(milliseconds)) break;
                 }
             }
-            if (latestState != null) storage.Flush(clock.Elapsed.TotalSeconds, latestState, JsonSerializer.Serialize(new Saved(identity, analysis.Bins), Json));
+            lock (referenceGate)
+            {
+                if (latestState != null) storage.Flush(clock.Elapsed.TotalSeconds, latestState, BaselineMirror());
+                PersistReferenceLocked();
+            }
             samplingProgress.MarkStopped(control.StopRequested ? "control" : stop.IsCancellationRequested ? "signal" : "sample_limit");
             MarkStopped(Path.Combine(data, "status.json"), control.StopRequested ? "control" : stop.IsCancellationRequested ? "signal" : "sample_limit",
                 control, analysis.Progress, samplingProgress.Snapshot(Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow));
-            Atomic(baselinePath, JsonSerializer.Serialize(new Saved(identity, analysis.Bins), Json));
+            lock (referenceGate) PersistReferenceLocked();
             if (stop.IsCancellationRequested) Console.WriteLine("ConnectorWatch: shutdown requested; state saved.");
             return 0;
         }
@@ -923,7 +1199,7 @@ public static class Program
     }
 
     static int WriteStartupFailure(string data, string source, string detail, string? instanceId = null,
-        AnalysisProgress? progress = null)
+        AnalysisProgress? progress = null, ReferenceStatusSnapshot? referenceLifecycle = null)
     {
         var now = DateTimeOffset.UtcNow;
         var result = new Result("VOLTAGE_UNAVAILABLE", null, null, null, null, null);
@@ -942,6 +1218,7 @@ public static class Program
                 electrical = (ElectricalSample?)null,
                 analysis_load = (AnalysisLoadSelection?)null,
                 analysis = result,
+                reference_lifecycle = referenceLifecycle,
                 progress = new
                 {
                     learning_samples = currentProgress.LearningSamples,

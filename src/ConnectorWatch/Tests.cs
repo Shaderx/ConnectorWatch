@@ -29,9 +29,18 @@ public static class Tests
             a.Progress.BaselineSamples == 5 && a.Progress.WindowTarget == 3,
             "analysis progress targets and settling count");
         for (int i = 0; i < 5; i++) Add(440, 12);
-        Check(Add(440, 12).Status == "NO_SHIFT_DETECTED", "stable reference");
+        var unverified = Add(440, 12);
+        Check(unverified.Status == "REFERENCE_UNVERIFIED" && a.Bins[425].Reference is null &&
+            a.Bins[425].CandidateReference == 12, "qualified candidate remains unverified");
         Check(a.Progress.WindowSamples == 3 && a.Progress.StableSamples == 7,
             "analysis progress rolling window and stable count");
+        // The runtime lifecycle applies this mutation only after an explicit
+        // operator acceptance. Keep the analysis fixture focused on proving
+        // that accepted values, once supplied, remain frozen during detection.
+        a.Bins[425].Reference = a.Bins[425].CandidateReference;
+        a.Bins[425].ReferenceP05 = a.Bins[425].CandidateReferenceP05;
+        a.Bins[425].CandidateReference = null;
+        a.Bins[425].CandidateReferenceP05 = null;
         Check(Add(440, 11.7).Status == "SUDDEN_DROOP", "sudden droop");
         for (int i = 0; i < 5; i++) Add(440, 11.79);
         Check(Add(440, 11.79).Status == "BASELINE_SHIFT", "sustained median shift");
@@ -141,6 +150,7 @@ public static class Tests
         CoarseRailGuardTests.Run();
         LoadQualifierTests.Run();
         TelemetryPhaseOneTests.Run();
+        ReferenceLifecycleTests.Run();
         Console.WriteLine($"PASS: {passed} behavioral checks.");
     }
 }

@@ -47,6 +47,17 @@ public static class ControlServerTests
             var release = SendAsync(server, new ControlRequest("release", "gui-a", hello.InstanceId)).GetAwaiter().GetResult();
             Check(release.Ok && !server.AlertsSuppressed, "control release restores alerts");
 
+            server.ReferenceCommand = request => new ControlCommandResult(
+                true, request.Operator ?? request.ClientId, "REFERENCE_ACCEPTED");
+            var accept = SendAsync(server, new ControlRequest("accept-reference", "gui-a",
+                hello.InstanceId, "operator", "reviewed")).GetAwaiter().GetResult();
+            Check(accept.Ok && accept.ReferenceState == "REFERENCE_ACCEPTED" &&
+                accept.Detail == "operator", "identity-bound reference operator command");
+            var staleAccept = SendAsync(server, new ControlRequest("accept-reference", "gui-a",
+                "old-instance")).GetAwaiter().GetResult();
+            Check(!staleAccept.Ok && staleAccept.ReferenceState == null,
+                "stale instance cannot mutate reference lifecycle");
+
             var invalid = SendAsync(server, new ControlRequest("unknown", "gui-a")).GetAwaiter().GetResult();
             Check(!invalid.Ok && invalid.Protocol == ControlProtocol.Version, "unknown command rejected");
 

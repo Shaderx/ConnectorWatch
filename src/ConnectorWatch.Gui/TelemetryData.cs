@@ -13,7 +13,7 @@ namespace ConnectorWatch.Gui;
 public sealed record PointSample(DateTimeOffset Time, DateTimeOffset SensorTime, double Voltage, double? Pcie,
     double? Power, int? Bin, string Status, double? Reference, double? P05, double? Drop, string Detail)
 {
-    public bool Eligible => Bin.HasValue && Status is "LEARNING_REFERENCE" or "WINDOW_WARMUP" or "NO_SHIFT_DETECTED" or "SUDDEN_DROOP" or "BASELINE_SHIFT";
+    public bool Eligible => Bin.HasValue && Status is "LEARNING_REFERENCE" or "REFERENCE_UNVERIFIED" or "WINDOW_WARMUP" or "NO_SHIFT_DETECTED" or "SUDDEN_DROOP" or "BASELINE_SHIFT";
     public bool Alert => Status is "SUDDEN_DROOP" or "BASELINE_SHIFT";
 }
 public sealed record Incident(string Id, DateTimeOffset Time, string Status, string Detail, double? Voltage = null, double? Drop = null, int? Bin = null);
@@ -44,6 +44,8 @@ public sealed class Snapshot
     public int Window { get; set; }
     public int Stable { get; set; }
     public int Schema { get; set; }
+    public string ReferenceState { get; set; } = "";
+    public string ReferenceCompatibility { get; set; } = "";
     public bool Fresh(double age = 5) => !Stopped && Time <= DateTimeOffset.UtcNow.AddSeconds(1) && (DateTimeOffset.UtcNow - Time).TotalSeconds <= age;
     public static Snapshot Parse(string text)
     {
@@ -59,6 +61,11 @@ public sealed class Snapshot
         { s.BoardPower = Num(g, "Power"); s.Temperature = Num(g, "Temperature"); s.Utilization = Num(g, "Utilization"); s.Limit = Num(g, "Limit"); }
         if (r.TryGetProperty("analysis", out var a) && a.ValueKind == JsonValueKind.Object)
         { s.Status = Str(a, "Status"); s.Bin = (int?)Num(a, "Bin"); s.Drop = Num(a, "Drop"); s.Reference = Num(a, "Reference"); s.Median = Num(a, "Median"); s.P05 = Num(a, "P05"); }
+        if (r.TryGetProperty("reference_lifecycle", out var reference) && reference.ValueKind == JsonValueKind.Object)
+        {
+            s.ReferenceState = Str(reference, "state");
+            s.ReferenceCompatibility = Str(reference, "compatibility");
+        }
         if (r.TryGetProperty("progress", out var p) && p.ValueKind == JsonValueKind.Object)
         { s.Learning = (int)(Num(p, "learning_samples") ?? 0); s.Window = (int)(Num(p, "window_samples") ?? 0); s.Stable = (int)(Num(p, "stable_samples") ?? 0); }
         return s;
@@ -133,11 +140,24 @@ public sealed class TelemetryStore
                 var info = new FileInfo(baseline); var stamp = (info.Length, info.LastWriteTimeUtc.Ticks);
                 if (baselineStamp == stamp) return;
                 using var d = JsonDocument.Parse(ReadShared(baseline, 8 * 1024 * 1024));
-                if (d.RootElement.TryGetProperty("Bins", out var bins))
+                JsonElement bins = default;
+                bool hasBins = d.RootElement.TryGetProperty("Bins", out bins) ||
+                    d.RootElement.TryGetProperty("bins", out bins);
+                if (!hasBins && d.RootElement.TryGetProperty("accepted", out var accepted) &&
+                    accepted.ValueKind == JsonValueKind.Object)
+                    hasBins = accepted.TryGetProperty("bins", out bins);
+                if (hasBins && bins.ValueKind == JsonValueKind.Object)
                 {
                     Baselines.Clear();
                     foreach (var b in bins.EnumerateObject())
-                        if (int.TryParse(b.Name, out var key) && key is >= 0 and <= 1000) Baselines[key] = new(Snapshot.Num(b.Value, "Reference"), Snapshot.Num(b.Value, "ReferenceP05"), b.Value.TryGetProperty("Learning", out var learning) ? learning.GetArrayLength() : 0);
+                        if (int.TryParse(b.Name, out var key) && key is >= 0 and <= 1000)
+                        {
+                            var median = Snapshot.Num(b.Value, "Reference") ?? Snapshot.Num(b.Value, "reference_volts");
+                            var p05 = Snapshot.Num(b.Value, "ReferenceP05") ?? Snapshot.Num(b.Value, "reference_p05_volts");
+                            if (median.HasValue) Baselines[key] = new(median, p05,
+                                b.Value.TryGetProperty("Learning", out var learning) ? learning.GetArrayLength() :
+                                (int)(Snapshot.Num(b.Value, "learning_samples") ?? 0));
+                        }
                 }
                 baselineStamp = stamp;
             } });

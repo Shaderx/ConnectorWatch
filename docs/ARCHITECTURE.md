@@ -12,7 +12,7 @@ flowchart LR
     V --> J[Optional RailJson adapter]
     N --> A[Load-binned analyzer]
     V --> A
-    A --> P[(data/ CSV, status, events, baseline)]
+    A --> P[(data/ CSV, status, events, baseline, reference lifecycle)]
     D --> Q[Current-user control pipe]
     P --> G[ConnectorWatch.Gui WPF dashboard]
     Q --> G
@@ -27,9 +27,9 @@ The default public configuration selects `VoltageSource: "direct"` and `Analysis
 
 The newline-delimited JSON adapter reads at most the newest 128 KiB from the file tail. When that window begins inside a record it discards the partial leading bytes, ignores an unterminated append, and returns the newest complete non-empty record. A single record larger than the bound is unavailable unless a later complete record fits in the window; the adapter never rescans an unbounded growing file.
 
-The analyzer groups eligible samples into 25 W bins. It waits for stable samples after a load transition, learns a per-bin median and fifth percentile, persists that reference identity, then compares a rolling window of current samples with the saved reference. The analysis result is written beside the raw observation so a consumer can distinguish an observed value, an approximate NVML-aligned value, a gap, and an alert state.
+The analyzer groups eligible samples into 25 W bins. It waits for stable samples after a load transition, learns a per-bin median and fifth percentile, and publishes a candidate snapshot. Candidate values remain outside comparison until an identity-bound operator command explicitly accepts them. Acceptance freezes an immutable snapshot; later learning can produce a separate candidate without mutating the accepted model. `accept-reference`, `migrate-reference`, and `archive-reference` commands are instance-checked by the current-user control endpoint. A source degradation leaves the accepted snapshot available for forensics but marks it stale and prevents comparison; a GPU/source/configuration mismatch marks the persisted model invalid. The analysis result is written beside the raw observation so a consumer can distinguish an observed value, an approximate NVML-aligned value, a gap, and an alert state.
 
-The daemon publishes live status and up to 512 recent CSV rows (512 KiB text cap) through the instance-checked `live` control command. Routine daily telemetry and transitions accumulate in bounded RAM, then flush with status and baseline checkpoints every `FlushSeconds` (30 by default, 1–60 allowed), at the buffer threshold, on an urgent warning/failure, and on graceful shutdown. The GUI merges pipe history with disk history using observation timestamps. `status.json` is a checkpoint and can lag live state by the flush interval. Atomic replacements and append opens retry temporary Windows sharing/access failures with bounded backoff; appends are not retried after writing may have begun. A lock file prevents multiple writers from using one data directory. On a clean signal, control stop, or finite sample run it marks the status as stopped and saves the reference. File and terminal voltage-source failures are surfaced as process failure; the logger does not continue while claiming that monitoring is live.
+The daemon publishes live status and up to 512 recent CSV rows (512 KiB text cap) through the instance-checked `live` control command. Routine daily telemetry and transitions accumulate in bounded RAM, then flush with status, the legacy baseline mirror, and the versioned reference lifecycle every `FlushSeconds` (30 by default, 1–60 allowed), at the buffer threshold, on an urgent warning/failure, and on graceful shutdown. The GUI merges pipe history with disk history using observation timestamps. `status.json` is a checkpoint and can lag live state by the flush interval. Atomic replacements and append opens retry temporary Windows sharing/access failures with bounded backoff; appends are not retried after writing may have begun. A lock file prevents multiple writers from using one data directory. On a clean signal, control stop, or finite sample run it marks the status as stopped and saves the lifecycle. File and terminal voltage-source failures are surfaced as process failure; the logger does not continue while claiming that monitoring is live.
 
 ## Direct native reader and identity gates
 
@@ -60,9 +60,10 @@ The main files are:
 | File | Producer | Consumer | Contract |
 | --- | --- | --- | --- |
 | `telemetry-YYYY-MM-DD.csv` | daemon | GUI and offline tools | legacy columns followed by additive typed rail, source, freshness, provenance, and analysis-unit fields |
-| `status.json` | daemon | GUI, scripts, operators | additive schema 3 state with legacy voltage plus typed `electrical` and `analysis_load`; inspect timestamp and `stopped` |
+| `status.json` | daemon | GUI, scripts, operators | additive schema 3 state with legacy voltage plus typed `electrical`, `analysis_load`, and `reference_lifecycle`; inspect timestamp and `stopped` |
 | `events.csv` | daemon | GUI and operators | status transitions and details |
-| `baseline.json` | daemon | analyzer | source/GPU/config identity and per-bin reference state |
+| `baseline.json` | daemon | GUI and legacy consumers | historical `Identity`/`Bins` mirror; `Reference` is populated only from an accepted snapshot |
+| `reference.json` | daemon | daemon, operator tooling | versioned identity, unverified candidate, frozen accepted snapshot, archive history, compatibility, and migration metadata |
 | `monitor.lock` | daemon | daemon | single-writer coordination |
 
 The GUI does not infer a reference distribution from aggregate statistics. Its histogram counts eligible stored observations, while its graph keeps missing periods as gaps. Acknowledging a warning is presentation state only; it cannot mutate the analyzer, source, or threshold.

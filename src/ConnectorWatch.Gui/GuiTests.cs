@@ -31,6 +31,10 @@ public static class GuiTests
         Check(new Snapshot { Time = now }.Fresh(), "Recent running snapshot is live");
         Check(Snapshot.Parse("{\"gpu_uuid\":\"GPU-example\"}").GpuUuid == "GPU-example", "Detected UUID reaches GUI snapshot");
         Check(Snapshot.Parse("{}").GpuUuid == "", "Older snapshots without UUID remain readable");
+        var lifecycleSnapshot = Snapshot.Parse("{\"reference_lifecycle\":{\"state\":\"REFERENCE_UNVERIFIED\",\"compatibility\":\"LEGACY\"}}");
+        Check(lifecycleSnapshot.ReferenceState == "REFERENCE_UNVERIFIED" &&
+            lifecycleSnapshot.ReferenceCompatibility == "LEGACY",
+            "Reference lifecycle state remains visible to the GUI");
         var csv = TelemetryStore.ParseCsv("one,\"two,three\",\"a\"\"b\"");
         Check(csv.SequenceEqual(new[] { "one", "two,three", "a\"b" }), "CSV quoting and escaped quotes");
         var bounded = new BoundedBuffer<int>(7);

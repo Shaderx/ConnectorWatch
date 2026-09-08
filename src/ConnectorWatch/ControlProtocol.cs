@@ -51,7 +51,21 @@ public sealed record ControlRequest(
     [property: JsonPropertyName("client_id")] string ClientId,
     [property: JsonPropertyName("expected_instance_id")]
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    string? ExpectedInstanceId = null);
+    string? ExpectedInstanceId = null,
+    [property: JsonPropertyName("operator")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? Operator = null,
+    [property: JsonPropertyName("note")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? Note = null,
+    [property: JsonPropertyName("explicit_legacy_migration")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    bool ExplicitLegacyMigration = false);
+
+/// <summary>Result returned by an identity-bound daemon command. This is kept
+/// separate from the pipe response so the existing hello/live/lease protocol
+/// remains source-compatible for older GUI clients.</summary>
+public sealed record ControlCommandResult(bool Ok, string Detail = "", string? ReferenceState = null);
 
 public sealed record ControlResponse(
     [property: JsonPropertyName("protocol")] int Protocol,
@@ -60,7 +74,11 @@ public sealed record ControlResponse(
     [property: JsonPropertyName("instance_id")] string InstanceId,
     [property: JsonPropertyName("ok")] bool Ok,
     [property: JsonPropertyName("live")]
-    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] LiveTelemetry? Live = null);
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] LiveTelemetry? Live = null,
+    [property: JsonPropertyName("detail")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Detail = null,
+    [property: JsonPropertyName("reference_state")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ReferenceState = null);
 
 public sealed record LiveTelemetry(string Status, string Header, string[] Rows);
 

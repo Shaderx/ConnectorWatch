@@ -26,6 +26,13 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
     Task? run;
     int disposed;
 
+    /// <summary>
+    /// Handles identity-bound operator commands that belong to the daemon's
+    /// runtime state. The callback is invoked outside the lease lock so a
+    /// persistence operation cannot block lease expiry or hello/live traffic.
+    /// </summary>
+    public Func<ControlRequest, ControlCommandResult?>? ReferenceCommand { get; set; }
+
     public ControlServer(string dataDirectory, CancellationTokenSource shutdown,
         string? instanceId = null, int? processId = null)
         : this(dataDirectory, shutdown.Token, shutdown.Cancel, instanceId, processId)
@@ -105,6 +112,9 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
     {
         bool ok = false;
         bool stopRequested = false;
+        bool referenceCommandRequested = false;
+        bool identityMatches = false;
+        ControlCommandResult? commandResult = null;
         if (request is not null &&
             !string.IsNullOrWhiteSpace(request.Command) &&
             !string.IsNullOrWhiteSpace(request.ClientId) &&
@@ -118,7 +128,7 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
                 // A GUI first discovers the daemon instance through hello. All
                 // mutating commands must echo that identity so a delayed stop
                 // cannot affect a replacement daemon using the same endpoint.
-                bool identityMatches = string.Equals(request.ExpectedInstanceId, InstanceId, StringComparison.Ordinal);
+                identityMatches = string.Equals(request.ExpectedInstanceId, InstanceId, StringComparison.Ordinal);
                 ok = command switch
                 {
                     "hello" => true,
@@ -126,9 +136,29 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
                     "lease" when identityMatches => GrantLeaseLocked(request.ClientId, now),
                     "release" when identityMatches => ReleaseLeaseLocked(request.ClientId),
                     "stop" when identityMatches => true,
+                    "accept-reference" when identityMatches => true,
+                    "migrate-reference" when identityMatches => true,
+                    "archive-reference" when identityMatches => true,
                     _ => false,
                 };
+                referenceCommandRequested = identityMatches && command is
+                    "accept-reference" or "migrate-reference" or "archive-reference";
                 stopRequested = ok && command == "stop";
+            }
+
+            if (referenceCommandRequested)
+            {
+                try
+                {
+                    commandResult = ReferenceCommand?.Invoke(request) ??
+                        new ControlCommandResult(false, "Reference operator commands are unavailable during startup.");
+                    ok = commandResult.Ok;
+                }
+                catch (Exception ex)
+                {
+                    commandResult = new ControlCommandResult(false, ex.Message);
+                    ok = false;
+                }
             }
 
             if (stopRequested)
@@ -139,7 +169,9 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
         }
 
         return new ControlResponse(ControlProtocol.Version, ProcessId, dataDirectory, InstanceId, ok,
-            ok && request?.Command == "live" ? ReadLive() : null);
+            ok && request is not null && string.Equals(request.Command.Trim(), "live", StringComparison.OrdinalIgnoreCase) ? ReadLive() : null,
+            commandResult?.Detail,
+            commandResult?.ReferenceState);
     }
 
     bool GrantLeaseLocked(string clientId, long now)

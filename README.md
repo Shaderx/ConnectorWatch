@@ -41,6 +41,19 @@ Keep the rest of the package's configuration fields when editing the file. `Volt
 
 `AnalysisLoadSource` pins the comparison basis for the daemon lifetime. Supported values are `CONNECTOR_CURRENT`, `CONNECTOR_POWER`, `NVML_BOARD_POWER`, and `EXTERNAL_SENSOR_POWER`. If the selected measurement is missing or stale, analysis becomes unavailable; it never silently substitutes a different source. Connector-current qualification is converted to the existing watt-binned axis only with voltage from the same fresh connector observation. Direct-reader power is derived from that rail's V×I and is not an independent third measurement.
 
+Reference learning is a two-step lifecycle. A completed learning window is
+written as `REFERENCE_UNVERIFIED` candidate evidence; it is never silently
+promoted into a comparison baseline. An operator must send the identity-bound
+control command `accept-reference` (or `migrate-reference` when explicitly
+reviewing a legacy baseline), optionally with `operator`, `note`, and
+`explicit_legacy_migration` fields. `archive-reference` removes the active
+accepted model and retains an immutable archive entry before relearning. The
+daemon rejects these commands when the instance identity is stale, the source
+is degraded, or the candidate is incomplete. Accepted values are frozen and
+are not altered by later learning. The current state, compatibility, candidate,
+accepted snapshot, and migration detail are exposed under
+`reference_lifecycle` in `status.json` and live status.
+
 Start the dashboard with `ConnectorWatch.Gui.exe` or `Start-GUI.cmd`. It starts one hidden daemon when the data directory is not already owned and attaches to an existing compatible daemon when one is running. To run without a window, start `ConnectorWatch.exe`, `Start.cmd`, or `RunBackground.ps1` from the extracted directory. The headless executable has no tray icon.
 
 Pressing **X** or **Alt+F4** hides the dashboard in the notification area; monitoring continues. Use the tray menu or double-click the icon to restore it. **Exit GUI — keep monitoring** closes the dashboard and leaves the daemon running. **Stop monitoring and exit** requests a graceful daemon stop and waits for its stopped state.
@@ -70,7 +83,8 @@ The daemon writes these files under `DataDirectory`:
 | `telemetry-YYYY-MM-DD.csv` | UTC observations, NVML telemetry, voltage-source values, analysis fields, and detector status |
 | `status.json` | Most recent complete state, including timestamps and stopped state |
 | `events.csv` | Status transitions and details |
-| `baseline.json` | Persisted reference identity and per-bin learning data |
+| `baseline.json` | Compatibility mirror with the historical `Bins` shape; accepted values only populate `Reference` |
+| `reference.json` | Versioned candidate/accepted reference lifecycle, identity, archives, and migration metadata |
 | `monitor.lock` | Single-writer guard for the data directory |
 
 The dashboard shows stale or stopped readings as unavailable. It records monitoring loss separately, including when the native daemon terminates. Windows notification settings can suppress tray notifications; the dashboard banner and warning history remain available. When the dashboard owns presentation, only one GUI receives the daemon's heartbeat lease. If it exits unexpectedly, the daemon resumes headless warnings, including for an active warning that began while the GUI owned presentation.
@@ -87,9 +101,9 @@ An abrupt process termination can lose the unflushed interval. Checkpoints use n
 
 ## How the detector should be read
 
-The default analyzer uses 25 W load bins, ignores analysis below 100 W, and waits for five successive fresh samples in a bin. The first 300 eligible readings learn a reference median and fifth percentile for each bin. After learning, the rolling window contains at most 60 eligible readings no older than 30 minutes. The example thresholds are a 0.20 V sustained median or fifth-percentile loss, and a 0.25 V single-reading sudden droop, with five consecutive eligible updates required for a sustained alert.
+The default analyzer uses 25 W load bins, ignores analysis below 100 W, and waits for five successive fresh samples in a bin. The first 300 eligible readings learn a candidate median and fifth percentile for each bin. The candidate remains unverified until an operator explicitly accepts it; only then does the rolling window compare against those frozen values. The rolling window contains at most 60 eligible readings no older than 30 minutes. The example thresholds are a 0.20 V sustained median or fifth-percentile loss, and a 0.25 V single-reading sudden droop, with five consecutive eligible updates required for a sustained alert.
 
-These thresholds are comparison settings, not electrical safety limits. Recheck a change at similar steady power and temperature. A source gap, restart, repeated timestamp, or load transition interrupts continuity and requires settling again. A saved reference belongs to its source, GPU, and configuration; archive `baseline.json` deliberately after changing a cable, PSU, sensor, GPU, or analysis configuration instead of resetting it merely to silence an alert.
+These thresholds are comparison settings, not electrical safety limits. Recheck a change at similar steady power and temperature. A source gap, restart, repeated timestamp, or load transition interrupts continuity and requires settling again. A saved reference belongs to its source, GPU, and configuration. Identity mismatch is reported as `REFERENCE_INVALID`; source degradation reports `REFERENCE_STALE` without deleting the accepted snapshot. Use the explicit `archive-reference` operation after changing a cable, PSU, sensor, GPU, or analysis configuration instead of resetting state merely to silence an alert. A legacy `baseline.json` is imported as an unverified candidate and requires explicit migration acknowledgement; migration never claims that the old values were known healthy.
 
 The direct reader is guarded by the target identity and topology checks described in [the architecture](docs/ARCHITECTURE.md). Its native setup is fail-closed: a rejected identity, multiple GPUs, incompatible driver or board, missing library, failed initialization, or possible native timeout records voltage as unavailable and does not retry or silently switch sources. NVML sensor fields that fail independently are left blank. The daemon never converts GPU core voltage or total board power into a connector-voltage measurement.
 
