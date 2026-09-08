@@ -140,6 +140,7 @@ public static class Tests
         RailJsonTailTests.Run();
         CoarseRailGuardTests.Run();
         LoadQualifierTests.Run();
+        TelemetryPhaseOneTests.Run();
         Console.WriteLine($"PASS: {passed} behavioral checks.");
     }
 }

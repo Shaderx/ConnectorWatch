@@ -658,12 +658,21 @@ public static class Program
             DateTimeOffset? lastSensor = null; string? previousStatus = null;
             bool alertPresentedForCurrentStatus = false;
             var clock = Stopwatch.StartNew(); double next = 0;
+            long startedMonotonic = Stopwatch.GetTimestamp();
+            var pollTimingTracker = new PollTimingTracker();
+            var samplingProgress = new SamplingProgressTracker(control.InstanceId,
+                DateTimeOffset.UtcNow, startedMonotonic,
+                staleAfterSeconds: Math.Max(c.MaxAgeSeconds, c.SampleSeconds * 3),
+                startupGraceSeconds: Math.Max(c.MaxAgeSeconds, c.SampleSeconds * 3));
+            var coverageTracker = new AnalysisCoverageTracker(TimeSpan.FromMinutes(30));
+            long? priorCompletedPoll = null;
             var storage = new HybridStorage(data, c.FlushSeconds);
             string? latestState = null;
             Console.WriteLine("ConnectorWatch: read-only telemetry. Ctrl+C/SIGTERM stops. No status certifies connector safety.");
             while (!stop.IsCancellationRequested && (count == 0 || n < count))
             {
                 var now = DateTimeOffset.UtcNow; var g = nvml.Read(); Voltage? v = null; ElectricalSample? electrical = null;
+                long pollStartMonotonic = Stopwatch.GetTimestamp();
                 string status = sourceSetupError != null ? "VOLTAGE_UNAVAILABLE" : "VOLTAGE_NOT_CONFIGURED";
                 string detail = sourceSetupError ?? "";
                 Exception? terminalFailure = null;
@@ -685,6 +694,11 @@ public static class Program
                         terminalFailure = ex;
                     }
                 }
+                long pollEndMonotonic = Stopwatch.GetTimestamp();
+                var pollTiming = pollTimingTracker.Record(pollStartMonotonic, pollEndMonotonic, now,
+                    electrical is null ? new RawElectricalObservation() :
+                        RawElectricalObservation.FromElectricalSample(electrical));
+                samplingProgress.CompleteSample(pollEndMonotonic, now);
                 var load = electrical?.SelectAnalysisLoad(analysisLoadSource, g.Power,
                     FreshnessMetadata.HostPoll(now, "NVML board-power timestamp is the daemon poll time."));
                 double? analysisPower = electrical != null && load != null
@@ -703,6 +717,54 @@ public static class Program
                 {
                     analysis.Gap();
                 }
+                double sampleDuration = priorCompletedPoll.HasValue
+                    ? MonotonicTime.ElapsedSeconds(priorCompletedPoll.Value, pollEndMonotonic) ?? 0
+                    : 0;
+                priorCompletedPoll = pollEndMonotonic;
+                bool loadKnown = analysisPower.HasValue;
+                bool loaded = analysisPower >= c.MinAnalysisWatts ||
+                    !loadKnown && (g.Power >= c.MinAnalysisWatts || !g.Power.HasValue);
+                bool eligible = result.LoadQualification?.IsQualified == true;
+                bool analyzed = eligible && result.Reference.HasValue &&
+                    result.Status is "NO_SHIFT_DETECTED" or "SUDDEN_DROOP" or "BASELINE_SHIFT";
+                var coverageReason = analyzed ? CoverageObservationReason.ANALYZED
+                    : !loadKnown ? CoverageObservationReason.UNKNOWN_LOAD
+                    : CoverageObservationReasonExtensions.FromDetectorStatus(result.Status);
+                coverageTracker.Record(new CoverageObservation(now, loaded, eligible, analyzed,
+                    coverageReason, sampleDuration, loadKnown, detail));
+                var coverage = coverageTracker.Snapshot(now);
+                var progressContract = samplingProgress.Snapshot(pollEndMonotonic, now);
+                var detectorAvailability = new Dictionary<string, DetectorAvailability>(StringComparer.Ordinal)
+                {
+                    ["coarse"] = result.CoarseGuard?.IsValid == true
+                        ? DetectorAvailability.Ready("coarse", now, detail: result.CoarseGuard.Detail)
+                        : DetectorAvailability.Unavailable("coarse",
+                            electrical is null ? DetectorAvailabilityReason.SOURCE_GAP : DetectorAvailabilityReason.STALE,
+                            now, detail: detail),
+                    ["legacy_trend"] = DetectorAvailability.FromStatus("legacy_trend", result.Status,
+                        now, analysis.Progress.WindowSamples, c.WindowSamples, detail),
+                };
+                bool timestampValid = electrical is not null &&
+                    electrical.Freshness.Kind != FreshnessKind.Unavailable &&
+                    (!electrical.Freshness.AgeSeconds.HasValue ||
+                     electrical.Freshness.AgeSeconds is double sampleAge && sampleAge >= 0 && double.IsFinite(sampleAge));
+                var acquisition = AcquisitionHealth.Evaluate(new AcquisitionHealthInput(
+                    MonitorRunning: terminalFailure is null,
+                    SourceConfigured: voltageSource is not null,
+                    SourceAvailable: electrical?.Connector.HasVoltage == true,
+                    TimestampValid: timestampValid,
+                    Fresh: electrical?.Freshness.IsFresh == true,
+                    PowerAvailable: analysisPower.HasValue,
+                    NativeFailure: terminalFailure is not null && voltageSource?.TerminalOnFailure == true,
+                    SensorCharacterized: false,
+                    AnalysisAvailable: analyzed,
+                    HostTimestampUtc: now,
+                    SourceTimestampUtc: electrical?.Freshness.SourceTimestampUtc,
+                    SampleAgeSeconds: electrical?.Freshness.AgeSeconds,
+                    Source: voltageSource?.Description ?? "",
+                    Detail: detail,
+                    FreshnessVerified: electrical?.Freshness.TimestampVerified == true),
+                    detectorAvailability);
                 string analysisPowerSource = analysisLoadSource.WireName();
                 string row = Csv.Line(now.ToString("O"), c.GpuUuid, g.Power, v?.Volts, v?.Timestamp.ToString("O"), analysisPower,
                     analysisPowerSource, g.Temperature, g.Utilization, g.Limit,
@@ -710,7 +772,13 @@ public static class Program
                     electrical?.Connector.CurrentA, electrical?.Connector.PowerW, electrical?.Pcie.VoltageV,
                     electrical?.Pcie.CurrentA, electrical?.Pcie.PowerW, electrical?.Source,
                     electrical?.Freshness.Kind, electrical?.Freshness.SourceTimestampUtc?.ToString("O"),
-                    electrical?.Connector.PowerProvenance, load?.Unit) + "\n";
+                    electrical?.Connector.PowerProvenance, load?.Unit,
+                    acquisition.Status, pollTiming.PollStartMonotonic, pollTiming.PollEndMonotonic,
+                    pollTiming.LatencySeconds, pollTiming.ValueChangeFlags,
+                    pollTiming.ConsecutiveIdenticalObservations, coverage.CoveragePercent,
+                    coverage.EligibleLoadedCount, coverage.AnalyzedLoadedCount,
+                    coverage.CurrentUnanalyzedLoadedSeconds, coverage.LongestUnanalyzedLoadedSeconds,
+                    progressContract.LastCompletedSampleMonotonic, progressContract.SampleAgeSeconds) + "\n";
                 storage.Add(now, row);
                 var progress = analysis.Progress;
                 var state = new
@@ -726,6 +794,10 @@ public static class Program
                     electrical,
                     analysis_load = load,
                     analysis = result,
+                    acquisition,
+                    coverage,
+                    poll_timing = pollTiming,
+                    sampling_progress = progressContract,
                     progress = new
                     {
                         learning_samples = progress.LearningSamples,
@@ -778,8 +850,9 @@ public static class Program
                 }
             }
             if (latestState != null) storage.Flush(clock.Elapsed.TotalSeconds, latestState, JsonSerializer.Serialize(new Saved(identity, analysis.Bins), Json));
+            samplingProgress.MarkStopped(control.StopRequested ? "control" : stop.IsCancellationRequested ? "signal" : "sample_limit");
             MarkStopped(Path.Combine(data, "status.json"), control.StopRequested ? "control" : stop.IsCancellationRequested ? "signal" : "sample_limit",
-                control, analysis.Progress);
+                control, analysis.Progress, samplingProgress.Snapshot(Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow));
             Atomic(baselinePath, JsonSerializer.Serialize(new Saved(identity, analysis.Bins), Json));
             if (stop.IsCancellationRequested) Console.WriteLine("ConnectorWatch: shutdown requested; state saved.");
             return 0;
@@ -803,7 +876,7 @@ public static class Program
     static void Atomic(string path, string value) => HybridStorage.Atomic(path, value);
 
     static void MarkStopped(string path, string reason, ControlServer? control = null,
-        AnalysisProgress? progress = null)
+        AnalysisProgress? progress = null, SamplingProgressContract? samplingProgress = null)
     {
         try
         {
@@ -836,6 +909,8 @@ public static class Program
                     ["stable_target"] = progress.StableTarget,
                 };
             }
+            if (samplingProgress is not null)
+                state["sampling_progress"] = JsonSerializer.SerializeToNode(samplingProgress, Json);
             state["stopped"] = true;
             state["stop_reason"] = reason;
             state["stopped_at_utc"] = DateTimeOffset.UtcNow;
