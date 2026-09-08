@@ -97,6 +97,7 @@ public static class Tests
         HybridStorageTests.Run();
         DirectNvRailsTests.Run();
         ElectricalSamplesTests.Run();
+        RailJsonTailTests.Run();
         Console.WriteLine($"PASS: {passed} behavioral checks.");
     }
 }

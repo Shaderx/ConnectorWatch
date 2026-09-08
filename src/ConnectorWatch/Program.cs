@@ -269,21 +269,64 @@ public sealed class RailJsonLog(Config c) : IVoltageSource
 
     static string ReadLatestCompleteLine(string path)
     {
+        const int BufferSize = 131072;
         using var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        int size = (int)Math.Min(f.Length, 131072);
-        if (size == 0) throw new IOException("JSON rail input is empty.");
-        var bytes = new byte[size]; f.ReadExactly(bytes);
-        string text = Encoding.UTF8.GetString(bytes).TrimStart('\uFEFF');
+        long length = f.Length;
+        if (length == 0) throw new IOException("JSON rail input is empty.");
 
-        // If the writer is in the middle of an append, ignore its unterminated
-        // tail and use the most recent newline-terminated record.
-        int end = text.EndsWith('\n') ? text.Length - 1 : text.LastIndexOf('\n');
-        if (end < 0) throw new IOException("JSON rail input has no complete record.");
-        int start = text.LastIndexOf('\n', Math.Max(0, end - 1)) + 1;
-        if (start >= end) throw new IOException("JSON rail input has no complete record.");
-        var line = text[start..end].TrimEnd('\r');
-        if (line.Length == 0) throw new IOException("JSON rail input has no complete record.");
-        return line;
+        // Snapshot one bounded window from the tail. The byte immediately
+        // before a nonzero offset distinguishes an exact record boundary from
+        // an offset in the middle of an older record.
+        long offset = Math.Max(0, length - BufferSize);
+        int size = (int)Math.Min(length, BufferSize);
+        bool startsAtRecordBoundary = offset == 0;
+        if (!startsAtRecordBoundary)
+        {
+            f.Position = offset - 1;
+            startsAtRecordBoundary = f.ReadByte() == '\n';
+        }
+
+        f.Position = offset;
+        var bytes = new byte[size];
+        int read = 0;
+        while (read < bytes.Length)
+        {
+            int count = f.Read(bytes, read, bytes.Length - read);
+            if (count == 0) break;
+            read += count;
+        }
+        if (read == 0) throw new IOException("JSON rail input has no complete record.");
+
+        ReadOnlySpan<byte> data = bytes.AsSpan(0, read);
+        int contentStart = 0;
+        if (!startsAtRecordBoundary)
+        {
+            int firstNewline = data.IndexOf((byte)'\n');
+            if (firstNewline < 0)
+                throw new IOException("JSON rail input has no complete record.");
+            contentStart = firstNewline + 1;
+        }
+
+        // A line is complete only when its LF delimiter is present. Thus an
+        // unterminated final append is ignored. Empty lines are skipped as
+        // they are not NDJSON records.
+        int newline = data.LastIndexOf((byte)'\n');
+        while (newline >= contentStart)
+        {
+            int lineStart = data[..newline].LastIndexOf((byte)'\n') + 1;
+            if (lineStart < contentStart) lineStart = contentStart;
+            int lineEnd = newline;
+            if (lineEnd > lineStart && data[lineEnd - 1] == '\r') lineEnd--;
+            if (lineEnd > lineStart)
+            {
+                var line = Encoding.UTF8.GetString(data[lineStart..lineEnd]);
+                if (offset == 0 && lineStart == 0) line = line.TrimStart('\uFEFF');
+                if (line.Length > 0) return line;
+            }
+            newline = data[..newline].LastIndexOf((byte)'\n');
+        }
+
+        throw new IOException("JSON rail input has no complete record.");
     }
 
     static double Number(JsonElement root, string name, bool required)
