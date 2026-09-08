@@ -1,5 +1,9 @@
 <Project>
   <PropertyGroup>
     <Version>1.2.0</Version>
+    <!-- The long-lived Roslyn compiler server has crashed on this host with
+         0xe0434352. Keep builds isolated so a failed server cannot take down
+         concurrent agent or operator builds. -->
+    <UseSharedCompilation>false</UseSharedCompilation>
   </PropertyGroup>
 </Project>
