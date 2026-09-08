@@ -44,15 +44,26 @@ public sealed class Config
     public int WindowMaxAgeSeconds { get; set; } = 1800;
     public double ShiftVolts { get; set; } = .2;
     public double SuddenDroopVolts { get; set; } = .25;
+    public double? GrossUnderVoltageV { get; set; }
+    public double? GrossOverVoltageV { get; set; }
+    public double CoarseConfirmationSeconds { get; set; } = 0;
+    public int CoarseConfirmationSamples { get; set; } = 1;
+    public double LoadBoundaryHysteresisWatts { get; set; } = 2.5;
     public int SustainSamples { get; set; } = 5;
     public void Validate()
     {
         if (!double.IsFinite(SampleSeconds) || !double.IsFinite(MaxAgeSeconds) ||
             !double.IsFinite(ShiftVolts) || !double.IsFinite(SuddenDroopVolts) ||
+            GrossUnderVoltageV is double grossUnder && !double.IsFinite(grossUnder) ||
+            GrossOverVoltageV is double grossOver && !double.IsFinite(grossOver) ||
+            !double.IsFinite(CoarseConfirmationSeconds) || !double.IsFinite(LoadBoundaryHysteresisWatts) ||
             FlushSeconds < 1 || FlushSeconds > 60 || SampleSeconds < .2 || SampleSeconds > 60 || BinWatts < 1 || BinWatts > 100 ||
             MinAnalysisWatts < 0 || StableSamples < 1 || BaselineSamples < 5 || BaselineSamples > 10000 ||
             WindowSamples < 3 || WindowSamples > 3600 || WindowMaxAgeSeconds < 1 ||
             ShiftVolts <= 0 || SuddenDroopVolts <= 0 || SustainSamples < 1 ||
+            CoarseConfirmationSeconds < 0 || CoarseConfirmationSamples < 1 ||
+            LoadBoundaryHysteresisWatts < 0 || LoadBoundaryHysteresisWatts >= BinWatts ||
+            GrossUnderVoltageV.HasValue && GrossOverVoltageV.HasValue && GrossUnderVoltageV > GrossOverVoltageV ||
             MaxAgeSeconds < 1 || Delimiter.Length != 1 ||
             (HwinfoCsv.Length > 0 && RailJson.Length > 0))
             throw new Exception("Invalid configuration; check numeric ranges and GPU UUID.");
@@ -377,7 +388,11 @@ public sealed class Bin
     public double? Reference { get; set; }
     public double? ReferenceP05 { get; set; }
 }
-public sealed record Result(string Status, int? Bin, double? Reference, double? Median, double? P05, double? Drop);
+public sealed record Result(string Status, int? Bin, double? Reference, double? Median, double? P05, double? Drop)
+{
+    public CoarseRailGuardResult? CoarseGuard { get; init; }
+    public LoadQualificationResult? LoadQualification { get; init; }
+}
 public sealed record AnalysisProgress(
     int LearningSamples,
     int BaselineSamples,
@@ -389,7 +404,25 @@ public sealed class Analysis(Config c, Dictionary<int, Bin>? saved = null)
 {
     public Dictionary<int, Bin> Bins { get; } = saved ?? [];
     readonly Dictionary<int, Queue<(DateTimeOffset Time, double V)>> windows = [];
-    int? previous; int stable, sustained; DateTimeOffset? last;
+    readonly CoarseRailGuard coarseGuard = new(new CoarseRailGuardOptions
+    {
+        GrossUnderVoltageV = c.GrossUnderVoltageV,
+        GrossOverVoltageV = c.GrossOverVoltageV,
+        RapidDiscontinuityVolts = c.SuddenDroopVolts,
+        ConfirmationDuration = TimeSpan.FromSeconds(c.CoarseConfirmationSeconds),
+        MinimumConfirmationSamples = c.CoarseConfirmationSamples,
+        MaximumGapSeconds = c.MaxAgeSeconds,
+    });
+    readonly HystereticLoadQualifier loadQualifier = new(new LoadQualificationOptions
+    {
+        MinimumLoadWatts = c.MinAnalysisWatts,
+        MaximumLoadWatts = 1000,
+        BinWatts = c.BinWatts,
+        BoundaryHysteresisWatts = c.LoadBoundaryHysteresisWatts,
+        MinimumStableSamples = c.StableSamples,
+        MaximumGapSeconds = c.MaxAgeSeconds,
+    });
+    int sustained;
     public AnalysisProgress Progress { get; private set; } =
         new(0, c.BaselineSamples, 0, c.WindowSamples, 0, c.StableSamples);
     public static double Percentile(IEnumerable<double> values, double p)
@@ -399,28 +432,60 @@ public sealed class Analysis(Config c, Dictionary<int, Bin>? saved = null)
     }
     public void Gap()
     {
-        previous = null; stable = sustained = 0; last = null; windows.Clear();
+        coarseGuard.Gap();
+        TrendGap();
+    }
+
+    void TrendGap()
+    {
+        loadQualifier.Gap(); sustained = 0; windows.Clear();
         Progress = new(0, c.BaselineSamples, 0, c.WindowSamples, 0, c.StableSamples);
     }
 
     void SetProgress(int learningSamples, int windowSamples) =>
-        Progress = new(learningSamples, c.BaselineSamples, windowSamples, c.WindowSamples, stable, c.StableSamples);
+        Progress = new(learningSamples, c.BaselineSamples, windowSamples, c.WindowSamples,
+            loadQualifier.StableSamples, c.StableSamples);
 
-    public Result Add(DateTimeOffset time, double watts, double volts)
+    public Result Add(DateTimeOffset time, double watts, double volts) =>
+        Add(time, (double?)watts, volts);
+
+    public Result Add(DateTimeOffset time, double? watts, double volts,
+        double? elapsedSeconds = null, bool isFresh = true)
     {
-        if (!double.IsFinite(watts) || watts < c.MinAnalysisWatts || watts > 1000 || !double.IsFinite(volts) || volts < 6 || volts > 16)
-        { Gap(); return new("OUTSIDE_ANALYSIS_RANGE", null, null, null, null, null); }
-        int bin = (int)(watts / c.BinWatts) * c.BinWatts;
-        if (last.HasValue && (time <= last.Value || (time - last.Value).TotalSeconds > c.MaxAgeSeconds)) Gap();
-        last = time;
-        stable = previous == bin ? stable + 1 : 1;
-        if (previous != bin) sustained = 0;
-        previous = bin;
-        if (stable < c.StableSamples)
+        var coarse = coarseGuard.Observe(time, volts, isFresh, elapsedSeconds);
+        if (!coarse.IsValid)
         {
-            SetProgress(Bins.TryGetValue(bin, out var settlingBin) ? settlingBin.Learning.Count : 0, 0);
-            return new("LOAD_SETTLING", bin, null, null, null, null);
+            TrendGap();
+            return new("VOLTAGE_UNAVAILABLE", null, null, null, null, null)
+                { CoarseGuard = coarse };
         }
+
+        var qualification = loadQualifier.Observe(time, watts, isFresh, elapsedSeconds);
+        string? coarseStatus = CoarseStatus(coarse);
+        if (coarse.BlocksQualification)
+        {
+            sustained = 0;
+            return new(coarseStatus ?? "COARSE_GUARD_PENDING", qualification.Bin,
+                null, null, null, null)
+                { CoarseGuard = coarse, LoadQualification = qualification };
+        }
+
+        if (qualification.State == LoadQualificationState.Invalid)
+        {
+            windows.Clear(); sustained = 0;
+            string unavailableStatus = watts.HasValue ? "OUTSIDE_ANALYSIS_RANGE" : "ANALYSIS_LOAD_UNAVAILABLE";
+            return new(unavailableStatus, null, null, null, null, null)
+                { CoarseGuard = coarse, LoadQualification = qualification };
+        }
+        if (!qualification.IsQualified || !qualification.Bin.HasValue)
+        {
+            int? settling = qualification.Bin;
+            SetProgress(settling.HasValue && Bins.TryGetValue(settling.Value, out var settlingBin)
+                ? settlingBin.Learning.Count : 0, 0);
+            return new("LOAD_SETTLING", settling, null, null, null, null)
+                { CoarseGuard = coarse, LoadQualification = qualification };
+        }
+        int bin = qualification.Bin.Value;
         if (!Bins.TryGetValue(bin, out var b)) Bins[bin] = b = new();
         if (!windows.TryGetValue(bin, out var q)) windows[bin] = q = new();
         while (q.Count > 0 && (time - q.Peek().Time).TotalSeconds > c.WindowMaxAgeSeconds) q.Dequeue();
@@ -435,7 +500,8 @@ public sealed class Analysis(Config c, Dictionary<int, Bin>? saved = null)
                 b.Reference = Percentile(b.Learning, .5); b.ReferenceP05 = Percentile(b.Learning, .05); b.Learning.Clear();
             }
             SetProgress(b.Learning.Count, q.Count);
-            return new("LEARNING_REFERENCE", bin, b.Reference, median, p05, null);
+            return new("LEARNING_REFERENCE", bin, b.Reference, median, p05, null)
+                { CoarseGuard = coarse, LoadQualification = qualification };
         }
         double drop = b.Reference.Value - median;
         bool shift = q.Count >= c.WindowSamples && (drop >= c.ShiftVolts || b.ReferenceP05 - p05 >= c.ShiftVolts);
@@ -443,7 +509,21 @@ public sealed class Analysis(Config c, Dictionary<int, Bin>? saved = null)
         bool sudden = Math.Max(b.Reference.Value, priorMedian ?? b.Reference.Value) - volts >= c.SuddenDroopVolts;
         string status = sudden ? "SUDDEN_DROOP" : sustained >= c.SustainSamples ? "BASELINE_SHIFT" : q.Count < c.WindowSamples ? "WINDOW_WARMUP" : "NO_SHIFT_DETECTED";
         SetProgress(0, q.Count);
-        return new(status, bin, b.Reference, median, p05, drop);
+        return new(status, bin, b.Reference, median, p05, drop)
+            { CoarseGuard = coarse, LoadQualification = qualification };
+    }
+
+    static string? CoarseStatus(CoarseRailGuardResult coarse)
+    {
+        if (coarse.Absolute.IsConfirmed)
+            return coarse.Absolute.Kind == CoarseRailAbsoluteKind.GrossUnderVoltage
+                ? "GROSS_UNDERVOLTAGE" : "GROSS_OVERVOLTAGE";
+        if (coarse.Discontinuity.IsConfirmed)
+            return coarse.Discontinuity.Kind == CoarseRailDiscontinuityKind.RapidDrop
+                ? "SUDDEN_DROOP" : "RAPID_VOLTAGE_RISE";
+        return coarse.Absolute.State == CoarseRailConditionState.Pending ||
+            coarse.Discontinuity.State == CoarseRailConditionState.Pending
+            ? "COARSE_GUARD_PENDING" : null;
     }
 }
 
@@ -561,7 +641,7 @@ public static class Program
             using var directLifetime = directSource;
             var providerIdentity = voltageSource?.Description ?? (sourceSetupError != null ? "direct NVIDIA rails unavailable" : "none");
             var analysisLoadSource = ResolveAnalysisLoadSource(c, sourceMode, voltageSource);
-            var identity = $"v4|{c.GpuUuid}|source={sourceMode}|provider={providerIdentity}|{c.HwinfoCsv}|{c.RailJson}|{c.VoltageColumn}|{c.PowerColumn}|analysis-load={analysisLoadSource.WireName()}|{c.BinWatts}|{c.BaselineSamples}";
+            var identity = $"v4|{c.GpuUuid}|source={sourceMode}|provider={providerIdentity}|{c.HwinfoCsv}|{c.RailJson}|{c.VoltageColumn}|{c.PowerColumn}|analysis-load={analysisLoadSource.WireName()}|qualification=hysteresis-v1|bin={c.BinWatts}|hysteresis={c.LoadBoundaryHysteresisWatts:R}|stable={c.StableSamples}|baseline={c.BaselineSamples}";
             string baselinePath = Path.Combine(data, "baseline.json");
             Saved? saved = File.Exists(baselinePath) ? JsonSerializer.Deserialize<Saved>(File.ReadAllText(baselinePath)) : null;
             if (saved != null && saved.Identity != identity && saved.Bins.Count > 0) throw new Exception("Baseline source/config changed. Archive baseline.json before restarting.");
@@ -611,16 +691,17 @@ public static class Program
                     ? load.ToAnalysisPowerWatts(electrical)
                     : null;
                 var result = new Result(status, null, null, null, null, null);
-                if (v != null && analysisPower.HasValue && (!lastSensor.HasValue || v.Timestamp > lastSensor.Value))
-                { result = analysis.Add(v.Timestamp, analysisPower.Value, v.Volts); lastSensor = v.Timestamp; }
-                else if (v == null || !analysisPower.HasValue)
+                if (v != null && (!lastSensor.HasValue || v.Timestamp > lastSensor.Value))
+                {
+                    result = analysis.Add(v.Timestamp, analysisPower, v.Volts,
+                        clock.Elapsed.TotalSeconds, electrical?.IsFresh == true);
+                    lastSensor = v.Timestamp;
+                    if (result.Status == "ANALYSIS_LOAD_UNAVAILABLE")
+                        detail = load?.Detail ?? $"Selected {analysisLoadSource.WireName()} is unavailable.";
+                }
+                else if (v == null)
                 {
                     analysis.Gap();
-                    if (v != null && terminalFailure == null)
-                    {
-                        result = result with { Status = "ANALYSIS_LOAD_UNAVAILABLE" };
-                        detail = load?.Detail ?? $"Selected {analysisLoadSource.WireName()} is unavailable.";
-                    }
                 }
                 string analysisPowerSource = analysisLoadSource.WireName();
                 string row = Csv.Line(now.ToString("O"), c.GpuUuid, g.Power, v?.Volts, v?.Timestamp.ToString("O"), analysisPower,

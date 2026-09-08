@@ -42,8 +42,48 @@ public static class Tests
         resumed.Add(t.AddSeconds(1), 440, 11.7);
         Check(resumed.Add(t.AddSeconds(2), 440, 11.7).Status == "SUDDEN_DROOP", "saved reference survives restart");
         Check(Add(390, 11.7).Status == "LOAD_SETTLING", "new bin never compared to old load");
+        a.Gap();
         Check(Add(30, 12).Status == "OUTSIDE_ANALYSIS_RANGE", "idle excluded");
         a.Gap(); Check(Add(440, 12).Status == "LOAD_SETTLING", "gap clears continuity");
+
+        var early = new Analysis(new Config
+        {
+            StableSamples = 5, BaselineSamples = 5, WindowSamples = 3,
+        });
+        var earlyTime = DateTimeOffset.UtcNow;
+        Check(early.Add(earlyTime, 440, 12).Status == "LOAD_SETTLING",
+            "coarse guard observes during settling");
+        Check(early.Add(earlyTime.AddSeconds(1), 440, 11.7).Status == "SUDDEN_DROOP",
+            "abrupt drop is detected during settling");
+        early.Gap();
+        Check(early.Add(earlyTime.AddSeconds(2), null, 12).Status == "ANALYSIS_LOAD_UNAVAILABLE",
+            "missing trend load is explicit");
+        Check(early.Add(earlyTime.AddSeconds(3), null, 11.7).Status == "SUDDEN_DROOP",
+            "abrupt drop is detected without trend load");
+
+        var boundary = new Analysis(new Config
+        {
+            StableSamples = 3, BaselineSamples = 5, WindowSamples = 3,
+            LoadBoundaryHysteresisWatts = 2.5,
+        });
+        var boundaryTime = DateTimeOffset.UtcNow;
+        var boundaryStatuses = Enumerable.Range(0, 8).Select(i =>
+            boundary.Add(boundaryTime.AddSeconds(i), i % 2 == 0 ? 449 : 451, 12).Status).ToArray();
+        Check(boundaryStatuses.Skip(2).Any(status => status == "LEARNING_REFERENCE") &&
+            boundaryStatuses.Skip(2).All(status => status != "LOAD_SETTLING"),
+            "449/451 W oscillation does not suppress analysis indefinitely");
+        Check(boundary.Add(boundaryTime.AddSeconds(8), 500, 12).Status == "LOAD_SETTLING",
+            "material load transition restarts qualification");
+
+        var invalidVoltage = new Analysis(new Config
+        {
+            StableSamples = 1, BaselineSamples = 5, WindowSamples = 3,
+        });
+        _ = invalidVoltage.Add(boundaryTime, 440, 12);
+        Check(invalidVoltage.Add(boundaryTime.AddSeconds(1), 440, double.NaN).Status == "VOLTAGE_UNAVAILABLE",
+            "invalid voltage cannot fabricate a coarse comparison");
+        Check(invalidVoltage.Add(boundaryTime.AddSeconds(2), 440, 11.5).Status != "SUDDEN_DROOP",
+            "first post-gap voltage is not compared with stale history");
         Check(Csv.Parse("a,\"b,c\",\"d\"\"e\"").SequenceEqual(new[] { "a", "b,c", "d\"e" }), "quoted CSV");
         var folder = Path.Combine(Path.GetTempPath(), "ConnectorWatch-test-" + Guid.NewGuid()); Directory.CreateDirectory(folder);
         try
@@ -98,6 +138,8 @@ public static class Tests
         DirectNvRailsTests.Run();
         ElectricalSamplesTests.Run();
         RailJsonTailTests.Run();
+        CoarseRailGuardTests.Run();
+        LoadQualifierTests.Run();
         Console.WriteLine($"PASS: {passed} behavioral checks.");
     }
 }

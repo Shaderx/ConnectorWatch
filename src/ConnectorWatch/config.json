@@ -25,5 +25,10 @@
   "WindowMaxAgeSeconds": 1800,
   "ShiftVolts": 0.2,
   "SuddenDroopVolts": 0.25,
+  "GrossUnderVoltageV": null,
+  "GrossOverVoltageV": null,
+  "CoarseConfirmationSeconds": 0,
+  "CoarseConfirmationSamples": 1,
+  "LoadBoundaryHysteresisWatts": 2.5,
   "SustainSamples": 5
 }
