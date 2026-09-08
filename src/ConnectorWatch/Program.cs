@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.IO.Pipes;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -936,6 +937,15 @@ public static class Program
                 return 0;
             }
             string data = Path.GetFullPath(c.DataDirectory, root); Directory.CreateDirectory(data);
+            string? operatorCommand = args.Contains("--accept-reference") ? "accept-reference" :
+                args.Contains("--migrate-reference") ? "migrate-reference" :
+                args.Contains("--archive-reference") ? "archive-reference" :
+                args.Contains("--acknowledge-incident") ? "acknowledge-incident" :
+                args.Contains("--resolve-incident") ? "resolve-incident" : null;
+            if (operatorCommand is not null)
+                return SendOperatorCommand(data, operatorCommand,
+                    Option(args, "--operator"), Option(args, "--note"),
+                    Option(args, "--incident-id"));
             using var singleInstance = new FileStream(Path.Combine(data, "monitor.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
             using var stop = new CancellationTokenSource();
             using var shutdown = RegisterShutdown(stop);
@@ -1598,6 +1608,42 @@ public static class Program
         }
     }
     static string? Option(string[] args, string name) { int i = Array.IndexOf(args, name); return i < 0 ? null : i + 1 < args.Length ? args[i + 1] : throw new Exception("Missing value for " + name); }
+
+    static int SendOperatorCommand(string dataDirectory, string command,
+        string? operatorName, string? note, string? incidentId)
+    {
+        if (command is "acknowledge-incident" or "resolve-incident" &&
+            string.IsNullOrWhiteSpace(incidentId))
+            throw new Exception("--incident-id is required for incident commands.");
+        string clientId = "connectorwatch-cli-" + Guid.NewGuid().ToString("N");
+        var hello = SendControlRequest(dataDirectory,
+            new ControlRequest("hello", clientId));
+        if (hello is null || !hello.Ok)
+            throw new IOException("No compatible ConnectorWatch daemon answered the control endpoint.");
+        var response = SendControlRequest(dataDirectory, new ControlRequest(command,
+            clientId, hello.InstanceId, operatorName, note,
+            ExplicitLegacyMigration: command == "migrate-reference",
+            IncidentId: incidentId));
+        if (response is null)
+            throw new IOException("The daemon did not return a complete control response.");
+        Console.WriteLine(JsonSerializer.Serialize(response, Json));
+        return response.Ok ? 0 : 1;
+    }
+
+    static ControlResponse? SendControlRequest(string dataDirectory, ControlRequest request)
+    {
+        using var pipe = new NamedPipeClientStream(".", ControlEndpoint.Name(dataDirectory),
+            PipeDirection.InOut, PipeOptions.CurrentUserOnly);
+        pipe.Connect(2000);
+        using var writer = new StreamWriter(pipe, new UTF8Encoding(false), 1024, leaveOpen: true)
+        { AutoFlush = true };
+        writer.WriteLine(ControlProtocol.Serialize(request));
+        using var reader = new StreamReader(pipe, Encoding.UTF8, false, 1024, leaveOpen: true);
+        string? line = reader.ReadLine();
+        return string.IsNullOrWhiteSpace(line)
+            ? null
+            : JsonSerializer.Deserialize<ControlResponse>(line, ControlProtocol.Json);
+    }
     static void Atomic(string path, string value) => HybridStorage.Atomic(path, value);
 
     static void MarkStopped(string path, string reason, ControlServer? control = null,
