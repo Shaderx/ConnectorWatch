@@ -153,6 +153,7 @@ public static class Tests
         ReferenceLifecycleTests.Run();
         OfflineReplayTests.Run();
         DifferentialModelTests.Run();
+        ResidualDetectorTests.Run();
         Console.WriteLine($"PASS: {passed} behavioral checks.");
     }
 }
