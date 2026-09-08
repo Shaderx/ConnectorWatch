@@ -32,11 +32,14 @@ Optionally copy that UUID into `config.json`. The public sample selects automati
   "SampleSeconds": 1,
   "DataDirectory": "data",
   "DesktopAlerts": true,
-  "VoltageSource": "direct"
+  "VoltageSource": "direct",
+  "AnalysisLoadSource": "CONNECTOR_POWER"
 }
 ```
 
 Keep the rest of the package's configuration fields when editing the file. `VoltageSource` must remain `direct` for the validated native path. An explicit UUID bypasses automatic selection; it does not enable multi-GPU support for direct rails. Only one daemon may write to a data directory.
+
+`AnalysisLoadSource` pins the comparison basis for the daemon lifetime. Supported values are `CONNECTOR_CURRENT`, `CONNECTOR_POWER`, `NVML_BOARD_POWER`, and `EXTERNAL_SENSOR_POWER`. If the selected measurement is missing or stale, analysis becomes unavailable; it never silently substitutes a different source. Connector-current qualification is converted to the existing watt-binned axis only with voltage from the same fresh connector observation. Direct-reader power is derived from that rail's V×I and is not an independent third measurement.
 
 Start the dashboard with `ConnectorWatch.Gui.exe` or `Start-GUI.cmd`. It starts one hidden daemon when the data directory is not already owned and attaches to an existing compatible daemon when one is running. To run without a window, start `ConnectorWatch.exe`, `Start.cmd`, or `RunBackground.ps1` from the extracted directory. The headless executable has no tray icon.
 

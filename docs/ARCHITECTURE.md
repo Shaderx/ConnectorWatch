@@ -21,9 +21,11 @@ flowchart LR
 
 ## Daemon
 
-At each sample, the daemon reads NVML board power, temperature, utilization, and requested power limit for the configured GPU UUID. A voltage provider supplies the 16-pin input voltage and, where the source exposes it, a contemporaneous power value and source timestamp. The provider's values remain distinct from GPU core voltage and from PCIe slot voltage.
+At each sample, the daemon reads NVML board power, temperature, utilization, and requested power limit for the configured GPU UUID. A voltage provider supplies a typed electrical sample with explicitly nullable connector and PCIe voltage/current/power fields, provenance, raw legacy extras, and conservative freshness metadata. Unsupported current remains unavailable rather than being inferred from voltage or power. Direct-reader power is the derived V×I result from the same rail observation, not an independent measurement. The provider's values remain distinct from GPU core voltage and from PCIe slot voltage.
 
-The default public configuration selects `VoltageSource: "direct"`. The daemon also contains explicit adapters for HWiNFO CSV and newline-delimited JSON. `auto` can be used by an advanced operator who has deliberately configured an external source; an explicit source does not silently change to another provider. A source value is accepted only when its timestamp is fresh and its required fields are valid. Missing or stale values create a monitoring gap instead of a fabricated sample.
+The default public configuration selects `VoltageSource: "direct"` and `AnalysisLoadSource: "CONNECTOR_POWER"`. The daemon also contains explicit adapters for HWiNFO CSV and newline-delimited JSON. `auto` can be used by an advanced operator who has deliberately configured an external source; an explicit source does not silently change to another provider. The analysis load source is resolved once, included in reference identity, and never falls back per sample. A missing selected load or stale required field creates `ANALYSIS_LOAD_UNAVAILABLE` and a continuity gap. Legacy configurations without the field receive a one-time provider-compatible resolution at startup.
+
+The newline-delimited JSON adapter reads at most the newest 128 KiB from the file tail. When that window begins inside a record it discards the partial leading bytes, ignores an unterminated append, and returns the newest complete non-empty record. A single record larger than the bound is unavailable unless a later complete record fits in the window; the adapter never rescans an unbounded growing file.
 
 The analyzer groups eligible samples into 25 W bins. It waits for stable samples after a load transition, learns a per-bin median and fifth percentile, persists that reference identity, then compares a rolling window of current samples with the saved reference. The analysis result is written beside the raw observation so a consumer can distinguish an observed value, an approximate NVML-aligned value, a gap, and an alert state.
 
@@ -57,8 +59,8 @@ The main files are:
 
 | File | Producer | Consumer | Contract |
 | --- | --- | --- | --- |
-| `telemetry-YYYY-MM-DD.csv` | daemon | GUI and offline tools | raw UTC observations plus source, comparison, reference, rolling, and status fields |
-| `status.json` | daemon | GUI, scripts, operators | latest complete state; inspect its timestamp and `stopped` flag |
+| `telemetry-YYYY-MM-DD.csv` | daemon | GUI and offline tools | legacy columns followed by additive typed rail, source, freshness, provenance, and analysis-unit fields |
+| `status.json` | daemon | GUI, scripts, operators | additive schema 3 state with legacy voltage plus typed `electrical` and `analysis_load`; inspect timestamp and `stopped` |
 | `events.csv` | daemon | GUI and operators | status transitions and details |
 | `baseline.json` | daemon | analyzer | source/GPU/config identity and per-bin reference state |
 | `monitor.lock` | daemon | daemon | single-writer coordination |

@@ -13,7 +13,7 @@ dotnet run --project .\src\ConnectorWatch.Gui\ConnectorWatch.Gui.csproj -- --dem
 
 The daemon self-test uses parser, analysis, persistence, control, and native-decoder fixtures. It does not initialize NVML, load NVAPI, invoke the direct reader, or query a GPU. The GUI command uses synthetic demo data and checks dashboard/tray behavior without attaching to a live daemon. These are safe offline checks; they do not prove that a physical sensor source is correct.
 
-The current offline results are passing: the daemon control/ABI suite and 21 behavioral checks pass, including zero-device, multiple-device, and error cases for the identity gate; 24 GUI regression checks pass; and seven synthetic UI/tray lifecycle checks pass, including stale-card handling. These results cover the source-tree test runs and do not certify every packaged artifact.
+The current vNext offline results include the existing daemon control/storage/native ABI suite, typed electrical/provenance/freshness fixtures, and bounded NDJSON-tail regressions. The daemon suite passes, both daemon and GUI projects build with zero warnings, and seven synthetic UI/tray lifecycle checks pass. These results cover source-tree behavior only and do not certify a physical sensor, connector, or packaged artifact.
 
 To make a release package after the source checks pass:
 
@@ -30,6 +30,8 @@ The intended self-contained output is `dist/ConnectorWatch-win-x64`. The package
 | Configuration | Automatic/explicit UUID selection, source mode, numeric ranges, and conflicting source settings are checked | Does not verify that a user's UUID selects the intended card |
 | NVML telemetry | Managed read and unavailable-field handling are exercised through offline seams | No GPU or driver is loaded by the offline suite |
 | Voltage input | HWiNFO CSV and newline-delimited JSON parsing, freshness, timestamps, gaps, and malformed rows are covered | A parsed value is not proof that the external sensor measures the connector |
+| Typed electrical contract | Direct connector/PCIe V/A/W mapping, derived-power provenance, explicit unsupported fields, stable source names, legacy projection and no-fallback selection are covered | V, I and derived V×I are one observation, not three independent sensors |
+| NDJSON tail reader | Files beyond 128 KiB, partial leading/trailing records, exact boundaries, CRLF/LF, empty/oversized records and concurrent append sharing are covered | A complete record larger than the bounded window cannot be reconstructed |
 | Direct decoder | ABI fixtures, buffer-size checks, canaries, metadata, freshness markers, and worker timeout ownership are covered offline | The direct native provider still requires the supported Windows board/driver and separate physical validation |
 | Detector | Bin learning, stable-sample gating, persisted references, rolling windows, percentile markers, gaps, repeated timestamps, and threshold transitions are covered | Thresholds are comparisons, not safety limits |
 | Files | Atomic status, daily telemetry, transition events, baseline identity, and single-writer behavior are covered | Disk retention is manual and can grow until archived or deleted |
