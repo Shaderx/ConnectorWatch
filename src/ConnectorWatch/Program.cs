@@ -13,6 +13,17 @@ namespace ConnectorWatch;
 public sealed class Config
 {
     public string GpuUuid { get; set; } = "";
+    /// <summary>Operator-requested target cap.  This is configuration only;
+    /// the daemon does not write it to a device.</summary>
+    public double? DesiredPowerCapWatts { get; set; }
+    // Friendly alias for callers using the watchdog terminology.  Keep one
+    // serialized/configured value so status cannot contain two cap claims.
+    [JsonIgnore]
+    public double? DesiredConfiguredCapWatts
+    {
+        get => DesiredPowerCapWatts;
+        set => DesiredPowerCapWatts = value;
+    }
     public double SampleSeconds { get; set; } = 1;
     public int FlushSeconds { get; set; } = 30;
     public string DataDirectory { get; set; } = "data";
@@ -57,6 +68,8 @@ public sealed class Config
             !double.IsFinite(ShiftVolts) || !double.IsFinite(SuddenDroopVolts) ||
             GrossUnderVoltageV is double grossUnder && !double.IsFinite(grossUnder) ||
             GrossOverVoltageV is double grossOver && !double.IsFinite(grossOver) ||
+            DesiredPowerCapWatts is double desiredPowerCap &&
+                (!double.IsFinite(desiredPowerCap) || desiredPowerCap <= 0) ||
             !double.IsFinite(CoarseConfirmationSeconds) || !double.IsFinite(LoadBoundaryHysteresisWatts) ||
             FlushSeconds < 1 || FlushSeconds > 60 || SampleSeconds < .2 || SampleSeconds > 60 || BinWatts < 1 || BinWatts > 100 ||
             MinAnalysisWatts < 0 || StableSamples < 1 || BaselineSamples < 5 || BaselineSamples > 10000 ||
@@ -856,6 +869,53 @@ public static class Program
         ExpectedIdentity = identity.CanonicalKey,
     };
 
+    /// <summary>Sensor continuity is an explicit gate.  A source that is
+    /// missing, stale, or unable to provide connector voltage cannot keep an
+    /// accepted reference in the analyzable state.</summary>
+    internal static bool IsSourceDegraded(ElectricalSample? electrical,
+        Voltage? voltage, string? setupError) =>
+        !string.IsNullOrWhiteSpace(setupError) || electrical is null ||
+        voltage is null || voltage.Timestamp == default ||
+        !electrical.Connector.HasVoltage || !electrical.Freshness.IsFresh;
+
+    internal static bool MarkReferenceStaleIfSourceDegraded(
+        ReferenceLifecycle lifecycle, ElectricalSample? electrical,
+        Voltage? voltage, string? setupError, DateTimeOffset atUtc,
+        string detail, bool continuityDegraded = false)
+    {
+        if ((!IsSourceDegraded(electrical, voltage, setupError) &&
+                !continuityDegraded) || lifecycle.Accepted is null ||
+            lifecycle.State is ReferenceLifecycleState.REFERENCE_STALE or
+                ReferenceLifecycleState.REFERENCE_INVALID)
+            return false;
+        lifecycle.MarkStale(atUtc, string.IsNullOrWhiteSpace(detail)
+            ? "Voltage source degraded; accepted reference marked stale."
+            : "Voltage source degraded; accepted reference marked stale: " + detail);
+        return true;
+    }
+
+    internal static bool HasAdvancingSensorTimestamp(DateTimeOffset? previous,
+        DateTimeOffset current) => current != default &&
+        (!previous.HasValue || current > previous.Value);
+
+    /// <summary>NVML exposes the daemon's host-poll observation here.  It does
+    /// not expose an independently verified limit timestamp or a separate
+    /// configured-vs-observed pair, so the watchdog must remain explicit about
+    /// those unavailable evidence fields.</summary>
+    internal static PowerLimitObservation BuildPowerLimitObservation(
+        DateTimeOffset hostTimestampUtc, Gpu gpu, string identity,
+        double? desiredConfiguredCapWatts = null,
+        ElectricalSample? electrical = null) =>
+        new(hostTimestampUtc, ConfiguredLimitWatts: desiredConfiguredCapWatts,
+            ObservedLimitWatts: gpu.Limit, BoardPowerWatts: gpu.Power,
+            IsFresh: gpu.Limit.HasValue, SourceTimestampUtc: null,
+            FreshnessVerified: false, Source: "NVML read-only; host poll timestamp",
+            Identity: identity,
+            DesiredConfiguredCapWatts: desiredConfiguredCapWatts,
+            EnforcedLimitWatts: null,
+            EnforcementTelemetrySupported: false,
+            ConnectorPowerWatts: electrical?.Connector.PowerW);
+
     internal static Dictionary<int, Bin> BuildAnalysisBins(ReferenceLifecycle lifecycle,
         Saved? legacySaved)
     {
@@ -1286,29 +1346,31 @@ public static class Program
                 bool newSensor = false;
                 lock (referenceGate)
                 {
-                    powerLimitResult = powerLimitWatchdog.Observe(new PowerLimitObservation(
-                        now, ConfiguredLimitWatts: null, ObservedLimitWatts: g.Limit,
-                        BoardPowerWatts: g.Power, IsFresh: g.Limit.HasValue,
-                        SourceTimestampUtc: now, FreshnessVerified: true,
-                        Source: "NVML read-only", Identity: incidentIdentity),
+                    powerLimitResult = powerLimitWatchdog.Observe(
+                        BuildPowerLimitObservation(now, g, incidentIdentity,
+                            c.DesiredPowerCapWatts, electrical),
                         clock.Elapsed.TotalSeconds);
                     result = new Result(status, null, null, null, null, null);
-                    if (v != null && (!lastSensor.HasValue || v.Timestamp > lastSensor.Value))
+                    bool timestampAdvances = v is not null &&
+                        HasAdvancingSensorTimestamp(lastSensor, v.Timestamp);
+                    if (timestampAdvances)
                     {
                         newSensor = true;
-                        result = analysis.Add(v.Timestamp, analysisPower, v.Volts,
+                        result = analysis.Add(v!.Timestamp, analysisPower, v.Volts,
                             clock.Elapsed.TotalSeconds, electrical?.IsFresh == true);
                         lastSensor = v.Timestamp;
                         if (result.Status == "ANALYSIS_LOAD_UNAVAILABLE")
                             detail = load?.Detail ?? $"Selected {analysisLoadSource.WireName()} is unavailable.";
                     }
-                    else if (v == null)
+                    else
                     {
                         analysis.Gap();
+                        if (v is not null)
+                            detail = "Voltage source timestamp repeated or moved backwards; analysis continuity reset.";
                     }
                     var beforeState = lifecycle.State;
                     bool beforeCandidateQualified = lifecycle.Candidate?.IsQualified == true;
-                    if (v is not null)
+                    if (newSensor && v is not null)
                     {
                         var candidate = analysis.BuildCandidate(referenceIdentity, now);
                         // ReferenceLifecycle preserves LEGACY_MIGRATION origin
@@ -1316,6 +1378,13 @@ public static class Program
                         // cannot bypass explicit migration acknowledgement.
                         if (candidate is not null)
                             _ = lifecycle.SetCandidate(candidate);
+                    }
+                    bool continuityDegraded = v is not null && lastSensor.HasValue &&
+                        !timestampAdvances;
+                    if (MarkReferenceStaleIfSourceDegraded(lifecycle, electrical, v,
+                        sourceSetupError, now, detail, continuityDegraded))
+                    {
+                        PersistReferenceLocked();
                     }
                     referenceStatus = lifecycle.Snapshot();
                     referenceChanged = beforeState != referenceStatus.State ||

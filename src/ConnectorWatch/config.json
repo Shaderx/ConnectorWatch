@@ -1,5 +1,6 @@
 {
   "GpuUuid": "",
+  "DesiredPowerCapWatts": null,
   "SampleSeconds": 1,
   "FlushSeconds": 30,
   "DataDirectory": "data",

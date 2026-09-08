@@ -7,6 +7,7 @@ public static class EarlyWarningIntegrationTests
 {
     public static void Run()
     {
+        RuntimeEvidenceGates();
         var identity = new DifferentialModelIdentity(
             gpuUuid: "GPU-INTEGRATION",
             board: "BOARD-INTEGRATION",
@@ -85,6 +86,60 @@ public static class EarlyWarningIntegrationTests
             "integration-client", server.InstanceId, IncidentId: incidentId));
         Check(response.Ok && response.IncidentId == incidentId &&
             response.IncidentState == "RESOLVED", "identity-bound incident resolution command");
+    }
+
+    static void RuntimeEvidenceGates()
+    {
+        var start = new DateTimeOffset(2026, 9, 9, 4, 0, 0, TimeSpan.Zero);
+        var fresh = FreshnessMetadata.HostPoll(start, "host poll only");
+        var typed = ElectricalSample.FromLegacy(
+            new Voltage(start, 12.1, 440, "{}"), "fixture", fresh);
+        var stale = typed with { Freshness = FreshnessMetadata.Unavailable(
+            start, "fixture source gap") };
+        Check(!Program.IsSourceDegraded(typed, typed.ToLegacyVoltage(), null),
+            "fresh host-poll source is not treated as a source gap");
+        Check(Program.IsSourceDegraded(stale, stale.ToLegacyVoltage(), null),
+            "stale electrical source is propagated as degradation");
+        Check(Program.HasAdvancingSensorTimestamp(null, start) &&
+            !Program.HasAdvancingSensorTimestamp(start, start) &&
+            !Program.HasAdvancingSensorTimestamp(start, start.AddSeconds(-1)),
+            "repeated and backwards sensor timestamps are not advancing");
+
+        var config = new Config { GpuUuid = "GPU-RUNTIME-EVIDENCE" };
+        var referenceIdentity = Program.BuildReferenceIdentity(config, "json",
+            "fixture-source", AnalysisLoadSource.CONNECTOR_POWER);
+        var candidate = ReferenceCandidateModel.Learned(referenceIdentity,
+            new Dictionary<int, ReferenceBinStatistics>
+            {
+                [425] = new(425, 12.1, 12.0, observedSamples: 5),
+            }, qualifiedSamples: 5, requiredSamples: 5,
+            firstObservedAtUtc: start, lastObservedAtUtc: start,
+            isQualified: true, detail: "runtime fixture");
+        var lifecycle = new ReferenceLifecycle(referenceIdentity, start);
+        Check(lifecycle.SetCandidate(candidate).Succeeded &&
+            lifecycle.AcceptCandidate(start, "runtime-test").Succeeded,
+            "runtime fixture starts with an accepted reference");
+        Check(!Program.MarkReferenceStaleIfSourceDegraded(lifecycle, typed,
+            typed.ToLegacyVoltage(), null, start, "fresh source"),
+            "healthy source leaves accepted reference usable");
+        Check(Program.MarkReferenceStaleIfSourceDegraded(lifecycle, stale,
+            stale.ToLegacyVoltage(), null, start.AddSeconds(1), "fixture source gap") &&
+            lifecycle.State == ReferenceLifecycleState.REFERENCE_STALE &&
+            lifecycle.Compatibility == ReferenceCompatibility.DEGRADED,
+            "runtime source degradation marks the accepted reference stale");
+
+        var observation = Program.BuildPowerLimitObservation(start,
+            new Gpu(440, 60, 90, 450), "runtime-watchdog");
+        Check(!observation.FreshnessVerified && observation.SourceTimestampUtc is null &&
+            observation.ConfiguredLimitWatts is null,
+            "watchdog observation does not invent verified or configured evidence");
+        var watchdog = new PowerLimitWatchdog(
+            new PowerLimitWatchdogOptions(BaselineSamples: 1), "runtime-watchdog");
+        var watchdogResult = watchdog.Observe(observation);
+        Check(watchdogResult.Status == PowerLimitWatchdogStatus.FreshnessUnverified &&
+            !watchdogResult.LimitAvailable &&
+            watchdogResult.DifferenceFromConfiguredWatts is null,
+            "watchdog stays fail-closed without source freshness and a configured pair");
     }
 
     static void Check(bool condition, string detail)

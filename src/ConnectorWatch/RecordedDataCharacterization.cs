@@ -34,7 +34,10 @@ public sealed record RecordedTelemetryRow(
     double? PcieCurrentAmps = null,
     double? PciePowerWatts = null,
     double? UtilizationPercent = null,
-    double? PowerLimitWatts = null);
+    double? PowerLimitWatts = null,
+    double? PollLatencySeconds = null,
+    int? ConsecutiveIdenticalObservations = null,
+    string? AcquisitionHealth = null);
 
 /// <summary>Controls cadence and gap interpretation.  All values are UTC and
 /// seconds; a null expected cadence lets the report use the observed median.
@@ -130,6 +133,70 @@ public sealed record CharacterizationThermalCoverage(
     [property: JsonPropertyName("covered_duration_seconds")] double? CoveredDurationSeconds,
     [property: JsonPropertyName("duration_coverage_percent")] double? DurationCoveragePercent);
 
+public sealed record CharacterizationDistribution(
+    [property: JsonPropertyName("count")] int Count,
+    [property: JsonPropertyName("mean")] double? Mean,
+    [property: JsonPropertyName("variance")] double? Variance,
+    [property: JsonPropertyName("standard_deviation")] double? StandardDeviation,
+    [property: JsonPropertyName("p05")] double? P05,
+    [property: JsonPropertyName("median")] double? Median,
+    [property: JsonPropertyName("p95")] double? P95);
+
+public sealed record CharacterizationSignalBehavior(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("distribution")] CharacterizationDistribution Distribution,
+    [property: JsonPropertyName("unique_value_count")] int UniqueValueCount,
+    [property: JsonPropertyName("repeated_update_count")] int RepeatedUpdateCount,
+    [property: JsonPropertyName("minimum_observed_step")] double? MinimumObservedStep);
+
+public sealed record CharacterizationCurrentBand(
+    [property: JsonPropertyName("minimum_amps")] double MinimumAmps,
+    [property: JsonPropertyName("maximum_amps")] double MaximumAmps,
+    [property: JsonPropertyName("row_count")] int RowCount,
+    [property: JsonPropertyName("voltage_variance")] double? VoltageVariance,
+    [property: JsonPropertyName("residual_variance")] double? ResidualVariance);
+
+public sealed record CharacterizationCrossRailTiming(
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("row_aligned_pair_count")] int RowAlignedPairCount,
+    [property: JsonPropertyName("unpaired_row_count")] int UnpairedRowCount,
+    [property: JsonPropertyName("detail")] string Detail);
+
+public sealed record CharacterizationDrift(
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("window_seconds")] double WindowSeconds,
+    [property: JsonPropertyName("first_window_mean_v")] double? FirstWindowMeanVolts,
+    [property: JsonPropertyName("last_window_mean_v")] double? LastWindowMeanVolts,
+    [property: JsonPropertyName("change_v")] double? ChangeVolts);
+
+public sealed record CharacterizationPollingEvidence(
+    [property: JsonPropertyName("unique_voltage_updates")] int UniqueVoltageUpdates,
+    [property: JsonPropertyName("repeated_voltage_rows")] int RepeatedVoltageRows,
+    [property: JsonPropertyName("poll_latency_seconds")] CharacterizationDistribution PollLatencySeconds,
+    [property: JsonPropertyName("reported_identical_observation_maximum")] int? ReportedIdenticalObservationMaximum,
+    [property: JsonPropertyName("unhealthy_acquisition_rows")] int UnhealthyAcquisitionRows,
+    [property: JsonPropertyName("call_latency_status")] string CallLatencyStatus,
+    [property: JsonPropertyName("cpu_status")] string CpuStatus,
+    [property: JsonPropertyName("handle_thread_status")] string HandleThreadStatus,
+    [property: JsonPropertyName("driver_stability_status")] string DriverStabilityStatus);
+
+public sealed record CharacterizationThresholdProbe(
+    [property: JsonPropertyName("injected_droop_mv")] int InjectedDroopMillivolts,
+    [property: JsonPropertyName("fast_detected")] bool FastDetected,
+    [property: JsonPropertyName("fast_latency_seconds")] double? FastLatencySeconds,
+    [property: JsonPropertyName("ewma_detected")] bool EwmaDetected,
+    [property: JsonPropertyName("ewma_latency_seconds")] double? EwmaLatencySeconds);
+
+public sealed record CharacterizationDetectorEvaluation(
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("observed_duration_hours")] double? ObservedDurationHours,
+    [property: JsonPropertyName("normal_data_alert_transitions")] int NormalDataAlertTransitions,
+    [property: JsonPropertyName("false_alerts_per_observed_hour")] double? FalseAlertsPerObservedHour,
+    [property: JsonPropertyName("production_fast_threshold_v")] double ProductionFastThresholdVolts,
+    [property: JsonPropertyName("production_ewma_threshold_v")] double ProductionEwmaThresholdVolts,
+    [property: JsonPropertyName("production_defaults_changed")] bool ProductionDefaultsChanged,
+    [property: JsonPropertyName("synthetic_sensitivity_probes")] IReadOnlyList<CharacterizationThresholdProbe> SyntheticSensitivityProbes);
+
 /// <summary>Stable, JSON-ready characterization output.</summary>
 public sealed record RecordedDataCharacterizationReport(
     [property: JsonPropertyName("schema_version")] int SchemaVersion,
@@ -145,7 +212,15 @@ public sealed record RecordedDataCharacterizationReport(
     [property: JsonPropertyName("load_range_w")] CharacterizationRange LoadRangeWatts,
     [property: JsonPropertyName("voltage_range_v")] CharacterizationRange VoltageRangeVolts,
     [property: JsonPropertyName("load_voltage_association")] CharacterizationLoadVoltageAssociation LoadVoltageAssociation,
-    [property: JsonPropertyName("thermal_coverage")] CharacterizationThermalCoverage ThermalCoverage)
+    [property: JsonPropertyName("thermal_coverage")] CharacterizationThermalCoverage ThermalCoverage,
+    [property: JsonPropertyName("signal_behavior")] IReadOnlyList<CharacterizationSignalBehavior> SignalBehavior,
+    [property: JsonPropertyName("current_range_variance")] IReadOnlyList<CharacterizationCurrentBand> CurrentRangeVariance,
+    [property: JsonPropertyName("cross_rail_timing")] CharacterizationCrossRailTiming CrossRailTiming,
+    [property: JsonPropertyName("warmup_hour_scale_drift")] CharacterizationDrift WarmupHourScaleDrift,
+    [property: JsonPropertyName("polling_evidence")] CharacterizationPollingEvidence PollingEvidence,
+    [property: JsonPropertyName("detector_evaluation")] CharacterizationDetectorEvaluation DetectorEvaluation,
+    [property: JsonPropertyName("workload_types")] IReadOnlyList<string> WorkloadTypes,
+    [property: JsonPropertyName("unresolved_assumptions_and_blind_spots")] IReadOnlyList<string> UnresolvedAssumptionsAndBlindSpots)
 {
     static readonly JsonSerializerOptions Json = new()
     {
@@ -167,7 +242,7 @@ public sealed record RecordedDataCharacterizationReport(
 /// </summary>
 public static class RecordedDataCharacterization
 {
-    const int SchemaVersion = 1;
+    const int SchemaVersion = 2;
     static readonly CultureInfo Invariant = CultureInfo.InvariantCulture;
 
     public static RecordedDataCharacterizationReport Analyze(
@@ -293,6 +368,11 @@ public static class RecordedDataCharacterization
             x.Name, x.Values.Count(IsFinite), ordered.Count - x.Values.Count(IsFinite),
             Availability(x.Values.Count(IsFinite), ordered.Count))).ToArray();
         var thermal = Thermal(ordered, temperatureValues, threshold);
+        var association = Associate(ordered);
+        var residuals = LinearResiduals(ordered, association);
+        var signalBehavior = SignalBehavior(ordered, residuals);
+        var currentBands = CurrentBands(ordered, residuals);
+        var detectorEvaluation = EvaluateDetectors(ordered, residuals);
         return new(
             SchemaVersion,
             evidence,
@@ -313,7 +393,22 @@ public static class RecordedDataCharacterization
                 gapIntervals.Length == 0 ? null : gapIntervals.Max()),
             new CharacterizationSensorSummary(ordered.Count, sensorAvailability),
             Range(loadValues), Range(voltageValues),
-            Associate(ordered), thermal);
+            association, thermal,
+            signalBehavior,
+            currentBands,
+            CrossRailTiming(ordered),
+            Drift(ordered),
+            Polling(ordered),
+            detectorEvaluation,
+            new[] { "UNLABELLED_RECORDED_OPERATION" },
+            new[]
+            {
+                "Native source timestamps are unavailable in these files; row alignment is not proof of cross-rail synchronization.",
+                "Per-call latency, CPU, handle/thread counts, and driver health were not recorded; dependent stability claims remain unresolved.",
+                "The descriptive linear residual is not the frozen production robust-model residual and is not a resistance measurement.",
+                "Synthetic millivolt injections are sensitivity probes only; they are not safety thresholds or physical connector tests.",
+                "One-hertz aggregate observations can miss fast transients and cannot establish per-pin current or contact temperature."
+            });
     }
 
     static string EvidenceNote(CharacterizationEvidence evidence) => evidence switch
@@ -382,6 +477,177 @@ public static class RecordedDataCharacterization
             Range(temperatures), unique.Length > 1 ? observed : null,
             unique.Length > 1 ? covered : null,
             observed > 0 ? covered * 100.0 / observed : null);
+    }
+
+    static double?[] LinearResiduals(IReadOnlyList<RecordedTelemetryRow> rows,
+        CharacterizationLoadVoltageAssociation association)
+    {
+        var residuals = new double?[rows.Count];
+        if (association.SlopeVoltsPerWatt is not double slope ||
+            association.InterceptVolts is not double intercept) return residuals;
+        for (int i = 0; i < rows.Count; i++)
+            if (IsFinite(rows[i].LoadWatts) && IsFinite(rows[i].VoltageVolts))
+                residuals[i] = rows[i].VoltageVolts!.Value -
+                    (intercept + slope * rows[i].LoadWatts!.Value);
+        return residuals;
+    }
+
+    static IReadOnlyList<CharacterizationSignalBehavior> SignalBehavior(
+        IReadOnlyList<RecordedTelemetryRow> rows, IReadOnlyList<double?> residuals)
+    {
+        var signals = new (string Name, double?[] Values)[]
+        {
+            ("input_voltage_v", rows.Select(x => x.VoltageVolts).ToArray()),
+            ("pcie_voltage_v", rows.Select(x => x.PcieVoltageVolts).ToArray()),
+            ("connector_minus_pcie_voltage_v", rows.Select(x =>
+                IsFinite(x.VoltageVolts) && IsFinite(x.PcieVoltageVolts)
+                    ? x.VoltageVolts!.Value - x.PcieVoltageVolts!.Value : (double?)null).ToArray()),
+            ("board_power_w", rows.Select(x => x.BoardPowerWatts).ToArray()),
+            ("connector_power_w", rows.Select(x => x.ConnectorPowerWatts).ToArray()),
+            ("connector_current_a", rows.Select(x => x.ConnectorCurrentAmps).ToArray()),
+            ("pcie_current_a", rows.Select(x => x.PcieCurrentAmps).ToArray()),
+            ("pcie_power_w", rows.Select(x => x.PciePowerWatts).ToArray()),
+            ("descriptive_linear_residual_v", residuals.ToArray()),
+        };
+        return signals.Select(x => Behavior(x.Name, x.Values)).ToArray();
+    }
+
+    static CharacterizationSignalBehavior Behavior(string name, IReadOnlyList<double?> values)
+    {
+        var finite = values.Where(IsFinite).Select(x => x!.Value).ToArray();
+        var distinct = finite.Distinct().Order().ToArray();
+        int repeats = 0;
+        for (int i = 1; i < values.Count; i++)
+            if (IsFinite(values[i - 1]) && IsFinite(values[i]) &&
+                values[i - 1]!.Value == values[i]!.Value) repeats++;
+        var steps = new List<double>();
+        for (int i = 1; i < distinct.Length; i++)
+        {
+            var step = distinct[i] - distinct[i - 1];
+            if (step > 0 && double.IsFinite(step)) steps.Add(step);
+        }
+        return new(name, Distribution(finite), distinct.Length, repeats,
+            steps.Count == 0 ? null : steps.Min());
+    }
+
+    static CharacterizationDistribution Distribution(IReadOnlyList<double> values)
+    {
+        if (values.Count == 0) return new(0, null, null, null, null, null, null);
+        var mean = values.Average();
+        var variance = values.Sum(x => (x - mean) * (x - mean)) / values.Count;
+        return new(values.Count, mean, variance, Math.Sqrt(variance),
+            Percentile(values, .05), Percentile(values, .5), Percentile(values, .95));
+    }
+
+    static IReadOnlyList<CharacterizationCurrentBand> CurrentBands(
+        IReadOnlyList<RecordedTelemetryRow> rows, IReadOnlyList<double?> residuals)
+    {
+        return rows.Select((row, index) => (row, index))
+            .Where(x => IsFinite(x.row.ConnectorCurrentAmps))
+            .GroupBy(x => Math.Floor(x.row.ConnectorCurrentAmps!.Value / 10) * 10)
+            .OrderBy(x => x.Key)
+            .Select(group =>
+            {
+                var voltages = group.Select(x => x.row.VoltageVolts).Where(IsFinite)
+                    .Select(x => x!.Value).ToArray();
+                var bandResiduals = group.Select(x => residuals[x.index]).Where(IsFinite)
+                    .Select(x => x!.Value).ToArray();
+                return new CharacterizationCurrentBand(group.Key, group.Key + 10, group.Count(),
+                    Distribution(voltages).Variance, Distribution(bandResiduals).Variance);
+            }).ToArray();
+    }
+
+    static CharacterizationCrossRailTiming CrossRailTiming(IReadOnlyList<RecordedTelemetryRow> rows)
+    {
+        int paired = rows.Count(x => IsFinite(x.VoltageVolts) && IsFinite(x.PcieVoltageVolts));
+        int either = rows.Count(x => IsFinite(x.VoltageVolts) || IsFinite(x.PcieVoltageVolts));
+        return new(paired == 0 ? "NO_PAIRED_RAILS" : "ROW_ALIGNED_SOURCE_TIMING_UNVERIFIED",
+            paired, either - paired,
+            "Only host-row alignment is available; independent native update timestamps were not captured.");
+    }
+
+    static CharacterizationDrift Drift(IReadOnlyList<RecordedTelemetryRow> rows)
+    {
+        const double windowSeconds = 3600;
+        if (rows.Count == 0) return new("NO_DATA", windowSeconds, null, null, null);
+        var start = rows[0].TimestampUtc;
+        var end = rows[^1].TimestampUtc;
+        if ((end - start).TotalSeconds < windowSeconds * 2)
+            return new("INSUFFICIENT_DURATION", windowSeconds, null, null, null);
+        var first = rows.Where(x => x.TimestampUtc <= start.AddSeconds(windowSeconds))
+            .Select(x => x.VoltageVolts).Where(IsFinite).Select(x => x!.Value).ToArray();
+        var last = rows.Where(x => x.TimestampUtc >= end.AddSeconds(-windowSeconds))
+            .Select(x => x.VoltageVolts).Where(IsFinite).Select(x => x!.Value).ToArray();
+        if (first.Length == 0 || last.Length == 0)
+            return new("INSUFFICIENT_COVERAGE", windowSeconds, null, null, null);
+        var firstMean = first.Average(); var lastMean = last.Average();
+        return new("DESCRIPTIVE_ONLY", windowSeconds, firstMean, lastMean, lastMean - firstMean);
+    }
+
+    static CharacterizationPollingEvidence Polling(IReadOnlyList<RecordedTelemetryRow> rows)
+    {
+        var behavior = Behavior("input_voltage_v", rows.Select(x => x.VoltageVolts).ToArray());
+        var latencies = rows.Select(x => x.PollLatencySeconds).Where(IsFinite)
+            .Select(x => x!.Value).ToArray();
+        var reportedRepeats = rows.Select(x => x.ConsecutiveIdenticalObservations)
+            .Where(x => x.HasValue).Select(x => x!.Value).ToArray();
+        int unhealthy = rows.Count(x => !string.IsNullOrWhiteSpace(x.AcquisitionHealth) &&
+            !x.AcquisitionHealth!.Equals("HEALTHY", StringComparison.OrdinalIgnoreCase));
+        return new(behavior.UniqueValueCount, behavior.RepeatedUpdateCount,
+            Distribution(latencies), reportedRepeats.Length == 0 ? null : reportedRepeats.Max(), unhealthy,
+            latencies.Length > 0 ? "RECORDED_HOST_POLL_LATENCY" : "NOT_CAPTURED",
+            "NOT_CAPTURED", "NOT_CAPTURED",
+            rows.Any(x => !string.IsNullOrWhiteSpace(x.AcquisitionHealth))
+                ? "RECORDED_ACQUISITION_STATUS_ONLY" : "NOT_CAPTURED");
+    }
+
+    static CharacterizationDetectorEvaluation EvaluateDetectors(
+        IReadOnlyList<RecordedTelemetryRow> rows, IReadOnlyList<double?> residuals)
+    {
+        var detector = ResidualDetectorFactory.CreateComposite();
+        int transitions = 0; bool alerted = false;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            if (!IsFinite(residuals[i])) continue;
+            var result = detector.Update(ResidualObservation.Available(rows[i].TimestampUtc,
+                residuals[i]!.Value));
+            bool next = result.IsAlert;
+            if (next && !alerted) transitions++;
+            alerted = next;
+        }
+        double observedSeconds = 0;
+        for (int i = 1; i < rows.Count; i++)
+        {
+            var seconds = (rows[i].TimestampUtc - rows[i - 1].TimestampUtc).TotalSeconds;
+            if (seconds > 0 && seconds <= 5) observedSeconds += seconds;
+        }
+        double? hours = observedSeconds > 0 ? observedSeconds / 3600 : null;
+        double? rate = hours is double duration && duration > 0 ? transitions / duration : null;
+        var options = new ResidualDetectorOptions();
+        return new(residuals.Any(IsFinite) ? "DESCRIPTIVE_RECORDED_RESIDUAL" : "NO_RESIDUAL_DATA",
+            hours, transitions, rate, options.FastDroopThresholdVolts,
+            options.EwmaDroopThresholdVolts, false,
+            new[] { 10, 20, 50, 100, 200 }.Select(Probe).ToArray());
+    }
+
+    static CharacterizationThresholdProbe Probe(int millivolts)
+    {
+        var fast = new FastResidualDetector(); var ewma = new EwmaResidualDetector();
+        var epoch = DateTimeOffset.UnixEpoch; var injectedAt = epoch.AddSeconds(12);
+        DateTimeOffset? fastAt = null, ewmaAt = null;
+        for (int i = 0; i < 42; i++)
+        {
+            var timestamp = epoch.AddSeconds(i);
+            var residual = i < 12 ? 0 : -millivolts / 1000.0;
+            var observation = ResidualObservation.Available(timestamp, residual);
+            var fastResult = fast.Update(observation); var ewmaResult = ewma.Update(observation);
+            if (fastResult.IsAlert && fastAt is null) fastAt = timestamp;
+            if (ewmaResult.IsAlert && ewmaAt is null) ewmaAt = timestamp;
+        }
+        return new(millivolts, fastAt is not null,
+            fastAt is DateTimeOffset f ? (f - injectedAt).TotalSeconds : null,
+            ewmaAt is not null,
+            ewmaAt is DateTimeOffset e ? (e - injectedAt).TotalSeconds : null);
     }
 
     static int OutOfOrderCount(IReadOnlyList<RecordedTelemetryRow> rows)
@@ -525,7 +791,10 @@ public static class RecordedDataCharacterization
             Number(Get("pcie_current_a")) ?? Extra(extras, "pcie_12v_a", "pcie_current_a"),
             Number(Get("pcie_power_w")) ?? Extra(extras, "pcie_12v_w", "pcie_power_w"),
             Number(Get("utilization_pct", "gpu_utilization_pct")),
-            Number(Get("power_limit_w")));
+            Number(Get("power_limit_w")),
+            Number(Get("poll_latency_seconds")),
+            Integer(Get("consecutive_identical_observations")),
+            Get("acquisition_health"));
         return true;
     }
 
@@ -610,7 +879,10 @@ public static class RecordedDataCharacterization
             Number(root, "pcie_current_a") ?? Number(extras, "pcie_12v_a", "pcie_current_a"),
             Number(root, "pcie_power_w") ?? Number(extras, "pcie_12v_w", "pcie_power_w"),
             Number(root, "utilization_pct") ?? Number(gpu, "utilization_pct", "Utilization"),
-            Number(root, "power_limit_w") ?? Number(gpu, "power_limit_w", "Limit"));
+            Number(root, "power_limit_w") ?? Number(gpu, "power_limit_w", "Limit"),
+            Number(root, "poll_latency_seconds", "latency_seconds"),
+            Integer(root, "consecutive_identical_observations"),
+            Text(root, "acquisition_health").FirstOrDefault());
         return true;
     }
 
@@ -656,6 +928,16 @@ public static class RecordedDataCharacterization
 
     static double? Number(string value) =>
         double.TryParse(value, NumberStyles.Float, Invariant, out var number) && double.IsFinite(number) ? number : null;
+
+    static int? Integer(string value) =>
+        int.TryParse(value, NumberStyles.Integer, Invariant, out var number) ? number : null;
+
+    static int? Integer(JsonElement root, params string[] names)
+    {
+        var number = Number(root, names);
+        return number is double value && value >= int.MinValue && value <= int.MaxValue &&
+            Math.Truncate(value) == value ? (int)value : null;
+    }
 
     static bool TryTimestamp(string value, out DateTimeOffset timestamp) =>
         DateTimeOffset.TryParse(value, Invariant, DateTimeStyles.RoundtripKind, out timestamp) &&

@@ -22,6 +22,13 @@ public static class PowerLimitWatchdogStatus
     public const string TimestampInvalid = "POWER_LIMIT_TIMESTAMP_INVALID";
     public const string TimeDiscontinuity = "POWER_LIMIT_TIME_DISCONTINUITY";
     public const string IdentityMismatch = "POWER_LIMIT_IDENTITY_MISMATCH";
+    /// <summary>Management-limit telemetry is present, but no independent
+    /// enforcement telemetry was supplied, so end-to-end enforcement is only
+    /// partially verified.</summary>
+    public const string PartiallyVerified = "POWER_LIMIT_PARTIALLY_VERIFIED";
+    public const string NotEnforcedPending = "POWER_LIMIT_NOT_ENFORCED_PENDING";
+    public const string NotEnforced = "POWER_LIMIT_NOT_ENFORCED";
+    public const string EnforcementUnavailable = "POWER_LIMIT_ENFORCEMENT_UNAVAILABLE";
 }
 
 public static class PowerLimitBoardStatus
@@ -43,9 +50,31 @@ public sealed record PowerLimitObservation(
     DateTimeOffset? SourceTimestampUtc = null,
     bool FreshnessVerified = false,
     string Source = "",
-    string Identity = "")
+    string Identity = "",
+    double? DesiredConfiguredCapWatts = null,
+    double? EnforcedLimitWatts = null,
+    bool EnforcementTelemetrySupported = false,
+    double? ConnectorPowerWatts = null)
 {
     public DateTimeOffset HostTime => HostTimestampUtc.ToUniversalTime();
+
+    /// <summary>The configured cap is separate from the provider's reported
+    /// management limit.  The old ConfiguredLimitWatts field remains the
+    /// compatibility input for callers that predate this distinction.</summary>
+    public double? DesiredCapWatts => DesiredConfiguredCapWatts ?? ConfiguredLimitWatts;
+
+    /// <summary>Compatibility name for the provider-reported management
+    /// limit; it is never treated as independent enforcement evidence.</summary>
+    public double? ReportedManagementLimitWatts => ObservedLimitWatts;
+
+    public bool HasFiniteDesiredCap => DesiredCapWatts is double value &&
+        double.IsFinite(value) && value > 0;
+
+    public bool HasFiniteEnforcedLimit => EnforcedLimitWatts is double value &&
+        double.IsFinite(value) && value > 0;
+
+    public bool HasFiniteConnectorPower => ConnectorPowerWatts is double value &&
+        double.IsFinite(value) && value >= 0;
 
     public bool HasFiniteConfiguredLimit => ConfiguredLimitWatts is double value &&
         double.IsFinite(value) && value > 0;
@@ -68,7 +97,8 @@ public sealed record PowerLimitWatchdogOptions(
     double ConfirmationSeconds = 0,
     int BaselineSamples = 3,
     double MaximumGapSeconds = 30,
-    double NearLimitMarginWatts = 5)
+    double NearLimitMarginWatts = 5,
+    double NotEnforcedToleranceWatts = 1)
 {
     public void Validate()
     {
@@ -86,6 +116,8 @@ public sealed record PowerLimitWatchdogOptions(
             throw new ArgumentOutOfRangeException(nameof(MaximumGapSeconds));
         if (!double.IsFinite(NearLimitMarginWatts) || NearLimitMarginWatts < 0)
             throw new ArgumentOutOfRangeException(nameof(NearLimitMarginWatts));
+        if (!double.IsFinite(NotEnforcedToleranceWatts) || NotEnforcedToleranceWatts < 0)
+            throw new ArgumentOutOfRangeException(nameof(NotEnforcedToleranceWatts));
     }
 }
 
@@ -110,7 +142,17 @@ public sealed record PowerLimitWatchdogState(
     DateTimeOffset? LastHostTimestampUtc = null,
     DateTimeOffset? LastSourceTimestampUtc = null,
     double? LastMonotonicSeconds = null,
-    string LastStatus = PowerLimitWatchdogStatus.BaselineLearning)
+    string LastStatus = PowerLimitWatchdogStatus.BaselineLearning,
+    double? LastDesiredConfiguredCapWatts = null,
+    double? LastReportedManagementLimitWatts = null,
+    double? LastEnforcedLimitWatts = null,
+    bool LastEnforcementTelemetrySupported = false,
+    double? LastConnectorPowerWatts = null,
+    int PendingNotEnforcedSamples = 0,
+    double? PendingNotEnforcedSinceMonotonicSeconds = null,
+    double? PendingNotEnforcedSinceHostSeconds = null,
+    double? PendingNotEnforcedDifferenceWatts = null,
+    string? PendingNotEnforcedStatus = null)
 {
     [JsonIgnore]
     public IReadOnlyList<double> Learning => BaselineLearningWatts ?? Array.Empty<double>();
@@ -125,13 +167,45 @@ public sealed record PowerLimitWatchdogState(
             throw new FormatException("Power-limit watchdog baseline learning contains an invalid value.");
         if (PendingSamples < 0)
             throw new FormatException("Power-limit watchdog pending sample count is invalid.");
+        if (PendingNotEnforcedSamples < 0)
+            throw new FormatException("Power-limit watchdog not-enforced pending sample count is invalid.");
+        ValidateOptionalPositive(LastDesiredConfiguredCapWatts, nameof(LastDesiredConfiguredCapWatts));
+        ValidateOptionalPositive(LastReportedManagementLimitWatts, nameof(LastReportedManagementLimitWatts));
+        ValidateOptionalPositive(LastEnforcedLimitWatts, nameof(LastEnforcedLimitWatts));
+        ValidateOptionalNonNegative(LastConnectorPowerWatts, nameof(LastConnectorPowerWatts));
+        ValidateOptionalFinite(PendingNotEnforcedSinceMonotonicSeconds,
+            nameof(PendingNotEnforcedSinceMonotonicSeconds));
+        ValidateOptionalFinite(PendingNotEnforcedSinceHostSeconds,
+            nameof(PendingNotEnforcedSinceHostSeconds));
+        ValidateOptionalFinite(PendingNotEnforcedDifferenceWatts,
+            nameof(PendingNotEnforcedDifferenceWatts));
         return this with
         {
             Identity = Identity.Trim(),
             BaselineLearningWatts = Learning.ToArray(),
             LastStatus = string.IsNullOrWhiteSpace(LastStatus)
                 ? PowerLimitWatchdogStatus.BaselineLearning : LastStatus.Trim(),
+            PendingNotEnforcedStatus = string.IsNullOrWhiteSpace(PendingNotEnforcedStatus)
+                ? null : PendingNotEnforcedStatus.Trim(),
         };
+    }
+
+    static void ValidateOptionalPositive(double? value, string name)
+    {
+        if (value is double number && (!double.IsFinite(number) || number <= 0))
+            throw new FormatException($"Power-limit watchdog {name} is invalid.");
+    }
+
+    static void ValidateOptionalNonNegative(double? value, string name)
+    {
+        if (value is double number && (!double.IsFinite(number) || number < 0))
+            throw new FormatException($"Power-limit watchdog {name} is invalid.");
+    }
+
+    static void ValidateOptionalFinite(double? value, string name)
+    {
+        if (value is double number && !double.IsFinite(number))
+            throw new FormatException($"Power-limit watchdog {name} is invalid.");
     }
 }
 
@@ -156,12 +230,21 @@ public sealed record PowerLimitWatchdogResult(
     int ConfirmationSamples,
     double? ConfirmationElapsedSeconds,
     bool IncidentLatched,
-    string Detail)
+    string Detail,
+    double? DesiredConfiguredCapWatts = null,
+    double? ReportedManagementLimitWatts = null,
+    double? EnforcedLimitWatts = null,
+    bool EnforcementTelemetrySupported = false,
+    double? ConnectorPowerWatts = null,
+    string EnforcementStatus = PowerLimitWatchdogStatus.PartiallyVerified)
 {
     [JsonIgnore] public string StatusName => Status;
     [JsonIgnore] public string BoardStatusName => BoardPowerStatus;
     [JsonIgnore] public bool ReadOnly => IsReadOnly;
     [JsonIgnore] public bool SafetyCertificationAbsent => NoSafetyCertification;
+    [JsonIgnore] public double? DesiredCapWatts => DesiredConfiguredCapWatts;
+    [JsonIgnore] public double? ReportedLimitWatts => ReportedManagementLimitWatts;
+    [JsonIgnore] public bool EnforcementSupported => EnforcementTelemetrySupported;
 
     public string ToJson(bool indented = true) => JsonSerializer.Serialize(this,
         PowerLimitWatchdogJson.Options(indented));
@@ -234,6 +317,11 @@ public sealed class PowerLimitWatchdog
         PendingSinceHostSeconds = null,
         PendingDifferenceWatts = null,
         PendingStatus = null,
+        PendingNotEnforcedSamples = 0,
+        PendingNotEnforcedSinceMonotonicSeconds = null,
+        PendingNotEnforcedSinceHostSeconds = null,
+        PendingNotEnforcedDifferenceWatts = null,
+        PendingNotEnforcedStatus = null,
         LastStatus = PowerLimitWatchdogStatus.Ok,
     };
 
@@ -250,21 +338,51 @@ public sealed class PowerLimitWatchdog
         if (observation is null) throw new ArgumentNullException(nameof(observation));
         var host = observation.HostTime;
         if (host == default)
+        {
+            ClearAllPending();
             return Result(PowerLimitWatchdogStatus.TimestampInvalid, PowerLimitBoardStatus.Unavailable,
                 observation, null, null, null, false, false, "Host timestamp is invalid.");
+        }
 
         double? monotonic = monotonicSeconds is double mono && double.IsFinite(mono) && mono >= 0
             ? mono : null;
         if (monotonicSeconds.HasValue && !monotonic.HasValue)
+        {
+            ClearAllPending();
             return Result(PowerLimitWatchdogStatus.TimestampInvalid, PowerLimitBoardStatus.Unavailable,
                 observation, null, null, null, false, false, "Monotonic timestamp is invalid.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(observation.Identity) &&
+            !string.Equals(observation.Identity.Trim(), identity, StringComparison.Ordinal))
+        {
+            ClearAllPending();
+            return Result(PowerLimitWatchdogStatus.IdentityMismatch,
+                BoardStatus(observation, null), observation, null, null, null, false, true,
+                "Telemetry identity does not match the persisted watchdog identity.");
+        }
+
+        var previousDesired = state.LastDesiredConfiguredCapWatts;
+        var previousEnforcementSupport = state.LastEnforcementTelemetrySupported;
+        // Persist the channels independently, including nulls.  A restart or
+        // status consumer can therefore tell that an unsupported/missing
+        // channel was observed instead of accidentally inheriting an older
+        // value from a previous poll.
+        state = state with
+        {
+            LastDesiredConfiguredCapWatts = ValidPositive(observation.DesiredCapWatts),
+            LastReportedManagementLimitWatts = ValidPositive(observation.ReportedManagementLimitWatts),
+            LastEnforcedLimitWatts = ValidPositive(observation.EnforcedLimitWatts),
+            LastEnforcementTelemetrySupported = observation.EnforcementTelemetrySupported,
+            LastConnectorPowerWatts = ValidNonNegative(observation.ConnectorPowerWatts),
+        };
 
         if (state.LastHostTimestampUtc is DateTimeOffset previousHost)
         {
             double elapsed = (host - previousHost.ToUniversalTime()).TotalSeconds;
             if (!double.IsFinite(elapsed) || elapsed < 0 || elapsed > options.MaximumGapSeconds)
             {
-                ClearPending();
+                ClearAllPending();
                 state = state with { LastHostTimestampUtc = host,
                     LastSourceTimestampUtc = observation.SourceTimestampUtc?.ToUniversalTime(),
                     LastMonotonicSeconds = monotonic,
@@ -283,7 +401,7 @@ public sealed class PowerLimitWatchdog
             if (!double.IsFinite(elapsedMonotonic) || elapsedMonotonic < 0 ||
                 elapsedMonotonic > options.MaximumGapSeconds)
             {
-                ClearPending();
+                ClearAllPending();
                 state = state with
                 {
                     LastHostTimestampUtc = host,
@@ -305,30 +423,41 @@ public sealed class PowerLimitWatchdog
         };
 
         if (!observation.IsFresh)
+        {
+            ClearAllPending();
             return Result(PowerLimitWatchdogStatus.Stale, BoardStatus(observation, null), observation,
                 null, null, null, false, false, "Power-limit telemetry is marked stale.");
+        }
         if (!observation.FreshnessVerified)
+        {
+            ClearAllPending();
             return Result(PowerLimitWatchdogStatus.FreshnessUnverified,
                 BoardStatus(observation, null), observation, null, null, null, false, false,
                 "Freshness was not independently verified by the source adapter.");
+        }
         if (observation.SourceTimestampUtc is DateTimeOffset source)
         {
             double age = (host - source.ToUniversalTime()).TotalSeconds;
             if (!double.IsFinite(age) || age < 0 || age > options.MaximumGapSeconds)
+            {
+                ClearAllPending();
                 return Result(PowerLimitWatchdogStatus.Stale, PowerLimitBoardStatus.Stale,
                     observation, null, null, null, false, true, "Source timestamp is stale or in the future.");
+            }
         }
-        if (!string.IsNullOrWhiteSpace(observation.Identity) &&
-            !string.Equals(observation.Identity.Trim(), identity, StringComparison.Ordinal))
-            return Result(PowerLimitWatchdogStatus.IdentityMismatch,
-                BoardStatus(observation, null), observation, null, null, null, false, true,
-                "Telemetry identity does not match the persisted watchdog identity.");
-        if (!observation.HasFiniteObservedLimit)
+        double? desired = ValidPositive(observation.DesiredCapWatts);
+        double? reported = ValidPositive(observation.ReportedManagementLimitWatts);
+        if (!reported.HasValue)
+        {
+            ClearAllPending();
             return Result(PowerLimitWatchdogStatus.Unavailable,
                 BoardStatus(observation, null), observation, null, null, null, false, true,
-                "Observed power limit is unavailable or non-finite.");
+                "Reported management power limit is unavailable or non-finite.");
+        }
 
-        double observed = observation.ObservedLimitWatts!.Value;
+        double observed = reported.Value;
+        string enforcementStatus = UpdateEnforcementState(observation, desired, monotonic, host,
+            previousDesired, previousEnforcementSupport);
         if (state.BaselineLimitWatts is null)
         {
             var learning = state.Learning.ToList();
@@ -339,29 +468,31 @@ public sealed class PowerLimitWatchdog
                 state = state with
                 {
                     BaselineLimitWatts = baseline,
-                    ConfiguredBaselineWatts = ValidPositive(observation.ConfiguredLimitWatts),
+                    ConfiguredBaselineWatts = desired,
                     BaselineLearningWatts = Array.Empty<double>(),
                     LastStatus = PowerLimitWatchdogStatus.Ok,
                 };
                 return Result(PowerLimitWatchdogStatus.Ok, BoardStatus(observation, baseline),
                     observation, baseline, 0, 0, true, true,
-                    "Read-only baseline established from confirmed observations.");
+                    "Read-only baseline established from confirmed observations.",
+                    enforcementStatus: enforcementStatus);
             }
 
             state = state with
             {
                 BaselineLearningWatts = learning,
                 ConfiguredBaselineWatts = state.ConfiguredBaselineWatts ??
-                    ValidPositive(observation.ConfiguredLimitWatts),
+                    desired,
                 LastStatus = PowerLimitWatchdogStatus.BaselineLearning,
             };
             return Result(PowerLimitWatchdogStatus.BaselineLearning,
                 BoardStatus(observation, null), observation, null, null, null, true, true,
-                $"Collecting baseline observation {learning.Count}/{options.BaselineSamples}; no limit change is inferred.");
+                $"Collecting baseline observation {learning.Count}/{options.BaselineSamples}; no limit change is inferred.",
+                enforcementStatus: enforcementStatus);
         }
 
         double baselineLimit = state.BaselineLimitWatts.Value;
-        double? configured = ValidPositive(observation.ConfiguredLimitWatts);
+        double? configured = desired;
         double? fromBaseline = observed - baselineLimit;
         double? fromConfigured = configured.HasValue ? observed - configured.Value : null;
 
@@ -369,12 +500,14 @@ public sealed class PowerLimitWatchdog
             Math.Abs(configured.Value - configuredBaseline) > options.DriftToleranceWatts)
         {
             ClearPending();
+            ClearNotEnforcedPending();
             state = state with { ConfiguredBaselineWatts = configured,
                 LastStatus = PowerLimitWatchdogStatus.ConfigChanged };
             return Result(PowerLimitWatchdogStatus.ConfigChanged,
                 BoardStatus(observation, baselineLimit), observation, baselineLimit,
                 fromConfigured, fromBaseline, true, true,
-                "Configured limit changed; re-baselining requires an explicit operator action.");
+                "Configured limit changed; re-baselining requires an explicit operator action.",
+                enforcementStatus: EnforcementStatusAfterConfigurationChange(observation));
         }
 
         string? anomaly = null;
@@ -388,7 +521,7 @@ public sealed class PowerLimitWatchdog
             else if (Math.Abs(configuredDifference) > options.IncreaseToleranceWatts)
                 anomaly = PowerLimitWatchdogStatus.Drift;
         }
-        if (anomaly is null)
+        if (anomaly is null && fromConfigured is null)
         {
             if (fromBaseline > options.DriftToleranceWatts) anomaly = PowerLimitWatchdogStatus.Increased;
             else if (fromBaseline < -options.DriftToleranceWatts) anomaly = PowerLimitWatchdogStatus.Decreased;
@@ -399,17 +532,31 @@ public sealed class PowerLimitWatchdog
         if (anomaly is null)
         {
             ClearPending();
+            if (enforcementStatus is PowerLimitWatchdogStatus.NotEnforced or
+                PowerLimitWatchdogStatus.NotEnforcedPending)
+            {
+                state = state with { LastStatus = enforcementStatus };
+                return Result(enforcementStatus, BoardStatus(observation, baselineLimit),
+                    observation, baselineLimit, fromConfigured, fromBaseline, true, true,
+                    enforcementStatus == PowerLimitWatchdogStatus.NotEnforced
+                        ? "Enforced-limit telemetry is above the desired configured cap after bounded confirmation; watchdog remains read-only."
+                        : "Enforced-limit telemetry is above the desired configured cap and is pending bounded confirmation.",
+                    confirmationSamples: state.PendingNotEnforcedSamples,
+                    confirmationElapsedSeconds: PendingNotEnforcedElapsed(host, monotonic),
+                    enforcementStatus: enforcementStatus);
+            }
             if (state.Latched && state.LastStatus.EndsWith("_LATCHED", StringComparison.Ordinal))
             {
                 return Result(state.LastStatus, BoardStatus(observation, baselineLimit),
                     observation, baselineLimit, fromConfigured, fromBaseline, true, true,
                     "A previously confirmed power-limit incident remains latched until explicitly acknowledged.",
-                    latched: true);
+                    latched: true, enforcementStatus: enforcementStatus);
             }
             state = state with { LastStatus = PowerLimitWatchdogStatus.Ok };
             return Result(PowerLimitWatchdogStatus.Ok, BoardStatus(observation, baselineLimit),
                 observation, baselineLimit, fromConfigured, fromBaseline, true, true,
-                "Observed power limit is within the read-only confirmation band.");
+                "Observed power limit is within the read-only confirmation band.",
+                enforcementStatus: enforcementStatus);
         }
 
         bool samePending = string.Equals(state.PendingStatus, anomaly, StringComparison.Ordinal);
@@ -428,7 +575,7 @@ public sealed class PowerLimitWatchdog
         bool sampleConfirmed = pendingSamples >= options.MinimumConfirmationSamples;
         bool confirmed = timeConfirmed && sampleConfirmed;
         bool latched = state.Latched || confirmed;
-        string reported = latched ? anomaly + "_LATCHED" : anomaly;
+        string reportedStatus = latched ? anomaly + "_LATCHED" : anomaly;
         state = state with
         {
             PendingSamples = pendingSamples,
@@ -437,14 +584,14 @@ public sealed class PowerLimitWatchdog
             PendingDifferenceWatts = difference,
             PendingStatus = anomaly,
             Latched = latched,
-            LastStatus = reported,
+            LastStatus = reportedStatus,
         };
         string detail = confirmed
             ? "Unexpected observed power-limit change confirmed and latched; watchdog remains read-only."
             : $"Power-limit {anomaly.ToLowerInvariant()} pending confirmation ({pendingSamples}/{options.MinimumConfirmationSamples}, {elapsedPending:R}s).";
-        return Result(reported, BoardStatus(observation, baselineLimit), observation,
+        return Result(reportedStatus, BoardStatus(observation, baselineLimit), observation,
             baselineLimit, fromConfigured, fromBaseline, true, true, detail,
-            pendingSamples, elapsedPending, latched);
+            pendingSamples, elapsedPending, latched, enforcementStatus);
     }
 
     /// <summary>
@@ -463,6 +610,94 @@ public sealed class PowerLimitWatchdog
         PendingDifferenceWatts = null,
         PendingStatus = null,
     };
+
+    void ClearNotEnforcedPending() => state = state with
+    {
+        PendingNotEnforcedSamples = 0,
+        PendingNotEnforcedSinceMonotonicSeconds = null,
+        PendingNotEnforcedSinceHostSeconds = null,
+        PendingNotEnforcedDifferenceWatts = null,
+        PendingNotEnforcedStatus = null,
+    };
+
+    void ClearAllPending()
+    {
+        ClearPending();
+        ClearNotEnforcedPending();
+    }
+
+    string UpdateEnforcementState(PowerLimitObservation observation,
+        double? desired, double? monotonic, DateTimeOffset host,
+        double? previousDesired, bool previousSupport)
+    {
+        if (!observation.EnforcementTelemetrySupported)
+        {
+            ClearNotEnforcedPending();
+            return PowerLimitWatchdogStatus.PartiallyVerified;
+        }
+        if (!desired.HasValue || !observation.HasFiniteEnforcedLimit)
+        {
+            ClearNotEnforcedPending();
+            return PowerLimitWatchdogStatus.EnforcementUnavailable;
+        }
+
+        // A cap or support-mode change starts a new bounded observation.  The
+        // previous pending count must never be carried across that boundary.
+        bool capChanged = previousDesired.HasValue &&
+            Math.Abs(previousDesired.Value - desired.Value) > options.DriftToleranceWatts;
+        if (!previousSupport || capChanged)
+            ClearNotEnforcedPending();
+
+        double difference = observation.EnforcedLimitWatts!.Value - desired.Value;
+        if (difference <= options.NotEnforcedToleranceWatts)
+        {
+            ClearNotEnforcedPending();
+            return PowerLimitWatchdogStatus.Ok;
+        }
+
+        bool samePending = state.PendingNotEnforcedStatus ==
+            PowerLimitWatchdogStatus.NotEnforcedPending;
+        int samples = samePending ? state.PendingNotEnforcedSamples + 1 : 1;
+        double? sinceHost = samePending && state.PendingNotEnforcedSinceHostSeconds.HasValue
+            ? state.PendingNotEnforcedSinceHostSeconds
+            : host.ToUnixTimeMilliseconds() / 1000d;
+        double? sinceMonotonic = samePending && state.PendingNotEnforcedSinceMonotonicSeconds.HasValue
+            ? state.PendingNotEnforcedSinceMonotonicSeconds : monotonic;
+        double elapsed = PendingElapsed(host, monotonic, sinceHost, sinceMonotonic);
+        bool confirmed = samples >= options.MinimumConfirmationSamples &&
+            (options.ConfirmationSeconds <= 0 || elapsed >= options.ConfirmationSeconds);
+        var status = confirmed ? PowerLimitWatchdogStatus.NotEnforced
+            : PowerLimitWatchdogStatus.NotEnforcedPending;
+        state = state with
+        {
+            PendingNotEnforcedSamples = samples,
+            PendingNotEnforcedSinceMonotonicSeconds = sinceMonotonic,
+            PendingNotEnforcedSinceHostSeconds = sinceHost,
+            PendingNotEnforcedDifferenceWatts = difference,
+            PendingNotEnforcedStatus = PowerLimitWatchdogStatus.NotEnforcedPending,
+        };
+        return status;
+    }
+
+    string EnforcementStatusAfterConfigurationChange(PowerLimitObservation observation) =>
+        !observation.EnforcementTelemetrySupported
+            ? PowerLimitWatchdogStatus.PartiallyVerified
+            : observation.HasFiniteDesiredCap && observation.HasFiniteEnforcedLimit
+                ? PowerLimitWatchdogStatus.Ok
+                : PowerLimitWatchdogStatus.EnforcementUnavailable;
+
+    double PendingNotEnforcedElapsed(DateTimeOffset host, double? monotonic) =>
+        PendingElapsed(host, monotonic, state.PendingNotEnforcedSinceHostSeconds,
+            state.PendingNotEnforcedSinceMonotonicSeconds);
+
+    static double PendingElapsed(DateTimeOffset host, double? monotonic,
+        double? sinceHost, double? sinceMonotonic)
+    {
+        if (monotonic is double current && sinceMonotonic is double start)
+            return Math.Max(0, current - start);
+        var hostSeconds = host.ToUnixTimeMilliseconds() / 1000d;
+        return Math.Max(0, hostSeconds - (sinceHost ?? hostSeconds));
+    }
 
     string BoardStatus(PowerLimitObservation observation, double? limit)
     {
@@ -483,8 +718,20 @@ public sealed class PowerLimitWatchdog
         double? differenceFromConfigured, double? differenceFromBaseline,
         bool limitAvailable, bool freshnessVerified, string detail,
         int? confirmationSamples = null, double? confirmationElapsedSeconds = null,
-        bool? latched = null) => new(
-        status,
+        bool? latched = null, string? enforcementStatus = null)
+    {
+        string enforcement = enforcementStatus ?? EnforcementStatusForObservation(observation);
+        string effectiveStatus = status;
+        // A verified management-limit read without an independent enforced
+        // limit is useful, but cannot claim end-to-end enforcement.  Keep the
+        // more specific stale/unverified/change statuses intact and surface
+        // the partial state for the ordinary healthy path.
+        if ((status is PowerLimitWatchdogStatus.Ok or PowerLimitWatchdogStatus.BaselineLearning) &&
+            enforcement == PowerLimitWatchdogStatus.PartiallyVerified &&
+            observation.FreshnessVerified && observation.HasFiniteObservedLimit)
+            effectiveStatus = PowerLimitWatchdogStatus.PartiallyVerified;
+        return new(
+        effectiveStatus,
         boardStatus,
         IsReadOnly: true,
         NoSafetyCertification: true,
@@ -494,8 +741,8 @@ public sealed class PowerLimitWatchdog
         freshnessVerified,
         observation.HostTime,
         observation.SourceTimestampUtc?.ToUniversalTime(),
-        ValidPositive(observation.ConfiguredLimitWatts),
-        ValidPositive(observation.ObservedLimitWatts),
+        ValidPositive(observation.DesiredCapWatts),
+        ValidPositive(observation.ReportedManagementLimitWatts),
         observation.HasFiniteBoardPower ? observation.BoardPowerWatts : null,
         baseline,
         differenceFromConfigured,
@@ -503,10 +750,28 @@ public sealed class PowerLimitWatchdog
         confirmationSamples ?? state.PendingSamples,
         confirmationElapsedSeconds,
         latched ?? state.Latched,
-        detail);
+        detail,
+        DesiredConfiguredCapWatts: ValidPositive(observation.DesiredCapWatts),
+        ReportedManagementLimitWatts: ValidPositive(observation.ReportedManagementLimitWatts),
+        EnforcedLimitWatts: observation.EnforcementTelemetrySupported &&
+            observation.HasFiniteEnforcedLimit ? observation.EnforcedLimitWatts : null,
+        EnforcementTelemetrySupported: observation.EnforcementTelemetrySupported,
+        ConnectorPowerWatts: ValidNonNegative(observation.ConnectorPowerWatts),
+        EnforcementStatus: enforcement);
+    }
+
+    string EnforcementStatusForObservation(PowerLimitObservation observation) =>
+        !observation.EnforcementTelemetrySupported
+            ? PowerLimitWatchdogStatus.PartiallyVerified
+            : observation.HasFiniteDesiredCap && observation.HasFiniteEnforcedLimit
+                ? PowerLimitWatchdogStatus.Ok
+                : PowerLimitWatchdogStatus.EnforcementUnavailable;
 
     static double? ValidPositive(double? value) => value is double number &&
         double.IsFinite(number) && number > 0 ? number : null;
+
+    static double? ValidNonNegative(double? value) => value is double number &&
+        double.IsFinite(number) && number >= 0 ? number : null;
 
     static double Median(IEnumerable<double> values)
     {

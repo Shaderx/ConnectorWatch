@@ -321,6 +321,12 @@ public sealed record IncidentLedgerDocument
     [JsonPropertyName("identity")] public string Identity { get; init; }
     [JsonPropertyName("pre_buffer")] public IReadOnlyList<IncidentObservation> PreBuffer { get; init; }
     [JsonPropertyName("incidents")] public IReadOnlyList<LatchedIncident> Incidents { get; init; }
+    /// <summary>
+    /// Number of incident records discarded by the retention bound.  This is
+    /// cumulative so a restart cannot hide prior evidence loss.
+    /// </summary>
+    [JsonPropertyName("incident_evidence_loss_count")]
+    public long IncidentEvidenceLossCount { get; init; }
     [JsonPropertyName("recent_observation_ids")] public IReadOnlyList<string> RecentObservationIds { get; init; }
     [JsonPropertyName("last_observation_at_utc")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -333,9 +339,13 @@ public sealed record IncidentLedgerDocument
         IReadOnlyList<LatchedIncident>? incidents,
         IReadOnlyList<string>? recentObservationIds,
         DateTimeOffset? lastObservationAtUtc,
-        DateTimeOffset updatedAtUtc)
+        DateTimeOffset updatedAtUtc,
+        long incidentEvidenceLossCount = 0)
     {
         if (schemaVersion < 1) throw new ArgumentOutOfRangeException(nameof(schemaVersion));
+        if (incidentEvidenceLossCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(incidentEvidenceLossCount),
+                "Incident evidence-loss accounting cannot be negative.");
         SchemaVersion = schemaVersion;
         Identity = IncidentObservation.Normalize(identity, nameof(identity));
         PreBuffer = new ReadOnlyCollection<IncidentObservation>(
@@ -345,11 +355,15 @@ public sealed record IncidentLedgerDocument
         RecentObservationIds = new ReadOnlyCollection<string>(
             (recentObservationIds ?? Array.Empty<string>()).Select(x =>
                 IncidentObservation.Normalize(x, nameof(recentObservationIds))).ToList());
+        IncidentEvidenceLossCount = incidentEvidenceLossCount;
         LastObservationAtUtc = lastObservationAtUtc?.ToUniversalTime();
         if (updatedAtUtc == default)
             throw new ArgumentException("An incident ledger needs an update timestamp.", nameof(updatedAtUtc));
         UpdatedAtUtc = updatedAtUtc.ToUniversalTime();
     }
+
+    /// <summary>Compatibility alias for callers that describe loss as drops.</summary>
+    [JsonIgnore] public long DroppedIncidentCount => IncidentEvidenceLossCount;
 }
 
 public sealed record IncidentObservationResult(
@@ -395,6 +409,7 @@ public sealed class IncidentLedger
     readonly List<LatchedIncident> incidents = [];
     readonly Queue<string> recentObservationIds = [];
     readonly HashSet<string> recentObservationSet = new(StringComparer.Ordinal);
+    long incidentEvidenceLossCount;
     DateTimeOffset? lastObservationAtUtc;
     DateTimeOffset updatedAtUtc;
 
@@ -419,6 +434,7 @@ public sealed class IncidentLedger
 
         preBuffer.AddRange(document.PreBuffer);
         incidents.AddRange(document.Incidents);
+        incidentEvidenceLossCount = document.IncidentEvidenceLossCount;
         foreach (string id in document.RecentObservationIds)
             RememberObservation(id);
         lastObservationAtUtc = document.LastObservationAtUtc;
@@ -429,6 +445,19 @@ public sealed class IncidentLedger
 
     public string Identity => identity;
     public IncidentCaptureOptions Options => options;
+    /// <summary>
+    /// Cumulative number of incident records evicted to keep the ledger within
+    /// <see cref="IncidentCaptureOptions.MaxIncidents"/>.  A nonzero value is
+    /// explicit evidence that older incident records are no longer available.
+    /// </summary>
+    public long IncidentEvidenceLossCount
+    {
+        get { lock (gate) return incidentEvidenceLossCount; }
+    }
+
+    /// <summary>Compatibility alias for consumers that call evictions drops.</summary>
+    public long DroppedIncidentCount => IncidentEvidenceLossCount;
+
     public DateTimeOffset? LastObservationAtUtc
     {
         get { lock (gate) return lastObservationAtUtc; }
@@ -488,6 +517,7 @@ public sealed class IncidentLedger
 
             LatchedIncident? resultingIncident = null;
             bool triggered = false;
+            int evicted = 0;
             if (trigger is not null)
             {
                 var existing = incidents.FirstOrDefault(x => x.IsLatched &&
@@ -520,7 +550,7 @@ public sealed class IncidentLedger
                             window);
                         incidents.Add(resultingIncident);
                         triggered = true;
-                        TrimIncidents();
+                        evicted = TrimIncidents();
                     }
                 }
             }
@@ -529,9 +559,17 @@ public sealed class IncidentLedger
             TrimPreBuffer(observation.TimestampUtc);
             lastObservationAtUtc = observation.TimestampUtc;
             updatedAtUtc = observation.TimestampUtc;
+            string detail = triggered
+                ? resultingIncident is null
+                    ? "Incident latched, but its record was evicted by the incident retention bound."
+                    : evicted > 0
+                        ? $"Incident latched with a bounded forensic pre-window; " +
+                            $"evicted {evicted} older incident record(s)."
+                        : "Incident latched with a bounded forensic pre-window."
+                : "Observation recorded.";
             return new(true, false, triggered, resultingIncident?.IncidentId,
-                triggered ? "Incident latched with a bounded forensic pre-window."
-                    : "Observation recorded.", resultingIncident);
+                detail,
+                resultingIncident);
         }
     }
 
@@ -607,7 +645,7 @@ public sealed class IncidentLedger
         {
             return new IncidentLedgerDocument(CurrentPersistenceSchemaVersion,
                 identity, preBuffer, incidents, recentObservationIds.ToArray(),
-                lastObservationAtUtc, updatedAtUtc);
+                lastObservationAtUtc, updatedAtUtc, incidentEvidenceLossCount);
         }
     }
 
@@ -695,15 +733,29 @@ public sealed class IncidentLedger
             preBuffer.RemoveRange(0, preBuffer.Count - options.PreSamples);
     }
 
-    void TrimIncidents()
+    /// <summary>
+    /// Enforces the incident retention bound. Resolved records are evicted
+    /// first; when all records are unresolved the oldest unresolved record is
+    /// evicted so the bound remains hard. List order is insertion order, so
+    /// the choice is deterministic for both live and restored state.
+    /// </summary>
+    int TrimIncidents()
     {
+        int evicted = 0;
         while (incidents.Count > options.MaxIncidents)
         {
             int index = incidents.FindIndex(x => x.IsResolved);
-            if (index < 0) return; // Never discard an unresolved incident.
+            if (index < 0) index = 0;
             incidents.RemoveAt(index);
+            evicted++;
         }
+        if (evicted > 0)
+            incidentEvidenceLossCount = SaturatingAdd(incidentEvidenceLossCount, evicted);
+        return evicted;
     }
+
+    static long SaturatingAdd(long value, int increment) =>
+        value > long.MaxValue - increment ? long.MaxValue : value + increment;
 
     IReadOnlyList<LatchedIncident> SnapshotIncidents() =>
         new ReadOnlyCollection<LatchedIncident>(incidents.ToList());

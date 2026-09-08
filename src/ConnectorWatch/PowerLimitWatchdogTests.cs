@@ -13,6 +13,10 @@ public static class PowerLimitWatchdogTests
         StaleUnavailableAndUnverifiedAreDistinct();
         TimeAndIdentityGatesResetConfirmation();
         StateRoundTripPreservesIncident();
+        EnforcementTelemetryIsBoundedAndIndependent();
+        ConfiguredCapChangesResetEnforcementConfirmation();
+        MissingAndResetEvidenceRemainVisible();
+        InvalidEvidenceCannotBridgeConfirmationOrPoisonIdentity();
     }
 
     static void ReadOnlyConfirmationAndLatch()
@@ -129,11 +133,137 @@ public static class PowerLimitWatchdogTests
         Check(rejectedIdentity, "restoring state under another identity is rejected");
     }
 
+    static void EnforcementTelemetryIsBoundedAndIndependent()
+    {
+        var options = new PowerLimitWatchdogOptions(
+            MinimumConfirmationSamples: 2, ConfirmationSeconds: 0, BaselineSamples: 1,
+            NotEnforcedToleranceWatts: 1);
+        var t = new DateTimeOffset(2026, 1, 1, 4, 0, 0, TimeSpan.Zero);
+        var supported = new PowerLimitWatchdog(options, "fixture-gpu");
+        var baseline = supported.Observe(Sample(t, 450, 450, 200,
+            enforced: 450, connector: 180, enforcementSupported: true), 0);
+        Check(baseline.EnforcementTelemetrySupported && baseline.EnforcementStatus ==
+            PowerLimitWatchdogStatus.Ok && baseline.DesiredConfiguredCapWatts == 450 &&
+            baseline.ReportedManagementLimitWatts == 450 && baseline.EnforcedLimitWatts == 450 &&
+            baseline.ConnectorPowerWatts == 180 && baseline.BoardPowerWatts == 200,
+            "supported telemetry records desired, reported, enforced, connector, and board channels independently");
+        var pending = supported.Observe(Sample(t.AddSeconds(1), 450, 450, 201,
+            enforced: 452, connector: 181, enforcementSupported: true), 1);
+        Check(pending.Status == PowerLimitWatchdogStatus.NotEnforcedPending &&
+            pending.EnforcementStatus == PowerLimitWatchdogStatus.NotEnforcedPending &&
+            pending.ConfirmationSamples == 1,
+            "supported enforcement mismatch is bounded by confirmation samples");
+        var confirmed = supported.Observe(Sample(t.AddSeconds(2), 450, 450, 202,
+            enforced: 452, connector: 182, enforcementSupported: true), 2);
+        Check(confirmed.Status == PowerLimitWatchdogStatus.NotEnforced &&
+            confirmed.EnforcementStatus == PowerLimitWatchdogStatus.NotEnforced,
+            "supported mismatch becomes NOT_ENFORCED only after bounded confirmation");
+
+        var unsupported = new PowerLimitWatchdog(options, "fixture-gpu");
+        var partial = unsupported.Observe(Sample(t, 450, 450, 200,
+            enforced: null, connector: 170, enforcementSupported: false), 0);
+        Check(partial.Status == PowerLimitWatchdogStatus.PartiallyVerified &&
+            partial.EnforcementStatus == PowerLimitWatchdogStatus.PartiallyVerified &&
+            !partial.EnforcementTelemetrySupported && partial.EnforcedLimitWatts is null &&
+            partial.DesiredConfiguredCapWatts == 450 && partial.ReportedManagementLimitWatts == 450,
+            "unsupported enforcement telemetry is explicitly PARTIALLY_VERIFIED");
+    }
+
+    static void ConfiguredCapChangesResetEnforcementConfirmation()
+    {
+        var options = new PowerLimitWatchdogOptions(
+            MinimumConfirmationSamples: 2, ConfirmationSeconds: 0, BaselineSamples: 1);
+        var t = new DateTimeOffset(2026, 1, 1, 5, 0, 0, TimeSpan.Zero);
+        var watchdog = new PowerLimitWatchdog(options, "fixture-gpu");
+        _ = watchdog.Observe(Sample(t, 450, 450, 100,
+            enforced: 450, enforcementSupported: true), 0);
+        _ = watchdog.Observe(Sample(t.AddSeconds(1), 450, 450, 100,
+            enforced: 455, enforcementSupported: true), 1);
+        var changed = watchdog.Observe(Sample(t.AddSeconds(2), 500, 500, 100,
+            enforced: 500, enforcementSupported: true), 2);
+        Check(changed.Status == PowerLimitWatchdogStatus.ConfigChanged &&
+            changed.DesiredConfiguredCapWatts == 500 &&
+            watchdog.State.PendingNotEnforcedSamples == 0,
+            "a configured cap change is visible and resets pending enforcement evidence");
+        var firstNewCapMismatch = watchdog.Observe(Sample(t.AddSeconds(3), 500, 500, 100,
+            enforced: 505, enforcementSupported: true), 3);
+        Check(firstNewCapMismatch.Status == PowerLimitWatchdogStatus.NotEnforcedPending &&
+            firstNewCapMismatch.ConfirmationSamples == 1,
+            "the new cap starts a fresh bounded confirmation window");
+    }
+
+    static void MissingAndResetEvidenceRemainVisible()
+    {
+        var options = new PowerLimitWatchdogOptions(BaselineSamples: 1);
+        var t = new DateTimeOffset(2026, 1, 1, 6, 0, 0, TimeSpan.Zero);
+        var missing = new PowerLimitWatchdog(options, "fixture-gpu");
+        var missingResult = missing.Observe(Sample(t, 450, null, null,
+            enforced: null, connector: null, enforcementSupported: false));
+        Check(missingResult.Status == PowerLimitWatchdogStatus.Unavailable &&
+            missingResult.DesiredConfiguredCapWatts == 450 &&
+            missingResult.ReportedManagementLimitWatts is null &&
+            missingResult.EnforcedLimitWatts is null && missingResult.ConnectorPowerWatts is null &&
+            missingResult.BoardPowerWatts is null,
+            "missing management, enforcement, connector, and board values remain null");
+
+        var watchdog = new PowerLimitWatchdog(options, "fixture-gpu");
+        _ = watchdog.Observe(Sample(t, 450, 450, 100,
+            enforced: 450, connector: 160, enforcementSupported: true));
+        Check(watchdog.State.LastDesiredConfiguredCapWatts == 450 &&
+            watchdog.State.LastReportedManagementLimitWatts == 450 &&
+            watchdog.State.LastEnforcedLimitWatts == 450 &&
+            watchdog.State.LastConnectorPowerWatts == 160,
+            "persisted state records each evidence channel before restart");
+        var restored = PowerLimitWatchdog.Restore(watchdog.SerializeState(), options,
+            "fixture-gpu");
+        Check(restored.State.LastDesiredConfiguredCapWatts == 450 &&
+            restored.State.LastEnforcedLimitWatts == 450 &&
+            restored.State.LastConnectorPowerWatts == 160,
+            "restart preserves independently recorded watchdog channels");
+        restored.ArchiveBaseline();
+        Check(restored.State.LastDesiredConfiguredCapWatts is null &&
+            restored.State.LastEnforcedLimitWatts is null &&
+            restored.State.LastConnectorPowerWatts is null,
+            "baseline archive/reset makes prior evidence visibility explicit");
+    }
+
+    static void InvalidEvidenceCannotBridgeConfirmationOrPoisonIdentity()
+    {
+        var options = new PowerLimitWatchdogOptions(
+            MinimumConfirmationSamples: 2, ConfirmationSeconds: 0, BaselineSamples: 1);
+        var t = new DateTimeOffset(2026, 1, 1, 7, 0, 0, TimeSpan.Zero);
+        var watchdog = new PowerLimitWatchdog(options, "fixture-gpu");
+        _ = watchdog.Observe(Sample(t, 450, 450, 100), 0);
+        var pending = watchdog.Observe(Sample(t.AddSeconds(1), 450, 455, 100), 1);
+        Check(pending.ConfirmationSamples == 1, "increase begins confirmation");
+        _ = watchdog.Observe(Sample(t.AddSeconds(2), 450, 455, 100,
+            isFresh: false), 2);
+        var afterStale = watchdog.Observe(Sample(t.AddSeconds(3), 450, 455, 100), 3);
+        Check(afterStale.Status == PowerLimitWatchdogStatus.Increased &&
+            afterStale.ConfirmationSamples == 1 && !afterStale.IncidentLatched,
+            "stale evidence breaks rather than bridges confirmation");
+
+        var savedDesired = watchdog.State.LastDesiredConfiguredCapWatts;
+        var savedTimestamp = watchdog.State.LastHostTimestampUtc;
+        var mismatch = watchdog.Observe(Sample(t.AddSeconds(4), 500, 500, 100,
+            identity: "other-gpu"), 4);
+        Check(mismatch.Status == PowerLimitWatchdogStatus.IdentityMismatch &&
+            watchdog.State.LastDesiredConfiguredCapWatts == savedDesired &&
+            watchdog.State.LastHostTimestampUtc == savedTimestamp,
+            "identity mismatch cannot overwrite persisted observation channels or timestamps");
+    }
+
     static PowerLimitObservation Sample(DateTimeOffset timestamp,
         double? configured, double? observed, double? board,
-        bool isFresh = true, bool freshnessVerified = true, string identity = "fixture-gpu") =>
+        bool isFresh = true, bool freshnessVerified = true, string identity = "fixture-gpu",
+        double? enforced = null, double? connector = null,
+        bool enforcementSupported = true) =>
         new(timestamp, configured, observed, board, isFresh,
-            timestamp, freshnessVerified, "fixture-nvml", identity);
+            timestamp, freshnessVerified, "fixture-nvml", identity,
+            DesiredConfiguredCapWatts: configured,
+            EnforcedLimitWatts: enforced ?? observed,
+            EnforcementTelemetrySupported: enforcementSupported,
+            ConnectorPowerWatts: connector);
 
     static void Check(bool condition, string description)
     {

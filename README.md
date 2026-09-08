@@ -29,6 +29,7 @@ Optionally copy that UUID into `config.json`. The public sample selects automati
 ```json
 {
   "GpuUuid": "",
+  "DesiredPowerCapWatts": null,
   "SampleSeconds": 1,
   "DataDirectory": "data",
   "DesktopAlerts": true,
@@ -124,7 +125,9 @@ These thresholds are comparison settings, not electrical safety limits. Recheck 
 
 The direct reader is guarded by the target identity and topology checks described in [the architecture](docs/ARCHITECTURE.md). Its native setup is fail-closed: a rejected identity, multiple GPUs, incompatible driver or board, missing library, failed initialization, or possible native timeout records voltage as unavailable and does not retry or silently switch sources. NVML sensor fields that fail independently are left blank. The daemon never converts GPU core voltage or total board power into a connector-voltage measurement.
 
-The power-limit watchdog is observation-only: it detects reported-limit changes, stale readings, and identity discontinuities but contains no write path. The optional downward-only mitigation design remains disabled and mock-only; this release has no native adapter that can change a GPU power limit.
+The power-limit watchdog is observation-only. Optional `DesiredPowerCapWatts` records an operator's expected cap but never applies it. Status keeps the desired cap, NVML-reported management limit, optional enforced limit, connector power, and board power as independent nullable evidence. Because the current NVML path has no enforced-limit query or independently verified source timestamp, it reports `PARTIALLY_VERIFIED`/freshness uncertainty rather than fabricating verification; adapters that do provide enforced telemetry use bounded `NOT_ENFORCED_PENDING` then `NOT_ENFORCED` states. The watchdog contains no write path.
+
+The optional downward-only mitigation design remains disabled and mock-only; this release has no native adapter or privileged helper that can change a GPU power limit. Its test contract requires caller authorization, a finite identity-bound lease, durable pre-write audit, strict decrease/readback, and bounded observed-load reduction before `MITIGATION_VERIFIED`. Readback alone is only `MITIGATION_ACCEPTED`; low-load/unobservable and failed verification remain explicit and do not clear the triggering incident.
 
 ## Build, publish, and offline checks
 

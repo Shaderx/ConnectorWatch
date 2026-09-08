@@ -102,6 +102,75 @@ public static class IncidentLatchingTests
         catch (InvalidDataException) { mismatchRejected = true; }
         Check(mismatchRejected, "identity mismatch fails closed on restore");
 
+        // The ledger bound is hard even while every incident remains active.
+        // The oldest record is retained only until the next record arrives;
+        // once it is evicted, the loss counter makes that evidence loss
+        // explicit and survives a restart.
+        var boundedOptions = options with { MaxIncidents = 2 };
+        IncidentObservation RetentionRow(int second, int number) =>
+            new(start.AddSeconds(second), "RETENTION_" + number, 12.1, 440,
+                observationId: "retention-observation-" + number);
+        IncidentTrigger RetentionTrigger(int number) =>
+            new("retention", "RETENTION_" + number,
+                dedupeKey: "retention-incident-" + number);
+        var bounded = new IncidentLedger("bounded-identity", boundedOptions, start);
+        for (int number = 0; number < 3; number++)
+        {
+            var result = bounded.Observe(RetentionRow(20 + number, number),
+                RetentionTrigger(number));
+            Check(result.Triggered, "each distinct active incident is latched");
+        }
+        Check(bounded.Incidents.Count == 2 &&
+            bounded.Incidents.Select(x => x.DedupeKey).SequenceEqual(
+                new[] { "retention-incident-1", "retention-incident-2" }),
+            "unresolved incident retention evicts the oldest record at the hard bound");
+        Check(bounded.DroppedIncidentCount == 1 &&
+            bounded.IncidentEvidenceLossCount == 1 &&
+            bounded.ToDocument().Incidents.Count == boundedOptions.MaxIncidents,
+            "unresolved eviction is explicitly counted and persisted within the bound");
+        var boundedRestored = IncidentLedger.Load(bounded.ToJson(),
+            "bounded-identity", boundedOptions);
+        Check(boundedRestored.Incidents.Count == 2 &&
+            boundedRestored.IncidentEvidenceLossCount == 1 &&
+            boundedRestored.ToJson() == bounded.ToJson(),
+            "bounded active ledger and evidence-loss count survive deterministic restart");
+
+        // Resolved records remain lower-retention priority than active ones.
+        var resolvedPriority = new IncidentLedger("resolved-priority", boundedOptions, start);
+        var resolved = resolvedPriority.Latch(RetentionRow(40, 0), RetentionTrigger(0));
+        resolvedPriority.Resolve(resolved.IncidentId, start.AddSeconds(41), "operator-a");
+        _ = resolvedPriority.Latch(RetentionRow(42, 1), RetentionTrigger(1));
+        _ = resolvedPriority.Latch(RetentionRow(43, 2), RetentionTrigger(2));
+        Check(resolvedPriority.Incidents.Count == 2 &&
+            resolvedPriority.Get(resolved.IncidentId) is null &&
+            resolvedPriority.Incidents.All(x => x.IsLatched) &&
+            resolvedPriority.DroppedIncidentCount == 1,
+            "resolved records are evicted before active records deterministically");
+
+        // A persisted document may be larger than the current configured
+        // bound. Loading it must trim before exposing the ledger and retain
+        // any loss accounting already present in the document.
+        var oversizedSource = new IncidentLedger("oversized-identity",
+            options with { MaxIncidents = 8 }, start);
+        for (int number = 0; number < 4; number++)
+            _ = oversizedSource.Latch(RetentionRow(60 + number, number),
+                RetentionTrigger(number));
+        var oversizedDocument = oversizedSource.ToDocument() with
+        {
+            IncidentEvidenceLossCount = 7,
+        };
+        var oversized = IncidentLedger.Load(
+            IncidentLedgerPersistence.Serialize(oversizedDocument),
+            "oversized-identity", boundedOptions);
+        Check(oversized.Incidents.Count == boundedOptions.MaxIncidents &&
+            oversized.Incidents.Select(x => x.DedupeKey).SequenceEqual(
+                new[] { "retention-incident-2", "retention-incident-3" }) &&
+            oversized.IncidentEvidenceLossCount == 9,
+            "oversized loaded state is trimmed and prior evidence loss is accumulated");
+        Check(IncidentLedger.Load(oversized.ToJson(), "oversized-identity",
+                boundedOptions).ToDocument().Incidents.Count == boundedOptions.MaxIncidents,
+            "trimmed loaded state remains bounded after persistence and reload");
+
         Console.WriteLine($"PASS: {passed} incident-latching checks.");
     }
 }

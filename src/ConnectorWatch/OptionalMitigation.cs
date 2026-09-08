@@ -12,6 +12,27 @@ public enum MitigationDecision
     BLOCKED,
 }
 
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum MitigationStage
+{
+    NONE,
+    MITIGATION_REQUESTED,
+    MITIGATION_ACCEPTED,
+    MITIGATION_VERIFIED,
+    MITIGATION_FAILED,
+}
+
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum MitigationLoadVerification
+{
+    NOT_OBSERVED,
+    REDUCTION_OBSERVED,
+    UNOBSERVABLE_ALREADY_LOW,
+    UNAVAILABLE,
+    NO_REDUCTION,
+    TIMED_OUT,
+}
+
 /// <summary>Stable fail-closed reasons exposed to an operator or audit log.</summary>
 public static class MitigationBlockReason
 {
@@ -34,8 +55,14 @@ public static class MitigationBlockReason
     public const string ConcurrentChange = "CONCURRENT_CHANGE";
     public const string AuditNotDurable = "AUDIT_NOT_DURABLE";
     public const string WriteFailed = "WRITE_FAILED";
+    public const string WriteTimeout = "WRITE_TIMEOUT";
     public const string ReadbackFailed = "READBACK_FAILED";
     public const string NoIncrease = "NO_INCREASE_ALLOWED";
+    public const string UnauthorizedCaller = "UNAUTHORIZED_CALLER";
+    public const string LoadUnobservable = "LOAD_UNOBSERVABLE_ALREADY_LOW";
+    public const string LoadUnavailable = "LOAD_OBSERVATION_UNAVAILABLE";
+    public const string LoadNotReduced = "LOAD_NOT_REDUCED";
+    public const string ObservationTimeout = "LOAD_OBSERVATION_TIMEOUT";
 }
 
 /// <summary>Input to the optional mitigation policy.  Values come from an
@@ -54,7 +81,9 @@ public sealed record MitigationContext(
     DateTimeOffset TimestampUtc,
     double MonotonicSeconds,
     string? LeaseToken = null,
-    string Detail = "")
+    string Detail = "",
+    string CallerIdentity = "",
+    string AuthorizationContext = "")
 {
     public DateTimeOffset Utc => TimestampUtc.ToUniversalTime();
 }
@@ -86,10 +115,15 @@ public sealed record MitigationState(
     IReadOnlyList<string>? AppliedIncidentIds = null,
     MitigationDecision LastDecision = MitigationDecision.NO_OP,
     string LastReason = "",
-    DateTimeOffset? LastDecisionUtc = null)
+    DateTimeOffset? LastDecisionUtc = null,
+    MitigationStage LastStage = MitigationStage.NONE,
+    bool LastIncidentLatched = false,
+    IReadOnlyList<string>? AttemptedIncidentIds = null)
 {
     [JsonIgnore]
     public IReadOnlyList<string> Applied => AppliedIncidentIds ?? Array.Empty<string>();
+    [JsonIgnore]
+    public IReadOnlyList<string> Attempted => AttemptedIncidentIds ?? Array.Empty<string>();
 
     public MitigationState Normalize()
     {
@@ -101,6 +135,8 @@ public sealed record MitigationState(
             throw new FormatException("Mitigation state contains an empty incident id.");
         if (Applied.Count > 64)
             throw new FormatException("Mitigation state contains too many incident ids.");
+        if (Attempted.Count > 64 || Attempted.Any(string.IsNullOrWhiteSpace))
+            throw new FormatException("Mitigation state contains invalid attempted incident ids.");
         if (Lease is not null &&
             (string.IsNullOrWhiteSpace(Lease.Token) || string.IsNullOrWhiteSpace(Lease.Identity) ||
              !string.Equals(Lease.Identity.Trim(), Identity.Trim(), StringComparison.Ordinal) ||
@@ -112,6 +148,7 @@ public sealed record MitigationState(
         {
             Identity = Identity.Trim(),
             AppliedIncidentIds = Applied.Distinct(StringComparer.Ordinal).ToArray(),
+            AttemptedIncidentIds = Attempted.Distinct(StringComparer.Ordinal).ToArray(),
             LastReason = LastReason?.Trim() ?? "",
         };
     }
@@ -135,6 +172,12 @@ public sealed record MitigationResult(
     DateTimeOffset TimestampUtc,
     string Detail)
 {
+    public MitigationStage Stage { get; init; } = MitigationStage.NONE;
+    public IReadOnlyList<MitigationStage> Stages { get; init; } = Array.Empty<MitigationStage>();
+    public MitigationLoadVerification LoadVerification { get; init; } = MitigationLoadVerification.NOT_OBSERVED;
+    public double? LoadBeforeWatts { get; init; }
+    public double? LoadAfterWatts { get; init; }
+    public bool IncidentLatched { get; init; }
     public bool IsBlocked => Decision == MitigationDecision.BLOCKED;
     public bool IsReduction => Decision == MitigationDecision.REDUCE;
 
@@ -150,6 +193,26 @@ public interface IPowerLimitMitigationAdapter
     MitigationDeviceRead Read();
     MitigationAdapterApply Apply(double targetWatts);
 }
+
+/// <summary>Mock-only trust boundary. A production implementation must authenticate
+/// the caller outside the request payload; strings alone are not credentials.</summary>
+public interface IMitigationAuthorizationGate
+{
+    bool Authorize(string callerIdentity, string authorizationContext, string deviceIdentity);
+}
+
+/// <summary>Read-only observation seam. Implementations must return within the
+/// supplied duration and sample budget. No production observer is provided.</summary>
+public interface IMitigationLoadObserver
+{
+    MitigationLoadObservation Observe(double maximumSeconds, int maximumSamples);
+}
+
+public sealed record MitigationLoadSample(string Identity, double ElapsedSeconds,
+    double? BoardPowerWatts, bool Fresh = true);
+
+public sealed record MitigationLoadObservation(IReadOnlyList<MitigationLoadSample> Samples,
+    double ElapsedSeconds, bool TimedOut = false);
 
 public sealed record MitigationDeviceRead(
     string Identity,
@@ -179,13 +242,18 @@ public sealed record MitigationAuditEntry(
     double ConfiguredFloorWatts,
     DateTimeOffset TimestampUtc,
     double MonotonicSeconds,
-    string Reason);
+    string Reason,
+    string CallerIdentity = "",
+    MitigationStage Stage = MitigationStage.MITIGATION_REQUESTED);
 
 public sealed record OptionalMitigationOptions(
     bool Enabled = false,
     double LeaseMaximumSeconds = 300,
     double ConcurrentToleranceWatts = .5,
-    double ReadbackToleranceWatts = 1)
+    double ReadbackToleranceWatts = 1,
+    double ObservationMaximumSeconds = 5,
+    int ObservationMaximumSamples = 16,
+    double MinimumLoadReductionWatts = 5)
 {
     public void Validate()
     {
@@ -195,6 +263,12 @@ public sealed record OptionalMitigationOptions(
             throw new ArgumentOutOfRangeException(nameof(ConcurrentToleranceWatts));
         if (!double.IsFinite(ReadbackToleranceWatts) || ReadbackToleranceWatts < 0)
             throw new ArgumentOutOfRangeException(nameof(ReadbackToleranceWatts));
+        if (!double.IsFinite(ObservationMaximumSeconds) || ObservationMaximumSeconds <= 0)
+            throw new ArgumentOutOfRangeException(nameof(ObservationMaximumSeconds));
+        if (ObservationMaximumSamples < 2 || ObservationMaximumSamples > 1024)
+            throw new ArgumentOutOfRangeException(nameof(ObservationMaximumSamples));
+        if (!double.IsFinite(MinimumLoadReductionWatts) || MinimumLoadReductionWatts <= 0)
+            throw new ArgumentOutOfRangeException(nameof(MinimumLoadReductionWatts));
     }
 }
 
@@ -220,28 +294,40 @@ public sealed class OptionalMitigationPolicy
 
     readonly OptionalMitigationOptions options;
     readonly string identity;
+    readonly IMitigationAuthorizationGate? authorization;
+    readonly object transactionGate = new();
+    bool applying;
     MitigationState state;
 
     public OptionalMitigationPolicy(OptionalMitigationOptions? options = null,
-        string identity = "unspecified", MitigationState? persisted = null)
+        string identity = "unspecified", MitigationState? persisted = null,
+        IMitigationAuthorizationGate? authorization = null)
     {
         this.options = options ?? new OptionalMitigationOptions();
         this.options.Validate();
         if (string.IsNullOrWhiteSpace(identity))
             throw new ArgumentException("Mitigation identity is required.", nameof(identity));
         this.identity = identity.Trim();
+        this.authorization = authorization;
         state = (persisted ?? new MitigationState(Identity: this.identity)).Normalize();
         if (!string.Equals(state.Identity, this.identity, StringComparison.Ordinal))
             throw new ArgumentException("Mitigation state identity does not match.", nameof(persisted));
     }
 
     public OptionalMitigationOptions Options => options;
-    public MitigationState State => state;
+    public MitigationState State { get { lock (transactionGate) return state; } }
     public string Identity => identity;
 
     /// <summary>Arm a finite identity-bound lease.  This is the explicit
     /// operator opt-in; it never changes a device limit.</summary>
     public MitigationLease ArmLease(string token, double nowMonotonicSeconds,
+        double durationSeconds)
+    {
+        lock (transactionGate)
+            return ArmLeaseCore(token, nowMonotonicSeconds, durationSeconds);
+    }
+
+    MitigationLease ArmLeaseCore(string token, double nowMonotonicSeconds,
         double durationSeconds)
     {
         if (string.IsNullOrWhiteSpace(token)) throw new ArgumentException(
@@ -257,13 +343,21 @@ public sealed class OptionalMitigationPolicy
         return lease;
     }
 
-    public void RevokeLease() => state = state with { Lease = null, RequiresRearm = true };
+    public void RevokeLease()
+    {
+        lock (transactionGate)
+            state = state with { Lease = null, RequiresRearm = true };
+    }
 
-    public string SerializeState() => JsonSerializer.Serialize(state,
-        OptionalMitigationJson.Options(true));
+    public string SerializeState()
+    {
+        lock (transactionGate)
+            return JsonSerializer.Serialize(state, OptionalMitigationJson.Options(true));
+    }
 
     public static OptionalMitigationPolicy Restore(string json,
-        OptionalMitigationOptions? options = null, string? identity = null)
+        OptionalMitigationOptions? options = null, string? identity = null,
+        IMitigationAuthorizationGate? authorization = null)
     {
         if (string.IsNullOrWhiteSpace(json)) throw new FormatException("Mitigation state is empty.");
         var saved = JsonSerializer.Deserialize<MitigationState>(json,
@@ -273,13 +367,18 @@ public sealed class OptionalMitigationPolicy
         // A process restart invalidates the previous opt-in lease.  Keep
         // historical incident ids, but require a fresh explicit arm operation.
         saved = saved with { RequiresRearm = true, Lease = null };
-        return new OptionalMitigationPolicy(options, effectiveIdentity, saved);
+        return new OptionalMitigationPolicy(options, effectiveIdentity, saved, authorization);
     }
 
     public MitigationResult Evaluate(MitigationContext context)
     {
+        lock (transactionGate) return EvaluateCore(context);
+    }
+
+    MitigationResult EvaluateCore(MitigationContext context)
+    {
         if (context is null) throw new ArgumentNullException(nameof(context));
-        var common = (string.IsNullOrWhiteSpace(context.Identity) ? identity : context.Identity.Trim(),
+        var common = (context.Identity?.Trim() ?? "",
             context.IncidentId?.Trim() ?? "", context.Utc);
         if (!options.Enabled)
             return Block(common.Item1, common.Item2, context, MitigationBlockReason.Disabled,
@@ -293,7 +392,8 @@ public sealed class OptionalMitigationPolicy
         if (!context.IncidentLatched)
             return NoOp(common.Item1, common.Item2, context, false,
                 MitigationBlockReason.NoLatchedIncident, "No latched incident requires mitigation.");
-        if (state.Applied.Contains(common.Item2, StringComparer.Ordinal))
+        if (state.Applied.Contains(common.Item2, StringComparer.Ordinal) ||
+            state.Attempted.Contains(common.Item2, StringComparer.Ordinal))
             return NoOp(common.Item1, common.Item2, context, true,
                 MitigationBlockReason.IncidentAlreadyHandled,
                 "This incident was already handled; repeated application is suppressed.");
@@ -319,6 +419,19 @@ public sealed class OptionalMitigationPolicy
         if (!state.Lease.IsActive(identity, context.LeaseToken, context.MonotonicSeconds))
             return Block(common.Item1, common.Item2, context, MitigationBlockReason.LeaseMissing,
                 "The supplied lease token or identity is invalid.");
+        try
+        {
+            if (authorization is null || string.IsNullOrWhiteSpace(context.CallerIdentity) ||
+                string.IsNullOrWhiteSpace(context.AuthorizationContext) ||
+                !authorization.Authorize(context.CallerIdentity, context.AuthorizationContext, identity))
+                return Block(common.Item1, common.Item2, context, MitigationBlockReason.UnauthorizedCaller,
+                    "The caller or authorization context is not authorized for this device.");
+        }
+        catch (Exception)
+        {
+            return Block(common.Item1, common.Item2, context, MitigationBlockReason.UnauthorizedCaller,
+                "Caller authorization could not be verified.");
+        }
         if (!FinitePositive(context.CurrentLimitWatts))
             return Block(common.Item1, common.Item2, context, MitigationBlockReason.LimitUnavailable,
                 "Current observed power limit is unavailable.");
@@ -347,6 +460,49 @@ public sealed class OptionalMitigationPolicy
     public MitigationResult Apply(MitigationContext context,
         IPowerLimitMitigationAdapter adapter, IMitigationAuditGate audit,
         double? monotonicAtWrite = null)
+    {
+        if (context is null) throw new ArgumentNullException(nameof(context));
+        // Reject contention instead of queuing a request whose telemetry and
+        // lease timestamp could be stale by the time the transaction starts.
+        if (!System.Threading.Monitor.TryEnter(transactionGate))
+            return Block(context.Identity, context.IncidentId, context,
+                MitigationBlockReason.ConcurrentChange, "Another mitigation operation is in progress.");
+        try
+        {
+            // Monitor is reentrant: an injected audit/adapter callback must
+            // not start a nested transaction before incident state is saved.
+            if (applying)
+                return Block(context.Identity, context.IncidentId, context,
+                    MitigationBlockReason.ConcurrentChange, "Another mitigation operation is in progress.");
+            applying = true;
+            try
+            {
+                var previousState = state;
+                var stages = new List<MitigationStage> { MitigationStage.MITIGATION_REQUESTED };
+                state = state with { LastStage = MitigationStage.MITIGATION_REQUESTED,
+                    LastIncidentLatched = state.LastIncidentLatched || context.IncidentLatched };
+                var result = ApplyCore(context, adapter, audit, monotonicAtWrite, stages);
+                if (result.Decision == MitigationDecision.NO_OP)
+                {
+                    state = previousState;
+                    return result with { IncidentLatched = state.LastIncidentLatched || context.IncidentLatched };
+                }
+                var finalStage = result.IsBlocked ? MitigationStage.MITIGATION_FAILED : result.Stage;
+                if (finalStage == MitigationStage.NONE) finalStage = MitigationStage.MITIGATION_REQUESTED;
+                if (stages[^1] != finalStage) stages.Add(finalStage);
+                state = state with { LastStage = finalStage, LastDecision = result.Decision,
+                    LastReason = result.Reason, LastDecisionUtc = context.Utc };
+                return result with { Stage = finalStage, Stages = stages.AsReadOnly(),
+                    IncidentLatched = state.LastIncidentLatched };
+            }
+            finally { applying = false; }
+        }
+        finally { System.Threading.Monitor.Exit(transactionGate); }
+    }
+
+    MitigationResult ApplyCore(MitigationContext context,
+        IPowerLimitMitigationAdapter adapter, IMitigationAuditGate audit,
+        double? monotonicAtWrite, List<MitigationStage> stages)
     {
         var decision = Evaluate(context);
         if (decision.Decision != MitigationDecision.REDUCE) return decision;
@@ -395,15 +551,16 @@ public sealed class OptionalMitigationPolicy
         if (target >= beforeWrite.CurrentLimitWatts!.Value)
             return Block(decision.Identity, decision.IncidentId, context,
                 MitigationBlockReason.TargetNotLower, "Target is no longer below the current limit.");
-        if (monotonicAtWrite is double writeMonotonic &&
-            !state.Lease!.IsActive(identity, context.LeaseToken, writeMonotonic))
+        if (state.RequiresRearm || state.Lease is null ||
+            !state.Lease.IsActive(identity, context.LeaseToken,
+                monotonicAtWrite ?? context.MonotonicSeconds))
             return Block(decision.Identity, decision.IncidentId, context,
                 MitigationBlockReason.LeaseExpired,
                 "The opt-in lease expired before the write; no write was attempted.");
 
         var auditEntry = new MitigationAuditEntry(identity, decision.IncidentId,
             beforeWrite.CurrentLimitWatts.Value, target, decision.ConfiguredFloorWatts!.Value,
-            context.Utc, context.MonotonicSeconds, "optional-downward-only-mitigation");
+            context.Utc, context.MonotonicSeconds, "optional-downward-only-mitigation", context.CallerIdentity);
         bool durable;
         try { durable = audit.RecordDurably(auditEntry); }
         catch (Exception ex)
@@ -414,22 +571,44 @@ public sealed class OptionalMitigationPolicy
         if (!durable)
             return Block(decision.Identity, decision.IncidentId, context,
                 MitigationBlockReason.AuditNotDurable, "Durable audit gate rejected the write.");
-        if (monotonicAtWrite is double finalWriteMonotonic &&
-            !state.Lease!.IsActive(identity, context.LeaseToken, finalWriteMonotonic))
+        if (state.RequiresRearm || state.Lease is null)
+            return Block(decision.Identity, decision.IncidentId, context,
+                MitigationBlockReason.RestartRearmRequired,
+                "The opt-in lease was revoked at the write boundary; no write was attempted.");
+        if (!state.Lease.IsActive(identity, context.LeaseToken,
+            monotonicAtWrite ?? context.MonotonicSeconds))
             return Block(decision.Identity, decision.IncidentId, context,
                 MitigationBlockReason.LeaseExpired,
                 "The opt-in lease expired at the write boundary; no write was attempted.");
 
+        var finalAuthorization = EvaluateCore(context with
+            { MonotonicSeconds = monotonicAtWrite ?? context.MonotonicSeconds });
+        if (!finalAuthorization.IsReduction) return finalAuthorization;
+
+        // An exception/denial/readback failure can leave the device changed.
+        // Preserve the incident and suppress repeated writes even if verification fails.
+        var attempted = state.Attempted.Append(decision.IncidentId).Distinct(StringComparer.Ordinal)
+            .TakeLast(64).ToArray();
+        state = state with { AttemptedIncidentIds = attempted };
+
         MitigationAdapterApply applied;
         try { applied = adapter.Apply(target); }
+        catch (TimeoutException)
+        {
+            return Block(decision.Identity, decision.IncidentId, context,
+                MitigationBlockReason.WriteTimeout, "Adapter acceptance timed out; the incident remains latched and no retry is scheduled.");
+        }
         catch (Exception ex)
         {
             return Block(decision.Identity, decision.IncidentId, context,
                 MitigationBlockReason.WriteFailed, "Adapter apply failed: " + ex.Message);
         }
-        if (!applied.Succeeded)
+        if (applied is null || !applied.Succeeded)
             return Block(decision.Identity, decision.IncidentId, context,
-                MitigationBlockReason.WriteFailed, applied.Detail);
+                MitigationBlockReason.WriteFailed, applied?.Detail ?? "Adapter returned no acceptance result.");
+
+        stages.Add(MitigationStage.MITIGATION_ACCEPTED);
+        state = state with { LastStage = MitigationStage.MITIGATION_ACCEPTED };
 
         MitigationDeviceRead after;
         try { after = adapter.Read(); }
@@ -438,7 +617,7 @@ public sealed class OptionalMitigationPolicy
             return Block(decision.Identity, decision.IncidentId, context,
                 MitigationBlockReason.ReadbackFailed, "Readback failed: " + ex.Message);
         }
-        if (!after.Supported || !after.Available || !after.Fresh ||
+        if (after is null || !after.Supported || !after.Available || !after.Fresh ||
             !string.Equals(after.Identity, identity, StringComparison.Ordinal) ||
             !FinitePositive(after.CurrentLimitWatts))
             return Block(decision.Identity, decision.IncidentId, context,
@@ -463,12 +642,78 @@ public sealed class OptionalMitigationPolicy
             LastReason = "APPLIED",
             LastDecisionUtc = context.Utc,
         };
-        return decision with
+        var accepted = decision with
         {
             Reason = "APPLIED",
             AppliedTargetWatts = after.CurrentLimitWatts,
-            Detail = "Downward-only target applied and verified by readback; no restore is scheduled.",
+            Stage = MitigationStage.MITIGATION_ACCEPTED,
+            Detail = "Downward-only limit accepted and read back; electrical load verification remains.",
         };
+        return VerifyLoad(accepted, beforeWrite.BoardPowerWatts, adapter as IMitigationLoadObserver);
+    }
+
+    MitigationResult VerifyLoad(MitigationResult accepted, double? loadBefore,
+        IMitigationLoadObserver? observer)
+    {
+        MitigationResult Failure(string reason, MitigationLoadVerification verification, string detail) =>
+            accepted with { Decision = MitigationDecision.BLOCKED, Reason = reason,
+                Stage = MitigationStage.MITIGATION_FAILED, LoadVerification = verification,
+                LoadBeforeWatts = loadBefore, Detail = detail };
+        if (!FiniteNonNegative(loadBefore))
+            return Failure(MitigationBlockReason.LoadUnavailable, MitigationLoadVerification.UNAVAILABLE,
+                "Fresh pre-write electrical load is unavailable; limit readback does not verify load reduction.");
+        if (loadBefore!.Value <= accepted.RequestedTargetWatts!.Value)
+            return accepted with { Reason = MitigationBlockReason.LoadUnobservable,
+                LoadVerification = MitigationLoadVerification.UNOBSERVABLE_ALREADY_LOW,
+                LoadBeforeWatts = loadBefore,
+                Detail = "Load was already below the requested cap; a mitigation-induced reduction is unobservable. Incident remains latched." };
+        if (observer is null)
+            return Failure(MitigationBlockReason.LoadUnavailable, MitigationLoadVerification.UNAVAILABLE,
+                "No bounded electrical load observer was supplied.");
+        MitigationLoadObservation observation;
+        try { observation = observer.Observe(options.ObservationMaximumSeconds, options.ObservationMaximumSamples); }
+        catch (TimeoutException)
+        {
+            return Failure(MitigationBlockReason.ObservationTimeout, MitigationLoadVerification.TIMED_OUT,
+                "Electrical load observation timed out; incident remains latched.");
+        }
+        catch (Exception)
+        {
+            return Failure(MitigationBlockReason.LoadUnavailable, MitigationLoadVerification.UNAVAILABLE,
+                "Electrical load observation failed; incident remains latched.");
+        }
+        if (observation is null || observation.Samples is null ||
+            !double.IsFinite(observation.ElapsedSeconds) || observation.ElapsedSeconds < 0 ||
+            observation.Samples.Count > options.ObservationMaximumSamples)
+            return Failure(MitigationBlockReason.LoadUnavailable, MitigationLoadVerification.UNAVAILABLE,
+                "The observation violated its sample or time contract.");
+        if (observation.TimedOut || observation.ElapsedSeconds > options.ObservationMaximumSeconds)
+            return Failure(MitigationBlockReason.ObservationTimeout, MitigationLoadVerification.TIMED_OUT,
+                "Electrical load was not verified within the observation window.");
+        double previousTime = 0;
+        int consecutiveReduced = 0;
+        double? lastLoad = null;
+        foreach (var sample in observation.Samples)
+        {
+            if (sample is null || !sample.Fresh ||
+                !string.Equals(sample.Identity, identity, StringComparison.Ordinal) ||
+                !double.IsFinite(sample.ElapsedSeconds) || sample.ElapsedSeconds <= previousTime ||
+                sample.ElapsedSeconds > observation.ElapsedSeconds || !FiniteNonNegative(sample.BoardPowerWatts))
+                return Failure(MitigationBlockReason.LoadUnavailable, MitigationLoadVerification.UNAVAILABLE,
+                    "Electrical load samples must be fresh, ordered, finite, and from the same device.");
+            previousTime = sample.ElapsedSeconds;
+            lastLoad = sample.BoardPowerWatts;
+            consecutiveReduced = loadBefore.Value - sample.BoardPowerWatts!.Value >= options.MinimumLoadReductionWatts
+                ? consecutiveReduced + 1 : 0;
+        }
+        if (consecutiveReduced < 2)
+            return Failure(MitigationBlockReason.LoadNotReduced, MitigationLoadVerification.NO_REDUCTION,
+                "The bounded observation did not end with two consecutive reduced electrical load samples.")
+                with { LoadAfterWatts = lastLoad };
+        return accepted with { Stage = MitigationStage.MITIGATION_VERIFIED,
+            LoadVerification = MitigationLoadVerification.REDUCTION_OBSERVED,
+            LoadBeforeWatts = loadBefore, LoadAfterWatts = lastLoad,
+            Detail = "Limit readback and consecutive electrical load reductions verified; incident remains latched and no restore is scheduled." };
     }
 
     string? ValidateRead(MitigationDeviceRead read, double expectedCurrent, double floor)
@@ -507,14 +752,20 @@ public sealed class OptionalMitigationPolicy
 
 /// <summary>Small fake adapter/audit implementations for offline tests.  They
 /// are intentionally kept here, rather than providing a real device adapter.</summary>
-public sealed class FakePowerLimitMitigationAdapter : IPowerLimitMitigationAdapter
+public sealed class FakePowerLimitMitigationAdapter : IPowerLimitMitigationAdapter, IMitigationLoadObserver
 {
     public string Identity { get; set; } = "fixture";
     public bool Supported { get; set; } = true;
     public bool Available { get; set; } = true;
     public bool Fresh { get; set; } = true;
     public double CurrentLimitWatts { get; set; } = 450;
-    public double? BoardPowerWatts { get; set; } = 100;
+    public double? BoardPowerWatts { get; set; } = 450;
+    public MitigationLoadObservation? Observation { get; set; }
+    public bool ObservationTimesOut { get; set; }
+    public bool ApplyTimesOut { get; set; }
+    public int ObservationCount { get; private set; }
+    public double? LastObservationMaximumSeconds { get; private set; }
+    public int? LastObservationMaximumSamples { get; private set; }
     public double RoundingWatts { get; set; }
     public bool FailApply { get; set; }
     public bool FailReadback { get; set; }
@@ -538,11 +789,39 @@ public sealed class FakePowerLimitMitigationAdapter : IPowerLimitMitigationAdapt
     public MitigationAdapterApply Apply(double targetWatts)
     {
         ApplyCount++;
+        if (ApplyTimesOut) throw new TimeoutException("fixture apply timeout");
         if (FailApply) return new(false, "fixture write failure");
         CurrentLimitWatts = IncreaseOnApply ? CurrentLimitWatts + 5 : RoundingWatts > 0
             ? Math.Round(targetWatts / RoundingWatts) * RoundingWatts : targetWatts;
         return new(true, "fixture write", CurrentLimitWatts);
     }
+
+    public MitigationLoadObservation Observe(double maximumSeconds, int maximumSamples)
+    {
+        ObservationCount++;
+        LastObservationMaximumSeconds = maximumSeconds;
+        LastObservationMaximumSamples = maximumSamples;
+        if (ObservationTimesOut) throw new TimeoutException("fixture observation timeout");
+        return Observation ?? new(new[]
+        {
+            new MitigationLoadSample(Identity, maximumSeconds / 2, CurrentLimitWatts),
+            new MitigationLoadSample(Identity, maximumSeconds, CurrentLimitWatts),
+        }, maximumSeconds);
+    }
+}
+
+/// <summary>Offline fixture, not an authentication mechanism.</summary>
+public sealed class FakeMitigationAuthorizationGate : IMitigationAuthorizationGate
+{
+    public string CallerIdentity { get; set; } = "fixture-operator";
+    public string AuthorizationContext { get; set; } = "fixture-auth";
+    public string DeviceIdentity { get; set; } = "fixture-gpu";
+    public bool Allowed { get; set; } = true;
+
+    public bool Authorize(string callerIdentity, string authorizationContext, string deviceIdentity) =>
+        Allowed && string.Equals(callerIdentity, CallerIdentity, StringComparison.Ordinal) &&
+        string.Equals(authorizationContext, AuthorizationContext, StringComparison.Ordinal) &&
+        string.Equals(deviceIdentity, DeviceIdentity, StringComparison.Ordinal);
 }
 
 public sealed class FakeMitigationAuditGate : IMitigationAuditGate

@@ -10,6 +10,12 @@ public static class OptionalMitigationTests
         DownwardApplyRequiresAuditAndReadback();
         FailuresAndConcurrentChangesBlock();
         LeaseExpiryRestartAndRepeatIncidentAreSafe();
+        OverlappingAppliesAreRejected();
+        ReentrantApplyAndRevocationFailClosed();
+        FailedTransactionReleasesGate();
+        CallerAuthorizationFailsClosed();
+        LifecycleRequiresElectricalLoadObservation();
+        DenialTimeoutAndVerificationFailurePreserveLatch();
     }
 
     static void DisabledAndLeaseGatesAreFailClosed()
@@ -34,6 +40,10 @@ public static class OptionalMitigationTests
         Check(wrongIdentity.Decision == MitigationDecision.BLOCKED &&
             wrongIdentity.Reason == MitigationBlockReason.IdentityMismatch,
             "identity mismatch blocks before adapter use");
+        var missingIdentity = policy.Evaluate(Context(t, 1, identity: "", lease: "lease-a"));
+        Check(missingIdentity.Decision == MitigationDecision.BLOCKED &&
+            missingIdentity.Reason == MitigationBlockReason.IdentityMismatch,
+            "blank identity cannot borrow the policy identity or its lease");
         var unsupported = policy.Evaluate(Context(t, 1, lease: "lease-a", supported: false));
         Check(unsupported.Decision == MitigationDecision.BLOCKED &&
             unsupported.Reason == MitigationBlockReason.Unsupported,
@@ -187,8 +197,224 @@ public static class OptionalMitigationTests
             "optional mitigation is separate from the read-only watchdog contract");
     }
 
+    static void OverlappingAppliesAreRejected()
+    {
+        var policy = Enabled();
+        policy.ArmLease("lease-a", 0, 10);
+        var adapter = new FakePowerLimitMitigationAdapter { Identity = "fixture-gpu" };
+        using var enteredAudit = new System.Threading.ManualResetEventSlim();
+        using var releaseAudit = new System.Threading.ManualResetEventSlim();
+        var audit = new CallbackAudit(() =>
+        {
+            enteredAudit.Set();
+            if (!releaseAudit.Wait(TimeSpan.FromSeconds(5)))
+                throw new TimeoutException("Test did not release the audit gate.");
+            return true;
+        });
+        var first = System.Threading.Tasks.Task.Run(() => policy.Apply(
+            Context(Time(1), 1, lease: "lease-a"), adapter, audit));
+        try
+        {
+            Check(enteredAudit.Wait(TimeSpan.FromSeconds(5)), "first apply reaches durable audit");
+            var competingAudit = new FakeMitigationAuditGate();
+            var sameIncident = policy.Apply(Context(Time(1), 1, lease: "lease-a"),
+                adapter, competingAudit);
+            var otherIncident = policy.Apply(Context(Time(1), 1, lease: "lease-a",
+                incident: "incident-2"), adapter, competingAudit);
+            Check(sameIncident.Reason == MitigationBlockReason.ConcurrentChange &&
+                otherIncident.Reason == MitigationBlockReason.ConcurrentChange &&
+                sameIncident.IsBlocked && otherIncident.IsBlocked &&
+                competingAudit.CallCount == 0 && adapter.ReadCount == 2 && adapter.ApplyCount == 0,
+                "overlapping incidents cannot enter adapter or audit while a transaction is active");
+        }
+        finally
+        {
+            releaseAudit.Set();
+            Check(first.Wait(TimeSpan.FromSeconds(5)), "first apply finishes after audit release");
+        }
+        Check(first.Result.Reason == "APPLIED" && adapter.ApplyCount == 1 &&
+            policy.State.Applied.SequenceEqual(new[] { "incident-1" }),
+            "only the admitted transaction writes and records incident state");
+        Check(policy.Apply(Context(Time(2), 2, lease: "lease-a"), adapter,
+            new FakeMitigationAuditGate()).Reason == MitigationBlockReason.IncidentAlreadyHandled,
+            "completed transaction still suppresses repeated incidents");
+    }
+
+    static void ReentrantApplyAndRevocationFailClosed()
+    {
+        var policy = Enabled();
+        policy.ArmLease("lease-a", 0, 10);
+        var adapter = new FakePowerLimitMitigationAdapter { Identity = "fixture-gpu" };
+        var nestedAudit = new FakeMitigationAuditGate();
+        MitigationResult? nested = null;
+        var result = policy.Apply(Context(Time(1), 1, lease: "lease-a"), adapter,
+            new CallbackAudit(() =>
+            {
+                nested = policy.Apply(Context(Time(1), 1, lease: "lease-a"), adapter, nestedAudit);
+                return true;
+            }));
+        Check(result.Reason == "APPLIED" && nested?.IsBlocked == true &&
+            nested.Reason == MitigationBlockReason.ConcurrentChange &&
+            nestedAudit.CallCount == 0 && adapter.ApplyCount == 1,
+            "reentrant audit callback cannot start a nested apply transaction");
+
+        var revoked = Enabled();
+        revoked.ArmLease("lease-a", 0, 10);
+        var revokedAdapter = new FakePowerLimitMitigationAdapter { Identity = "fixture-gpu" };
+        var revokedResult = revoked.Apply(Context(Time(1), 1, lease: "lease-a"), revokedAdapter,
+            new CallbackAudit(() => { revoked.RevokeLease(); return true; }));
+        Check(revokedResult.IsBlocked &&
+            revokedResult.Reason == MitigationBlockReason.RestartRearmRequired &&
+            revokedAdapter.ApplyCount == 0,
+            "lease revocation inside an audit callback fails closed before writing");
+    }
+
+    static void FailedTransactionReleasesGate()
+    {
+        var policy = Enabled();
+        policy.ArmLease("lease-a", 0, 10);
+        var adapter = new FakePowerLimitMitigationAdapter { Identity = "fixture-gpu" };
+        var failed = policy.Apply(Context(Time(1), 1, lease: "lease-a"), adapter,
+            new CallbackAudit(() => throw new InvalidOperationException("fixture audit exception")));
+        Check(failed.Reason == MitigationBlockReason.AuditNotDurable && adapter.ApplyCount == 0,
+            "audit exception remains fail-closed");
+        var retry = policy.Apply(Context(Time(2), 2, lease: "lease-a"), adapter,
+            new FakeMitigationAuditGate());
+        Check(retry.Reason == "APPLIED" && adapter.ApplyCount == 1,
+            "failed transaction releases gate for a subsequent request");
+    }
+
+    static void CallerAuthorizationFailsClosed()
+    {
+        var context = Context(Time(1), 1, lease: "lease-a");
+        foreach (var invalid in new[]
+        {
+            context with { CallerIdentity = "other-operator" },
+            context with { AuthorizationContext = "other-auth" },
+            context with { AuthorizationContext = "" },
+        })
+        {
+            var policy = Enabled();
+            policy.ArmLease("lease-a", 0, 10);
+            var adapter = new FakePowerLimitMitigationAdapter { Identity = "fixture-gpu" };
+            var audit = new FakeMitigationAuditGate();
+            var result = policy.Apply(invalid, adapter, audit);
+            Check(result.Reason == MitigationBlockReason.UnauthorizedCaller &&
+                result.Stage == MitigationStage.MITIGATION_FAILED &&
+                adapter.ReadCount == 0 && adapter.ApplyCount == 0 && audit.CallCount == 0,
+                "wrong caller or authorization context cannot reach the adapter or audit");
+        }
+        var missingGate = new OptionalMitigationPolicy(new(Enabled: true), "fixture-gpu");
+        missingGate.ArmLease("lease-a", 0, 10);
+        Check(missingGate.Evaluate(context).Reason == MitigationBlockReason.UnauthorizedCaller,
+            "missing authorization gate is denied even with a valid lease");
+    }
+
+    static void LifecycleRequiresElectricalLoadObservation()
+    {
+        var policy = Enabled();
+        policy.ArmLease("lease-a", 0, 10);
+        var adapter = new FakePowerLimitMitigationAdapter { Identity = "fixture-gpu" };
+        var result = policy.Apply(Context(Time(1), 1, lease: "lease-a"), adapter,
+            new CallbackAudit(() =>
+            {
+                Check(policy.State.LastStage == MitigationStage.MITIGATION_REQUESTED,
+                    "audit sees a requested transaction before any adapter acceptance");
+                return true;
+            }));
+        Check(result.Stage == MitigationStage.MITIGATION_VERIFIED && result.Stages.SequenceEqual(new[]
+            { MitigationStage.MITIGATION_REQUESTED, MitigationStage.MITIGATION_ACCEPTED,
+                MitigationStage.MITIGATION_VERIFIED }) &&
+            result.LoadVerification == MitigationLoadVerification.REDUCTION_OBSERVED &&
+            result.LoadBeforeWatts == 450 && result.LoadAfterWatts == 420 &&
+            adapter.LastObservationMaximumSeconds == policy.Options.ObservationMaximumSeconds &&
+            adapter.LastObservationMaximumSamples == policy.Options.ObservationMaximumSamples,
+            "verification requires observed electrical reduction within explicit time and sample budgets");
+        Check(result.IncidentLatched && policy.State.LastIncidentLatched &&
+            policy.State.LastStage == MitigationStage.MITIGATION_VERIFIED,
+            "successful mitigation preserves the incident latch");
+
+        var low = Enabled();
+        low.ArmLease("lease-a", 0, 10);
+        var lowAdapter = new FakePowerLimitMitigationAdapter
+            { Identity = "fixture-gpu", BoardPowerWatts = 100 };
+        var lowResult = low.Apply(Context(Time(1), 1, lease: "lease-a"), lowAdapter,
+            new FakeMitigationAuditGate());
+        Check(lowResult.Stage == MitigationStage.MITIGATION_ACCEPTED &&
+            lowResult.LoadVerification == MitigationLoadVerification.UNOBSERVABLE_ALREADY_LOW &&
+            !lowResult.Stages.Contains(MitigationStage.MITIGATION_VERIFIED) &&
+            lowResult.IncidentLatched && lowAdapter.ObservationCount == 0,
+            "already-low load is explicitly unobservable and never falsely verified");
+    }
+
+    static void DenialTimeoutAndVerificationFailurePreserveLatch()
+    {
+        var cases = new[]
+        {
+            (new FakePowerLimitMitigationAdapter { FailApply = true }, MitigationBlockReason.WriteFailed),
+            (new FakePowerLimitMitigationAdapter { ApplyTimesOut = true }, MitigationBlockReason.WriteTimeout),
+            (new FakePowerLimitMitigationAdapter { ObservationTimesOut = true }, MitigationBlockReason.ObservationTimeout),
+            (new FakePowerLimitMitigationAdapter { Observation = new(new[]
+            {
+                new MitigationLoadSample("fixture-gpu", 1, 450),
+                new MitigationLoadSample("fixture-gpu", 2, 450),
+            }, 2) }, MitigationBlockReason.LoadNotReduced),
+            (new FakePowerLimitMitigationAdapter { BoardPowerWatts = null }, MitigationBlockReason.LoadUnavailable),
+            (new FakePowerLimitMitigationAdapter { Observation = new(new[]
+            {
+                new MitigationLoadSample("fixture-gpu", 1, 410),
+                new MitigationLoadSample("fixture-gpu", 2, 450),
+            }, 2) }, MitigationBlockReason.LoadNotReduced),
+            (new FakePowerLimitMitigationAdapter { Observation = new(new[]
+            {
+                new MitigationLoadSample("fixture-gpu", 1, 410),
+                new MitigationLoadSample("fixture-gpu", 2, 410, Fresh: false),
+            }, 2) }, MitigationBlockReason.LoadUnavailable),
+            (new FakePowerLimitMitigationAdapter { Observation = new(
+                Enumerable.Range(1, 17).Select(i => new MitigationLoadSample("fixture-gpu",
+                    i / 10.0, 410)).ToArray(), 2) }, MitigationBlockReason.LoadUnavailable),
+            (new FakePowerLimitMitigationAdapter { Observation = new(new[]
+            {
+                new MitigationLoadSample("fixture-gpu", 1, 410),
+                new MitigationLoadSample("fixture-gpu", 6, 410),
+            }, 6) }, MitigationBlockReason.ObservationTimeout),
+            (new FakePowerLimitMitigationAdapter { Observation = new(new[]
+            {
+                new MitigationLoadSample("fixture-gpu", 1, 410),
+                new MitigationLoadSample("other-gpu", 2, 410),
+            }, 2) }, MitigationBlockReason.LoadUnavailable),
+        };
+        foreach (var (adapter, reason) in cases)
+        {
+            var policy = Enabled();
+            policy.ArmLease("lease-a", 0, 10);
+            adapter.Identity = "fixture-gpu";
+            var result = policy.Apply(Context(Time(1), 1, lease: "lease-a"), adapter,
+                new FakeMitigationAuditGate());
+            Check(result.IsBlocked && result.Reason == reason &&
+                result.Stage == MitigationStage.MITIGATION_FAILED &&
+                !result.Stages.Contains(MitigationStage.MITIGATION_VERIFIED) &&
+                result.IncidentLatched && policy.State.LastIncidentLatched,
+                "denial, timeout, or missing load reduction fails without clearing the latch: " + reason);
+            Check(policy.Apply(Context(Time(2), 2, lease: "lease-a"), adapter,
+                new FakeMitigationAuditGate()).Reason == MitigationBlockReason.IncidentAlreadyHandled &&
+                adapter.ApplyCount == 1,
+                "uncertain or failed post-write outcomes cannot automatically retry");
+            var restored = OptionalMitigationPolicy.Restore(policy.SerializeState(), policy.Options);
+            Check(restored.State.LastIncidentLatched && restored.State.RequiresRearm &&
+                restored.State.Attempted.Contains("incident-1"),
+                "restart preserves incident latch and attempted write history");
+        }
+    }
+
+    sealed class CallbackAudit(Func<bool> record) : IMitigationAuditGate
+    {
+        public bool RecordDurably(MitigationAuditEntry entry) => record();
+    }
+
     static OptionalMitigationPolicy Enabled() => new(
-        new OptionalMitigationOptions(Enabled: true), "fixture-gpu");
+        new OptionalMitigationOptions(Enabled: true), "fixture-gpu",
+        authorization: new FakeMitigationAuthorizationGate());
 
     static MitigationContext Context(DateTimeOffset timestamp, double monotonic,
         string identity = "fixture-gpu", string incident = "incident-1",
@@ -196,7 +422,8 @@ public static class OptionalMitigationTests
         bool supported = true, double current = 450, double floor = 400,
         double target = 420, string? lease = null) => new(
         identity, incident, latched, available, fresh, supported, current, floor, target,
-        timestamp, monotonic, lease);
+        timestamp, monotonic, lease, CallerIdentity: "fixture-operator",
+        AuthorizationContext: "fixture-auth");
 
     static DateTimeOffset Time(double seconds) =>
         new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero).AddSeconds(seconds);

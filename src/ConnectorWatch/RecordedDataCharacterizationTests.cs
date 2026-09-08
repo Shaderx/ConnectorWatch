@@ -65,6 +65,24 @@ public static class RecordedDataCharacterizationTests
             var sensor = report.SensorAvailability.Sensors.Single(x => x.Name == "pcie_voltage_v");
             Check(sensor.AvailableRows == 1 && sensor.MissingRows == 4,
                 "optional sensor availability and JSON extras");
+            Check(report.SignalBehavior.Any(x => x.Name == "descriptive_linear_residual_v" &&
+                    x.Distribution.Count == 5) &&
+                report.SignalBehavior.Single(x => x.Name == "input_voltage_v").UniqueValueCount == 4,
+                "per-signal distribution and update behavior");
+            Check(report.CrossRailTiming.Status == "ROW_ALIGNED_SOURCE_TIMING_UNVERIFIED" &&
+                report.CrossRailTiming.RowAlignedPairCount == 1,
+                "cross-rail timing assumptions remain explicit");
+            Check(report.PollingEvidence.CallLatencyStatus == "NOT_CAPTURED" &&
+                report.PollingEvidence.CpuStatus == "NOT_CAPTURED",
+                "uncaptured polling evidence is not guessed");
+            Check(report.DetectorEvaluation.SyntheticSensitivityProbes.Count == 5 &&
+                report.DetectorEvaluation.SyntheticSensitivityProbes.Single(x =>
+                    x.InjectedDroopMillivolts == 200).EwmaDetected &&
+                !report.DetectorEvaluation.ProductionDefaultsChanged,
+                "synthetic injection sensitivity and frozen production defaults");
+            Check(report.UnresolvedAssumptionsAndBlindSpots.Count >= 5 &&
+                report.WorkloadTypes.SequenceEqual(new[] { "UNLABELLED_RECORDED_OPERATION" }),
+                "workload and blind-spot disclosure");
 
             var firstJson = report.ToDeterministicJson();
             var secondJson = RecordedDataCharacterization.AnalyzeFile(csv, options).ToJson();
