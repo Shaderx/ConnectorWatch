@@ -151,6 +151,7 @@ public static class Tests
         LoadQualifierTests.Run();
         TelemetryPhaseOneTests.Run();
         ReferenceLifecycleTests.Run();
+        OfflineReplayTests.Run();
         Console.WriteLine($"PASS: {passed} behavioral checks.");
     }
 }
