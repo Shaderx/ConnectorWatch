@@ -916,6 +916,15 @@ public static class Program
         {
             if (args.Contains("--self-test")) { Tests.Run(); return 0; }
             if (args.Contains("--probe-nvapi")) { NvapiProbe.Run(); return 0; }
+            if (Option(args, "--characterize") is string characterizationPath)
+            {
+                characterizationPath = Path.GetFullPath(characterizationPath);
+                var report = Directory.Exists(characterizationPath)
+                    ? RecordedDataCharacterization.AnalyzeDirectory(characterizationPath)
+                    : RecordedDataCharacterization.AnalyzeFile(characterizationPath);
+                Console.WriteLine(report.ToDeterministicJson());
+                return 0;
+            }
             string configPath = Path.GetFullPath(Option(args, "--config") ?? Path.Combine(AppContext.BaseDirectory, "config.json"));
             var c = JsonSerializer.Deserialize<Config>(File.ReadAllText(configPath))!; c.Validate();
             var root = Path.GetDirectoryName(configPath)!;
