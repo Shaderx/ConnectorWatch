@@ -1086,6 +1086,28 @@ public static class Program
                 incidentLedger = new IncidentLedger(incidentIdentity);
             }
 
+            string powerLimitWatchdogPath = Path.Combine(data, "power-limit-watchdog.json");
+            string? powerLimitWatchdogDetail = null;
+            PowerLimitWatchdog powerLimitWatchdog;
+            if (File.Exists(powerLimitWatchdogPath))
+            {
+                try
+                {
+                    powerLimitWatchdog = PowerLimitWatchdog.Restore(
+                        File.ReadAllText(powerLimitWatchdogPath), identity: incidentIdentity);
+                }
+                catch (Exception ex) when (ex is FormatException or JsonException or
+                    NotSupportedException or ArgumentException or IOException)
+                {
+                    powerLimitWatchdog = new PowerLimitWatchdog(identity: incidentIdentity);
+                    powerLimitWatchdogDetail = "Persisted power-limit watchdog state is unavailable: " + ex.Message;
+                }
+            }
+            else
+            {
+                powerLimitWatchdog = new PowerLimitWatchdog(identity: incidentIdentity);
+            }
+
             string BaselineMirror() => JsonSerializer.Serialize(new Saved(identity, analysis.Bins), Json);
             void PersistReferenceLocked()
             {
@@ -1103,6 +1125,8 @@ public static class Program
             }
             void PersistIncidentsLocked() =>
                 Atomic(incidentsPath, incidentLedger.ToJson());
+            void PersistPowerLimitWatchdogLocked() =>
+                Atomic(powerLimitWatchdogPath, powerLimitWatchdog.SerializeState());
             ControlCommandResult? HandleReferenceCommand(ControlRequest request)
             {
                 lock (referenceGate)
@@ -1248,9 +1272,16 @@ public static class Program
                 AnalysisProgress analysisProgress;
                 DifferentialRuntimeObservation? differentialObservation = null;
                 IncidentObservationResult? incidentObservation = null;
+                PowerLimitWatchdogResult powerLimitResult;
                 bool newSensor = false;
                 lock (referenceGate)
                 {
+                    powerLimitResult = powerLimitWatchdog.Observe(new PowerLimitObservation(
+                        now, ConfiguredLimitWatts: null, ObservedLimitWatts: g.Limit,
+                        BoardPowerWatts: g.Power, IsFresh: g.Limit.HasValue,
+                        SourceTimestampUtc: now, FreshnessVerified: true,
+                        Source: "NVML read-only", Identity: incidentIdentity),
+                        clock.Elapsed.TotalSeconds);
                     result = new Result(status, null, null, null, null, null);
                     if (v != null && (!lastSensor.HasValue || v.Timestamp > lastSensor.Value))
                     {
@@ -1326,6 +1357,17 @@ public static class Program
                                 result.Status, v.Volts, analysisPower, detail);
                             incidentObservation = incidentLedger.Observe(observation);
                         }
+                    }
+                    if (powerLimitResult.IncidentLatched)
+                    {
+                        var powerObservation = new IncidentObservation(now,
+                            powerLimitResult.Status, v?.Volts, g.Power,
+                            powerLimitResult.Detail);
+                        incidentObservation = incidentLedger.Observe(powerObservation,
+                            new IncidentTrigger("power-limit-watchdog",
+                                powerLimitResult.Status, IncidentSeverity.WARNING,
+                                dedupeKey: "power-limit-watchdog:increase",
+                                detail: powerLimitResult.Detail));
                     }
                     analysisProgress = analysis.Progress;
                 }
@@ -1419,6 +1461,12 @@ public static class Program
                     },
                     differential_prediction = differentialObservation?.Prediction,
                     residual_detector = differentialObservation?.Detector,
+                    power_limit_watchdog = new
+                    {
+                        result = powerLimitResult,
+                        persisted_state = powerLimitWatchdog.State,
+                        load_detail = powerLimitWatchdogDetail,
+                    },
                     incident_ledger = new
                     {
                         identity = incidentIdentity,
@@ -1489,6 +1537,7 @@ public static class Program
                         PersistReferenceLocked();
                         PersistDifferentialModelLocked();
                         PersistIncidentsLocked();
+                        PersistPowerLimitWatchdogLocked();
                         storage.Flush(clock.Elapsed.TotalSeconds, latestState, BaselineMirror());
                     }
                 }
@@ -1499,6 +1548,7 @@ public static class Program
                         PersistReferenceLocked();
                         PersistDifferentialModelLocked();
                         PersistIncidentsLocked();
+                        PersistPowerLimitWatchdogLocked();
                     }
                     throw new Exception("ConnectorWatch stopped after a terminal voltage-source failure.", terminalFailure);
                 }
@@ -1517,6 +1567,7 @@ public static class Program
                 PersistReferenceLocked();
                 PersistDifferentialModelLocked();
                 PersistIncidentsLocked();
+                PersistPowerLimitWatchdogLocked();
             }
             samplingProgress.MarkStopped(control.StopRequested ? "control" : stop.IsCancellationRequested ? "signal" : "sample_limit");
             MarkStopped(Path.Combine(data, "status.json"), control.StopRequested ? "control" : stop.IsCancellationRequested ? "signal" : "sample_limit",
@@ -1526,6 +1577,7 @@ public static class Program
                 PersistReferenceLocked();
                 PersistDifferentialModelLocked();
                 PersistIncidentsLocked();
+                PersistPowerLimitWatchdogLocked();
             }
             if (stop.IsCancellationRequested) Console.WriteLine("ConnectorWatch: shutdown requested; state saved.");
             return 0;
