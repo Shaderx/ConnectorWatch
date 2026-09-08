@@ -17,6 +17,9 @@ public sealed record PointSample(DateTimeOffset Time, DateTimeOffset SensorTime,
     public bool Alert => Status is "SUDDEN_DROOP" or "BASELINE_SHIFT";
 }
 public sealed record Incident(string Id, DateTimeOffset Time, string Status, string Detail, double? Voltage = null, double? Drop = null, int? Bin = null);
+public sealed record SnapshotIncident(string Id, string Detector, string Status, string Severity, string State,
+    DateTimeOffset TriggeredAtUtc, DateTimeOffset? AcknowledgedAtUtc = null,
+    DateTimeOffset? ResolvedAtUtc = null, bool PostComplete = false);
 public sealed record Baseline(double? Median, double? P05, int Learning);
 public sealed class Snapshot
 {
@@ -46,33 +49,221 @@ public sealed class Snapshot
     public int Schema { get; set; }
     public string ReferenceState { get; set; } = "";
     public string ReferenceCompatibility { get; set; } = "";
+    // Typed electrical data is intentionally kept separate from the legacy
+    // Voltage record.  A null value means that the daemon did not report a
+    // field; the GUI never substitutes zero for missing hardware data.
+    public string ElectricalSource { get; set; } = "";
+    public string ElectricalSourcePath => ElectricalSource;
+    public string ElectricalStatus { get; set; } = "UNAVAILABLE";
+    public string ElectricalFreshnessKind { get; set; } = "Unavailable";
+    public string ElectricalFreshnessDetail { get; set; } = "";
+    public bool ElectricalFresh { get; set; }
+    public bool ElectricalFreshnessVerified { get; set; }
+    public DateTimeOffset? ElectricalSourceTimestamp { get; set; }
+    public double? ConnectorVoltage { get; set; }
+    public double? ConnectorCurrent { get; set; }
+    public double? ConnectorPower { get; set; }
+    public string ConnectorVoltageAvailability { get; set; } = "Missing";
+    public string ConnectorCurrentAvailability { get; set; } = "Missing";
+    public string ConnectorPowerAvailability { get; set; } = "Missing";
+    public double? PcieVoltage { get; set; }
+    public double? PciePower { get; set; }
+    public string PcieVoltageAvailability { get; set; } = "Missing";
+    public string PcieCurrentAvailability { get; set; } = "Missing";
+    public string PciePowerAvailability { get; set; } = "Missing";
+    public string AnalysisLoadSource { get; set; } = "";
+    public double? AnalysisLoadValue { get; set; }
+    public double? AnalysisLoad => AnalysisLoadValue;
+    public string AnalysisLoadUnit { get; set; } = "";
+    public bool AnalysisLoadAvailable { get; set; }
+    public bool AnalysisLoadFresh { get; set; }
+    public bool AnalysisLoadFreshnessVerified { get; set; }
+    public string AnalysisLoadStatus { get; set; } = "UNAVAILABLE";
+    public string AnalysisLoadDetail { get; set; } = "";
+    public string DifferentialModelState { get; set; } = "UNAVAILABLE";
+    public bool DifferentialModelLoaded { get; set; }
+    public bool DifferentialModelFitted { get; set; }
+    public double? DifferentialModelSlope { get; set; }
+    public int DifferentialModelLearningSamples { get; set; }
+    public string DifferentialModelDetail { get; set; } = "";
+    public bool DifferentialPredictionAvailable { get; set; }
+    public double? ExpectedVoltage { get; set; }
+    public double? ObservedVoltage { get; set; }
+    public double? Residual { get; set; }
+    public double? ExcessDroop { get; set; }
+    public double? DifferentialSlope { get; set; }
+    public string DifferentialPredictionQualification { get; set; } = "";
+    public string DifferentialPredictionDetail { get; set; } = "";
+    public string ResidualDetectorName { get; set; } = "";
+    public string ResidualDetectorStatus { get; set; } = "UNAVAILABLE";
+    public bool ResidualDetectorAvailable { get; set; }
+    public bool ResidualDetectorAlert { get; set; }
+    public bool ResidualDetectorFastAlert { get; set; }
+    public bool ResidualDetectorEwmaAlert { get; set; }
+    public double? FilteredResidual { get; set; }
+    public int? ResidualConsecutiveSamples { get; set; }
+    public string ResidualDetectorDetail { get; set; } = "";
+    public IReadOnlyList<SnapshotIncident> Incidents { get; set; } = Array.Empty<SnapshotIncident>();
+    public int IncidentCount { get; set; }
+    public int ActiveIncidentCount { get; set; }
+    public string LatestIncidentState { get; set; } = "";
+    public string LatestIncidentStatus { get; set; } = "";
+    public string LatestIncidentDetail { get; set; } = "";
+    public string WatchdogStatus { get; set; } = "UNAVAILABLE";
+    public string WatchdogBoardStatus { get; set; } = "";
+    public bool WatchdogAvailable { get; set; }
+    public bool WatchdogReadOnly { get; set; }
+    public bool WatchdogNoSafetyCertification { get; set; }
+    public bool WatchdogFresh { get; set; }
+    public bool WatchdogFreshnessVerified { get; set; }
+    public bool WatchdogIncidentLatched { get; set; }
+    public double? WatchdogConfiguredLimit { get; set; }
+    public double? WatchdogObservedLimit { get; set; }
+    public double? WatchdogBoardPower { get; set; }
+    public double? WatchdogBaselineLimit { get; set; }
+    public double? WatchdogDifferenceFromConfigured { get; set; }
+    public double? WatchdogDifferenceFromBaseline { get; set; }
+    public string WatchdogDetail { get; set; } = "";
+    public string AcquisitionStatus { get; set; } = "";
+    public string AcquisitionDetail { get; set; } = "";
+    public bool AcquisitionFreshnessKnown { get; set; }
+    public bool AcquisitionAnalysisAvailable { get; set; }
+    public bool AcquisitionSourceAvailable { get; set; }
+    public bool AcquisitionPowerAvailable { get; set; }
     public bool Fresh(double age = 5) => !Stopped && Time <= DateTimeOffset.UtcNow.AddSeconds(1) && (DateTimeOffset.UtcNow - Time).TotalSeconds <= age;
     public static Snapshot Parse(string text)
     {
         using var doc = JsonDocument.Parse(text); var r = doc.RootElement;
-        var s = new Snapshot { Time = Date(r, "timestamp_utc") ?? default, Stopped = r.TryGetProperty("stopped", out var stop) && stop.ValueKind == JsonValueKind.True,
-            Detail = Str(r, "detail"), Source = Str(r, "voltage_source"), GpuUuid = Str(r, "gpu_uuid"), Schema = (int)(Num(r, "schema_version") ?? 0) };
-        if (r.TryGetProperty("voltage", out var v) && v.ValueKind == JsonValueKind.Object)
+        var s = new Snapshot { Time = Date(r, "timestamp_utc") ?? default,
+            Stopped = Bool(r, "stopped"), Detail = Str(r, "detail"),
+            Source = Str(r, "voltage_source"), GpuUuid = Str(r, "gpu_uuid"),
+            Schema = (int)(Num(r, "schema_version") ?? 0) };
+        s.ElectricalSource = s.Source;
+        if (TryObject(r, "voltage", out var v))
         {
             s.Voltage = Num(v, "Volts"); s.Power = Num(v, "Power");
-            try { using var ex = JsonDocument.Parse(Str(v, "Extras")); s.Pcie = Num(ex.RootElement, "pcie_12v_v"); s.Current = Num(ex.RootElement, "12vhpwr_a"); s.PcieCurrent = Num(ex.RootElement, "pcie_12v_a"); } catch (JsonException) { }
+            string extras = Str(v, "Extras");
+            try { using var ex = JsonDocument.Parse(extras); s.Pcie = Num(ex.RootElement, "pcie_12v_v"); s.Current = Num(ex.RootElement, "12vhpwr_a"); s.PcieCurrent = Num(ex.RootElement, "pcie_12v_a"); } catch (JsonException) { }
+            s.ConnectorVoltage = s.Voltage; s.ConnectorPower = s.Power; s.ConnectorCurrent = s.Current;
+            s.PcieVoltage = s.Pcie;
+            s.ConnectorVoltageAvailability = Availability(s.ConnectorVoltage);
+            s.ConnectorCurrentAvailability = Availability(s.ConnectorCurrent);
+            s.ConnectorPowerAvailability = Availability(s.ConnectorPower);
+            s.PcieVoltageAvailability = Availability(s.PcieVoltage);
+            s.PcieCurrentAvailability = Availability(s.PcieCurrent);
         }
-        if (r.TryGetProperty("gpu", out var g) && g.ValueKind == JsonValueKind.Object)
+        if (TryObject(r, "gpu", out var g))
         { s.BoardPower = Num(g, "Power"); s.Temperature = Num(g, "Temperature"); s.Utilization = Num(g, "Utilization"); s.Limit = Num(g, "Limit"); }
-        if (r.TryGetProperty("analysis", out var a) && a.ValueKind == JsonValueKind.Object)
+        if (TryObject(r, "analysis", out var a))
         { s.Status = Str(a, "Status"); s.Bin = (int?)Num(a, "Bin"); s.Drop = Num(a, "Drop"); s.Reference = Num(a, "Reference"); s.Median = Num(a, "Median"); s.P05 = Num(a, "P05"); }
-        if (r.TryGetProperty("reference_lifecycle", out var reference) && reference.ValueKind == JsonValueKind.Object)
-        {
-            s.ReferenceState = Str(reference, "state");
-            s.ReferenceCompatibility = Str(reference, "compatibility");
-        }
-        if (r.TryGetProperty("progress", out var p) && p.ValueKind == JsonValueKind.Object)
+        if (TryObject(r, "reference_lifecycle", out var reference))
+        { s.ReferenceState = Str(reference, "state"); s.ReferenceCompatibility = Str(reference, "compatibility"); }
+        if (TryObject(r, "progress", out var p))
         { s.Learning = (int)(Num(p, "learning_samples") ?? 0); s.Window = (int)(Num(p, "window_samples") ?? 0); s.Stable = (int)(Num(p, "stable_samples") ?? 0); }
+        ParseElectrical(s, r);
+        ParseAnalysisLoad(s, r);
+        ParseDifferential(s, r);
+        ParseWatchdog(s, r);
+        ParseIncidents(s, r);
+        ParseAcquisition(s, r);
         return s;
     }
-    public static string Str(JsonElement r, string k) => r.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
-    public static double? Num(JsonElement r, string k) => r.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetDouble(out var n) && double.IsFinite(n) ? n : null;
-    public static DateTimeOffset? Date(JsonElement r, string k) => DateTimeOffset.TryParse(Str(r, k), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var t) ? t : null;
+    public static string Str(JsonElement r, string k) => TryProperty(r, k, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
+    public static double? Num(JsonElement r, string k) => TryProperty(r, k, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetDouble(out var n) && double.IsFinite(n) ? n : null;
+    public static DateTimeOffset? Date(JsonElement r, string k) => TryProperty(r, k, out var v) && v.ValueKind == JsonValueKind.String && DateTimeOffset.TryParse(v.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var t) ? t : null;
+    static bool Bool(JsonElement r, string k) => TryProperty(r, k, out var v) && (v.ValueKind == JsonValueKind.True || v.ValueKind == JsonValueKind.String && bool.TryParse(v.GetString(), out var b) && b);
+    static string Key(string value) => new string(value.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+    static bool TryProperty(JsonElement r, string key, out JsonElement value)
+    {
+        if (r.ValueKind != JsonValueKind.Object) { value = default; return false; }
+        if (r.TryGetProperty(key, out value)) return true;
+        string wanted = Key(key);
+        foreach (var property in r.EnumerateObject()) if (Key(property.Name) == wanted) { value = property.Value; return true; }
+        value = default; return false;
+    }
+    static bool TryObject(JsonElement r, string key, out JsonElement value) => TryProperty(r, key, out value) && value.ValueKind == JsonValueKind.Object;
+    static string Availability(double? value) => value.HasValue ? "Present" : "Missing";
+    static double? Measurement(JsonElement parent, string key)
+    {
+        if (!TryProperty(parent, key, out var value)) return null;
+        return value.ValueKind == JsonValueKind.Object ? Num(value, "Value") : value.ValueKind == JsonValueKind.Number && value.TryGetDouble(out var n) && double.IsFinite(n) ? n : null;
+    }
+    static string MeasurementAvailability(JsonElement parent, string key, double? value)
+    {
+        if (!TryProperty(parent, key, out var raw)) return Availability(value);
+        var reported = raw.ValueKind == JsonValueKind.Object ? Str(raw, "Availability") : "";
+        return reported.Length > 0 ? reported : Availability(value);
+    }
+    static (bool Fresh, bool Verified, string Kind, string Detail, DateTimeOffset? SourceTime) Freshness(JsonElement parent)
+    {
+        if (!TryObject(parent, "Freshness", out var f)) return (false, false, "Unavailable", "freshness unavailable", null);
+        string kind = Str(f, "Kind"); bool verified = kind.IndexOf("verified", StringComparison.OrdinalIgnoreCase) >= 0 && kind.IndexOf("unverified", StringComparison.OrdinalIgnoreCase) < 0;
+        return (Bool(f, "IsFresh"), verified, kind.Length == 0 ? "Unavailable" : kind, Str(f, "Detail"), Date(f, "SourceTimestampUtc"));
+    }
+    static string StateFor(bool available, bool fresh, bool verified) => !available ? fresh ? "UNAVAILABLE" : "STALE" : !fresh ? "STALE" : !verified ? "UNVERIFIED" : "AVAILABLE";
+    static string SourceOr(string preferred, string fallback) => preferred.Length > 0 ? preferred : fallback;
+    static void ParseElectrical(Snapshot s, JsonElement root)
+    {
+        if (!TryObject(root, "electrical", out var e))
+        {
+            var fallbackFresh = s.Time != default ? (true, false, "HostPollTimestampUnverified", "legacy voltage payload; source freshness unverified", (DateTimeOffset?)null) : (false, false, "Unavailable", "electrical payload unavailable", (DateTimeOffset?)null);
+            s.ElectricalFresh = fallbackFresh.Item1; s.ElectricalFreshnessVerified = fallbackFresh.Item2; s.ElectricalFreshnessKind = fallbackFresh.Item3; s.ElectricalFreshnessDetail = fallbackFresh.Item4; s.ElectricalSourceTimestamp = fallbackFresh.Item5;
+            s.ElectricalStatus = StateFor(s.ConnectorVoltage.HasValue, s.ElectricalFresh, s.ElectricalFreshnessVerified);
+            return;
+        }
+        s.ElectricalSource = SourceOr(Str(e, "Source"), s.Source);
+        if (TryObject(e, "Connector", out var connector))
+        {
+            s.ConnectorVoltage = Measurement(connector, "Voltage"); s.ConnectorCurrent = Measurement(connector, "Current"); s.ConnectorPower = Measurement(connector, "Power");
+            s.ConnectorVoltageAvailability = MeasurementAvailability(connector, "Voltage", s.ConnectorVoltage); s.ConnectorCurrentAvailability = MeasurementAvailability(connector, "Current", s.ConnectorCurrent); s.ConnectorPowerAvailability = MeasurementAvailability(connector, "Power", s.ConnectorPower);
+            s.Voltage = s.ConnectorVoltage ?? s.Voltage; s.Current = s.ConnectorCurrent ?? s.Current; s.Power = s.ConnectorPower ?? s.Power;
+        }
+        if (TryObject(e, "Pcie", out var pcie))
+        {
+            s.PcieVoltage = Measurement(pcie, "Voltage"); s.PcieCurrent = Measurement(pcie, "Current"); s.PciePower = Measurement(pcie, "Power");
+            s.PcieVoltageAvailability = MeasurementAvailability(pcie, "Voltage", s.PcieVoltage); s.PcieCurrentAvailability = MeasurementAvailability(pcie, "Current", s.PcieCurrent); s.PciePowerAvailability = MeasurementAvailability(pcie, "Power", s.PciePower);
+            s.Pcie = s.PcieVoltage ?? s.Pcie;
+        }
+        var freshness = Freshness(e);
+        s.ElectricalFresh = freshness.Fresh; s.ElectricalFreshnessVerified = freshness.Verified; s.ElectricalFreshnessKind = freshness.Kind; s.ElectricalFreshnessDetail = freshness.Detail; s.ElectricalSourceTimestamp = freshness.SourceTime;
+        s.ElectricalStatus = StateFor(s.ConnectorVoltage.HasValue, s.ElectricalFresh, s.ElectricalFreshnessVerified);
+    }
+    static void ParseAnalysisLoad(Snapshot s, JsonElement root)
+    {
+        if (!TryObject(root, "analysis_load", out var load)) { s.AnalysisLoadStatus = "UNAVAILABLE"; s.AnalysisLoadDetail = "Selected analysis load was not reported."; return; }
+        s.AnalysisLoadSource = Str(load, "Source"); s.AnalysisLoadValue = Num(load, "Value"); s.AnalysisLoadUnit = Str(load, "Unit"); s.AnalysisLoadAvailable = Bool(load, "IsAvailable") || !TryProperty(load, "IsAvailable", out _) && s.AnalysisLoadValue.HasValue; s.AnalysisLoadDetail = Str(load, "Detail");
+        var freshness = Freshness(load); s.AnalysisLoadFresh = freshness.Fresh; s.AnalysisLoadFreshnessVerified = freshness.Verified;
+        s.AnalysisLoadStatus = StateFor(s.AnalysisLoadAvailable && s.AnalysisLoadValue.HasValue, s.AnalysisLoadFresh, s.AnalysisLoadFreshnessVerified);
+        if (s.AnalysisLoadDetail.Length == 0 && s.AnalysisLoadStatus != "AVAILABLE") s.AnalysisLoadDetail = s.AnalysisLoadStatus == "STALE" ? "Selected load is stale." : s.AnalysisLoadStatus == "UNVERIFIED" ? "Selected load timestamp is unverified." : "Selected load is unavailable.";
+    }
+    static void ParseDifferential(Snapshot s, JsonElement root)
+    {
+        if (TryObject(root, "differential_model", out var model)) { s.DifferentialModelLoaded = Bool(model, "is_loaded"); s.DifferentialModelFitted = Bool(model, "is_fitted"); s.DifferentialModelState = Str(model, "state"); if (s.DifferentialModelState.Length == 0) s.DifferentialModelState = s.DifferentialModelFitted ? "FITTED" : s.DifferentialModelLoaded ? "LOADED" : "UNAVAILABLE"; s.DifferentialModelSlope = Num(model, "apparent_slope_v_per_unit"); s.DifferentialModelLearningSamples = (int)(Num(model, "learning_samples") ?? 0); s.DifferentialModelDetail = Str(model, "detail"); }
+        if (TryObject(root, "differential_prediction", out var prediction)) { s.DifferentialPredictionAvailable = Bool(prediction, "is_available"); s.ExpectedVoltage = Num(prediction, "expected_voltage_v"); s.ObservedVoltage = Num(prediction, "observed_voltage_v"); s.Residual = Num(prediction, "residual_v"); s.ExcessDroop = Num(prediction, "excess_droop_v"); s.DifferentialSlope = Num(prediction, "apparent_slope_v_per_unit"); s.DifferentialPredictionQualification = Str(prediction, "qualification"); s.DifferentialPredictionDetail = Str(prediction, "detail"); }
+        if (TryObject(root, "residual_detector", out var detector)) { s.ResidualDetectorName = Str(detector, "detector"); s.ResidualDetectorStatus = Str(detector, "status"); if (s.ResidualDetectorStatus.Length == 0) s.ResidualDetectorStatus = "UNAVAILABLE"; s.ResidualDetectorAvailable = Bool(detector, "is_available"); s.ResidualDetectorAlert = Bool(detector, "is_alert"); s.ResidualDetectorFastAlert = Bool(detector, "is_fast_alert"); s.ResidualDetectorEwmaAlert = Bool(detector, "is_ewma_alert"); s.FilteredResidual = Num(detector, "filtered_residual_v"); s.ResidualConsecutiveSamples = (int?)Num(detector, "consecutive_samples"); s.ResidualDetectorDetail = Str(detector, "detail"); }
+    }
+    static void ParseWatchdog(Snapshot s, JsonElement root)
+    {
+        if (!TryObject(root, "power_limit_watchdog", out var wrapper) || !TryObject(wrapper, "result", out var result)) { s.WatchdogDetail = "Read-only power-limit monitor was not reported."; return; }
+        s.WatchdogAvailable = true; s.WatchdogStatus = Str(result, "Status"); s.WatchdogBoardStatus = Str(result, "BoardPowerStatus"); s.WatchdogReadOnly = Bool(result, "IsReadOnly"); s.WatchdogNoSafetyCertification = Bool(result, "NoSafetyCertification"); s.WatchdogFresh = Bool(result, "IsFresh"); s.WatchdogFreshnessVerified = Bool(result, "FreshnessVerified"); s.WatchdogIncidentLatched = Bool(result, "IncidentLatched"); s.WatchdogConfiguredLimit = Num(result, "ConfiguredLimitWatts"); s.WatchdogObservedLimit = Num(result, "ObservedLimitWatts"); s.WatchdogBoardPower = Num(result, "BoardPowerWatts"); s.WatchdogBaselineLimit = Num(result, "BaselineLimitWatts"); s.WatchdogDifferenceFromConfigured = Num(result, "DifferenceFromConfiguredWatts"); s.WatchdogDifferenceFromBaseline = Num(result, "DifferenceFromBaselineWatts"); s.WatchdogDetail = Str(result, "Detail"); if (s.WatchdogDetail.Length == 0) s.WatchdogDetail = Str(wrapper, "load_detail");
+    }
+    static void ParseIncidents(Snapshot s, JsonElement root)
+    {
+        if (!TryProperty(root, "incidents", out var values) || values.ValueKind != JsonValueKind.Array) return;
+        var incidents = new List<SnapshotIncident>();
+        foreach (var item in values.EnumerateArray()) if (item.ValueKind == JsonValueKind.Object)
+        {
+            var time = Date(item, "TriggeredAtUtc") ?? Date(item, "triggered_at_utc") ?? default;
+            incidents.Add(new SnapshotIncident(Str(item, "incident_id"), Str(item, "detector"), Str(item, "status"), Str(item, "severity"), Str(item, "state"), time, Date(item, "acknowledged_at_utc"), Date(item, "resolved_at_utc"), Bool(item, "post_complete")));
+        }
+        s.Incidents = incidents.OrderBy(i => i.TriggeredAtUtc).ToArray(); s.IncidentCount = incidents.Count; s.ActiveIncidentCount = incidents.Count(i => !string.Equals(i.State, "RESOLVED", StringComparison.OrdinalIgnoreCase));
+        if (s.Incidents.Count > 0) { var latest = s.Incidents[^1]; s.LatestIncidentState = latest.State; s.LatestIncidentStatus = latest.Status; s.LatestIncidentDetail = latest.Detector.Length > 0 ? latest.Detector : latest.Severity; }
+    }
+    static void ParseAcquisition(Snapshot s, JsonElement root)
+    {
+        if (!TryObject(root, "acquisition", out var acquisition)) return;
+        s.AcquisitionStatus = Str(acquisition, "status"); s.AcquisitionDetail = Str(acquisition, "detail"); s.AcquisitionFreshnessKnown = Bool(acquisition, "freshness_known"); s.AcquisitionAnalysisAvailable = Bool(acquisition, "analysis_available"); s.AcquisitionSourceAvailable = Bool(acquisition, "source_available"); s.AcquisitionPowerAvailable = Bool(acquisition, "power_available");
+    }
 }
 
 public sealed class TelemetryStore

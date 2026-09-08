@@ -30,6 +30,7 @@ public sealed class MainWindow : Window
     readonly TextBlock connection = Text("Connecting…", 12), voltage = Text("—", 30), power = Text("—", 30), pcie = Text("—", 30), change = Text("—", 30);
     readonly TextBlock voltageNote = Text("16-pin input", 11), powerNote = Text("Measured rail V × A", 11), referenceNote = Text("Waiting for a reference", 11);
     readonly TextBlock powerLabel = Text("CONNECTOR POWER", 10);
+    readonly TextBlock powerPath = Text("", 11), degradation = Text("", 11);
     readonly TextBlock bannerText = Text("", 13), analysisTitle = Text("Waiting for data", 19), analysisBody = Text("", 12), histogramStats = Text("", 11), footer = Text("", 11);
     readonly Border banner = new() { CornerRadius = new CornerRadius(8), Padding = new Thickness(14, 10, 14, 10), Margin = new Thickness(0, 0, 0, 14) };
     readonly ProgressBar progress = new() { Height = 5, Margin = new Thickness(0, 12, 0, 12), Maximum = 300, Foreground = Palette.Cyan, Background = Palette.Line, BorderThickness = new Thickness(0) };
@@ -108,6 +109,8 @@ public sealed class MainWindow : Window
             var card = Panel(Vertical(label, values[i], notes[i])); card.Margin = new Thickness(i == 0 ? 0 : 5, 0, i == 3 ? 0 : 5, 0); Grid.SetColumn(card, i); cards.Children.Add(card);
         }
         content.Children.Add(cards);
+        powerPath.Foreground = Palette.Text; degradation.Foreground = Palette.Amber;
+        var pathPanel = Panel(Vertical(Header("Power path and data quality"), powerPath, degradation)); pathPanel.Margin = new Thickness(0, 0, 0, 16); content.Children.Add(pathPanel);
         range.Items.Add("15 minutes"); range.Items.Add("1 hour"); range.Items.Add("24 hours");
         range.SelectedIndex = settings.RangeMinutes == 1440 ? 2 : settings.RangeMinutes == 60 ? 1 : 0;
         range.SelectionChanged += (_, _) => { settings.RangeMinutes = range.SelectedIndex == 2 ? 1440 : range.SelectedIndex == 1 ? 60 : 15; if (!busy) RenderData(); };
@@ -222,24 +225,53 @@ public sealed class MainWindow : Window
         string state = fresh ? (demo ? "Synthetic preview" : "Monitoring") : s?.Stopped == true ? "Monitor stopped" : "No fresh telemetry";
         connection.Text = state + (s == null ? "" : $"  ·  {age:F0}s since update");
         connection.Foreground = fresh ? Palette.Cyan : Palette.Amber;
-        voltage.Text = fresh && s?.Voltage is double v ? $"{v:F3} V" : "—";
-        pcie.Text = fresh && s?.Pcie is double pv ? $"{pv:F3} V" : "—";
-        power.Text = fresh && s?.Power is double pw ? $"{pw:F1} W" : "—";
-        bool direct = demo || s?.Source.StartsWith("direct NVIDIA", StringComparison.OrdinalIgnoreCase) == true;
+        bool pathValues = s?.ElectricalStatus is "AVAILABLE" or "UNVERIFIED";
+        double? connectorVoltage = s?.ConnectorVoltage ?? s?.Voltage;
+        double? connectorPower = s?.ConnectorPower ?? (s?.ElectricalSource.Length == 0 ? s?.Power : null);
+        double? pcieVoltage = s?.PcieVoltage ?? s?.Pcie;
+        voltage.Text = fresh && pathValues ? FormatValue(connectorVoltage, "V", 3) : "—";
+        pcie.Text = fresh && pathValues ? FormatValue(pcieVoltage, "V", 3) : "—";
+        power.Text = fresh && pathValues ? FormatValue(connectorPower, "W", 1) : "—";
+        bool direct = demo || s?.ConnectorPower.HasValue == true || s?.Source.StartsWith("direct NVIDIA", StringComparison.OrdinalIgnoreCase) == true;
         powerLabel.Text = direct ? "CONNECTOR POWER" : "COMPARISON POWER";
-        powerNote.Text = direct ? "Measured rail V × A" : "Power supplied by voltage source";
+        powerNote.Text = s?.ConnectorPower.HasValue == true ? "Typed connector rail power" : direct ? "Legacy source; provenance unverified" : "Power supplied by voltage source";
         change.Text = fresh && s?.Drop is double dr ? $"{-dr * 1000:+0;−0;0} mV" : "—";
         referenceNote.Text = s?.Reference is double r ? $"Reference {r:F3} V" : "Awaiting a learned reference";
-        bool alert = fresh && s?.Status is "SUDDEN_DROOP" or "BASELINE_SHIFT";
-        string message = operation.Length > 0 ? operation : store.ReadError.Length > 0 ? "Data read issue: " + store.ReadError : !fresh ? "Monitoring unavailable. Values shown in history are past observations." : alert ? Friendly(s!.Status) + ". Save your work and reduce GPU load while investigating." : s!.Status == "OUTSIDE_ANALYSIS_RANGE" ? $"Collecting telemetry. Analysis starts during steady connector load above {config.MinAnalysisWatts} W." : Friendly(s!.Status) + ". Aggregate rail readings do not certify connector safety.";
+        bool alert = fresh && (s?.Status is "SUDDEN_DROOP" or "BASELINE_SHIFT" || s?.ResidualDetectorAlert == true || s?.ActiveIncidentCount > 0);
+        string quality = QualitySummary(s);
+        string message = operation.Length > 0 ? operation : store.ReadError.Length > 0 ? "Data read issue: " + store.ReadError : !fresh ? "Monitoring unavailable. Values shown in history are past observations." : quality.Length > 0 ? "Telemetry degraded: " + quality + "." : alert ? Friendly(s!.Status) + ". Save your work and reduce GPU load while investigating." : s!.Status == "OUTSIDE_ANALYSIS_RANGE" ? $"Collecting telemetry. Analysis starts during steady connector load above {config.MinAnalysisWatts} W." : Friendly(s!.Status) + ". Aggregate rail readings do not certify connector safety.";
         if (demo) message = "Synthetic demonstration — charts and warnings below are test data.";
         bannerText.Text = message; bannerText.Foreground = alert ? Palette.Red : Palette.Muted;
         banner.Background = Palette.Panel; banner.BorderBrush = alert ? Palette.Red : Palette.Line; banner.BorderThickness = new Thickness(1);
+        powerPath.Text = $"Source path  {SourceLabel(s)}\n16-pin  {FormatValue(s?.ConnectorVoltage ?? s?.Voltage, "V", 3)}  ·  {FormatValue(s?.ConnectorCurrent ?? s?.Current, "A", 2)}  ·  {FormatValue(s?.ConnectorPower ?? (s?.ElectricalSource.Length == 0 ? s?.Power : null), "W", 1)}\nPCIe  {FormatValue(s?.PcieVoltage ?? s?.Pcie, "V", 3)}  ·  {FormatValue(s?.PcieCurrent ?? s?.PcieCurrent, "A", 2)}  ·  {FormatValue(s?.PciePower, "W", 1)}\nSelected analysis load  {FormatValue(s?.AnalysisLoadValue, s?.AnalysisLoadUnit, 1)}  ·  {SourceLabel(s?.AnalysisLoadSource)}  ·  {s?.AnalysisLoadStatus ?? "UNAVAILABLE"}";
+        degradation.Text = QualityDetails(s);
         if (tray != null)
         {
             tray.Icon = !fresh ? Drawing.SystemIcons.Error : alert ? Drawing.SystemIcons.Warning : Drawing.SystemIcons.Information;
-            string text = $"ConnectorWatch · {state}\n{s?.Voltage:F3} V · {age:F0}s ago"; tray.Text = text.Length > 63 ? text[..63] : text;
+            string text = $"ConnectorWatch · {state}\n{FormatValue(connectorVoltage, "V", 3)} · {age:F0}s ago"; tray.Text = text.Length > 63 ? text[..63] : text;
         }
+    }
+    static string FormatValue(double? value, string? unit, int decimals) => value is double number && double.IsFinite(number) ? number.ToString($"F{decimals}", CultureInfo.InvariantCulture) + (string.IsNullOrWhiteSpace(unit) ? "" : " " + unit) : "—";
+    static string SourceLabel(Snapshot? s) => SourceLabel(s?.ElectricalSource ?? "");
+    static string SourceLabel(string? source) => string.IsNullOrWhiteSpace(source) ? "Unavailable" : source;
+    static string QualitySummary(Snapshot? s)
+    {
+        if (s == null) return "";
+        var states = new List<string>();
+        if (s.ElectricalStatus is "STALE" or "UNAVAILABLE" or "UNVERIFIED") states.Add("electrical " + s.ElectricalStatus.ToLowerInvariant());
+        if (s.AnalysisLoadStatus is "STALE" or "UNAVAILABLE" or "UNVERIFIED") states.Add("analysis load " + s.AnalysisLoadStatus.ToLowerInvariant());
+        if (s.AcquisitionStatus.Length > 0 && !string.Equals(s.AcquisitionStatus, "HEALTHY", StringComparison.OrdinalIgnoreCase)) states.Add("acquisition " + Friendly(s.AcquisitionStatus));
+        if (s.DifferentialModelState is "" or "UNAVAILABLE" or "UNFITTED") states.Add("differential model unavailable");
+        if (s.IncidentCount > 0) states.Add($"{s.ActiveIncidentCount} active incident(s) of {s.IncidentCount}");
+        return string.Join("; ", states);
+    }
+    static string QualityDetails(Snapshot? s)
+    {
+        if (s == null) return "No snapshot. Values are unavailable.";
+        string model = s.DifferentialModelState.Length == 0 ? "UNAVAILABLE" : s.DifferentialModelState;
+        string incidents = s.IncidentCount == 0 ? "No incident ledger entries reported" : $"Incidents {s.ActiveIncidentCount} active / {s.IncidentCount} total" + (s.LatestIncidentState.Length > 0 ? $" · latest {s.LatestIncidentState} {s.LatestIncidentStatus}" : "");
+        string watchdog = s.WatchdogAvailable ? $"Read-only power-limit monitor {s.WatchdogStatus}; safety certification absent" : "Read-only power-limit monitor unavailable";
+        return $"Electrical {s.ElectricalStatus}; freshness {s.ElectricalFreshnessKind}; reference {SourceLabel(s.ReferenceState)}; model {model}; {incidents}; {watchdog}.";
     }
     int? SelectedBin()
     {
@@ -271,7 +303,11 @@ public sealed class MainWindow : Window
         analysisTitle.Text = s == null || !s.Fresh(config.MaxAgeSeconds) ? "Monitoring unavailable" : Friendly(s.Status);
         progress.Maximum = config.BaselineSamples; progress.Value = s?.Reference.HasValue == true ? config.BaselineSamples : Math.Min(config.BaselineSamples, s?.Learning ?? 0);
         string binLabel = s?.Bin is int bnow ? $"{bnow}–{bnow + config.BinWatts} W connector load" : "No eligible load bin";
-        analysisBody.Text = binLabel + "\n" + (s?.Reference.HasValue == true ? $"Frozen reference  {s.Reference:F3} V\nCurrent median  {s.Median:F3} V  ·  P05 {s.P05:F3} V\nWindow  {s.Window} / {config.WindowSamples} eligible samples" : $"Reference learning  {s?.Learning ?? 0} / {config.BaselineSamples} samples\nLearning accumulates during steady load.") + $"\nShift threshold  {config.ShiftVolts * 1000:F0} mV  ·  sudden {config.SuddenDroopVolts * 1000:F0} mV";
+        string referenceText = s?.Reference.HasValue == true ? $"Frozen reference  {FormatValue(s.Reference, "V", 3)}\nCurrent median  {FormatValue(s.Median, "V", 3)}  ·  P05 {FormatValue(s.P05, "V", 3)}\nWindow  {s.Window} / {config.WindowSamples} eligible samples" : $"Reference learning  {s?.Learning ?? 0} / {config.BaselineSamples} samples\nLearning accumulates during steady load.";
+        string modelText = $"Selected load  {FormatValue(s?.AnalysisLoadValue, s?.AnalysisLoadUnit, 1)} · {SourceLabel(s?.AnalysisLoadSource)} · {s?.AnalysisLoadStatus ?? "UNAVAILABLE"}\nReference lifecycle  {SourceLabel(s?.ReferenceState)}" + (s?.ReferenceCompatibility.Length > 0 ? $" · {s.ReferenceCompatibility}" : "") + $"\nDifferential model  {SourceLabel(s?.DifferentialModelState)} · slope {FormatValue(s?.DifferentialModelSlope, "V/unit", 5)}\nPrediction  expected {FormatValue(s?.ExpectedVoltage, "V", 3)} · observed {FormatValue(s?.ObservedVoltage, "V", 3)} · residual {FormatValue(s?.Residual, "V", 3)}\nResidual detector  {SourceLabel(s?.ResidualDetectorStatus)}";
+        string incidentText = s == null || s.IncidentCount == 0 ? "Incidents  0 active / 0 total" : $"Incidents  {s.ActiveIncidentCount} active / {s.IncidentCount} total · latest {SourceLabel(s.LatestIncidentState)} {SourceLabel(s.LatestIncidentStatus)}";
+        string watchdogText = s?.WatchdogAvailable == true ? $"Power-limit monitor  READ-ONLY · {SourceLabel(s.WatchdogStatus)}" : "Power-limit monitor  READ-ONLY · UNAVAILABLE";
+        analysisBody.Text = binLabel + "\n" + referenceText + $"\nShift threshold  {config.ShiftVolts * 1000:F0} mV  ·  sudden {config.SuddenDroopVolts * 1000:F0} mV\n" + modelText + $"\n{incidentText}\n{watchdogText}";
         if (renderedWarningRevision != store.Incidents.Revision || renderedAcknowledgementRevision != acknowledged.Revision || renderedAllWarnings != allWarnings)
         {
             string? chosen = (warnings.SelectedItem as ListBoxItem)?.Tag as string;
@@ -306,8 +342,13 @@ public sealed class MainWindow : Window
     void ShowDetails()
     {
         var s = store.Current;
-        ShowText("Sensor details", $"GPU UUID\n{(string.IsNullOrWhiteSpace(s?.GpuUuid) ? (string.IsNullOrWhiteSpace(config.GpuUuid) ? "Automatic (awaiting daemon)" : config.GpuUuid) : s.GpuUuid)}\n\nSource\n{s?.Source}\n\nLast observation\n{s?.Time.LocalDateTime:yyyy-MM-dd HH:mm:ss}\n16-pin {s?.Voltage:F6} V  ·  PCIe {s?.Pcie:F6} V\n16-pin current {s?.Current:F3} A  ·  PCIe current {s?.PcieCurrent:F3} A\nConnector power {s?.Power:F3} W  ·  NVML board power {s?.BoardPower:F3} W\nGPU {s?.Temperature:F0} °C  ·  utilization {s?.Utilization:F0}%  ·  power limit {s?.Limit:F0} W\n\nStatus\n{s?.Status}  ·  schema {s?.Schema}\n{s?.Detail}\n\nTimestamps are host polling time. Native sensor freshness is unverified. GPU temperature is not connector temperature.\n\nData directory\n{data}");
+        string gpu = string.IsNullOrWhiteSpace(s?.GpuUuid) ? (string.IsNullOrWhiteSpace(config.GpuUuid) ? "Automatic (awaiting daemon)" : config.GpuUuid) : s.GpuUuid;
+        string time = s == null || s.Time == default ? "—" : s.Time.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+        string incidents = s == null ? "—" : $"{s.ActiveIncidentCount} active / {s.IncidentCount} total" + (s.LatestIncidentState.Length > 0 ? $" · latest {s.LatestIncidentState} {s.LatestIncidentStatus}" : "");
+        string watchdog = s?.WatchdogAvailable == true ? $"{s.WatchdogStatus} · board {SourceLabel(s.WatchdogBoardStatus)} · read-only {Flag(true, s.WatchdogReadOnly)} · no safety certification {Flag(true, s.WatchdogNoSafetyCertification)}" : "Unavailable";
+        ShowText("Sensor details", $"GPU UUID\n{gpu}\n\nSource path\n{SourceLabel(s)}\nElectrical state\n{s?.ElectricalStatus ?? "UNAVAILABLE"} · freshness {s?.ElectricalFreshnessKind ?? "Unavailable"}\n16-pin  {FormatValue(s?.ConnectorVoltage ?? s?.Voltage, "V", 6)}  ·  {FormatValue(s?.ConnectorCurrent ?? s?.Current, "A", 3)}  ·  {FormatValue(s?.ConnectorPower ?? (s?.ElectricalSource.Length == 0 ? s?.Power : null), "W", 3)}\nPCIe  {FormatValue(s?.PcieVoltage ?? s?.Pcie, "V", 6)}  ·  {FormatValue(s?.PcieCurrent, "A", 3)}  ·  {FormatValue(s?.PciePower, "W", 3)}\nSelected analysis load  {FormatValue(s?.AnalysisLoadValue, s?.AnalysisLoadUnit, 3)} · {SourceLabel(s?.AnalysisLoadSource)} · {s?.AnalysisLoadStatus ?? "UNAVAILABLE"}\n\nModel\nReference {SourceLabel(s?.ReferenceState)} · compatibility {SourceLabel(s?.ReferenceCompatibility)}\nExpected {FormatValue(s?.ExpectedVoltage, "V", 6)} · observed {FormatValue(s?.ObservedVoltage, "V", 6)} · residual {FormatValue(s?.Residual, "V", 6)}\nModel slope {FormatValue(s?.DifferentialModelSlope ?? s?.DifferentialSlope, "V/unit", 6)} · detector {SourceLabel(s?.ResidualDetectorStatus)}\n\nIncidents\n{incidents}\n\nPower-limit watchdog\n{watchdog}\nConfigured limit {FormatValue(s?.WatchdogConfiguredLimit, "W", 1)} · observed limit {FormatValue(s?.WatchdogObservedLimit, "W", 1)} · board power {FormatValue(s?.WatchdogBoardPower ?? s?.BoardPower, "W", 1)}\n\nGPU temperature {FormatValue(s?.Temperature, "°C", 0)}  ·  utilization {FormatValue(s?.Utilization, "%", 0)}  ·  power limit {FormatValue(s?.Limit, "W", 0)}\n\nStatus\n{s?.Status ?? "UNAVAILABLE"}  ·  schema {s?.Schema}\n{s?.AcquisitionStatus} {s?.AcquisitionDetail}\n{s?.Detail}\n\nTimestamps are host polling time unless a verified source timestamp is shown. Native sensor freshness may be unverified. GPU temperature is not connector temperature. These readings do not certify connector safety.\n\nData directory\n{data}");
     }
+    static string Flag(bool available, bool value) => available ? value ? "yes" : "no" : "—";
     void ShowSettings()
     {
         var body = Vertical(Text($"Sampling  {config.SampleSeconds}s\nMinimum load  {config.MinAnalysisWatts} W\nLoad bins  {config.BinWatts} W\nReference  {config.BaselineSamples} samples\nRolling window  {config.WindowSamples} samples\n\nThreshold and hardware changes require a daemon restart.\nClosing the window hides it to the tray. Explicit Exit GUI keeps monitoring.", 13));
@@ -410,7 +451,7 @@ public sealed class MainWindow : Window
             store.Samples.Add(new(t, t, v, 12.1 + random.NextDouble() * .008, 438 + random.NextDouble() * 5, 425, state, 12.08, 12.06, 12.08 - v, "Synthetic voltage event"));
         }
         var last = store.Samples[^1];
-        store.Current = new Snapshot { Time = now, Voltage = last.Voltage, Pcie = last.Pcie, Power = last.Power, BoardPower = 452, Temperature = 62, Utilization = 97, Limit = 450, Bin = 425, Status = "BASELINE_SHIFT", Reference = 12.08, Median = 11.856, P05 = 11.849, Drop = .224, Learning = 300, Window = 60, Schema = 2, Source = "Synthetic fixture · no hardware" };
+        store.Current = new Snapshot { Time = now, Voltage = last.Voltage, Pcie = last.Pcie, Power = last.Power, ConnectorVoltage = last.Voltage, ConnectorCurrent = 36.5, ConnectorPower = last.Power, PcieVoltage = last.Pcie, PcieCurrent = 4.2, PciePower = 50.4, ElectricalSource = "Synthetic fixture · no hardware", ElectricalStatus = "UNVERIFIED", ElectricalFresh = true, ElectricalFreshnessKind = "Synthetic", AnalysisLoadSource = "CONNECTOR_POWER", AnalysisLoadValue = last.Power, AnalysisLoadUnit = "W", AnalysisLoadAvailable = true, AnalysisLoadFresh = true, AnalysisLoadStatus = "UNVERIFIED", DifferentialModelState = "SYNTHETIC", ResidualDetectorStatus = "SYNTHETIC", BoardPower = 452, Temperature = 62, Utilization = 97, Limit = 450, Bin = 425, Status = "BASELINE_SHIFT", Reference = 12.08, Median = 11.856, P05 = 11.849, Drop = .224, Learning = 300, Window = 60, Schema = 2, Source = "Synthetic fixture · no hardware" };
         store.Baselines[425] = new(12.08, 12.06, 0);
         store.Incidents.Add(new("demo1", now.AddSeconds(-250), "SUDDEN_DROOP", "Synthetic 280 mV drop", 11.80, .28, 425));
         store.Incidents.Add(new("demo2", now.AddSeconds(-100), "BASELINE_SHIFT", "Synthetic sustained change", 11.856, .224, 425));
@@ -484,7 +525,10 @@ public sealed class MainWindow : Window
     {
         "SUDDEN_DROOP" => "Sudden voltage drop", "BASELINE_SHIFT" => "Sustained voltage shift", "VOLTAGE_UNAVAILABLE" => "Voltage unavailable", "MONITOR_STOPPED" => "Monitoring stopped",
         "LEARNING_REFERENCE" => "Learning reference", "WINDOW_WARMUP" => "Warming up comparison", "LOAD_SETTLING" => "Load settling", "NO_SHIFT_DETECTED" => "No shift detected",
-        "OUTSIDE_ANALYSIS_RANGE" => "Waiting for steady load", "POWER_UNAVAILABLE" => "Power unavailable", "WAITING_FOR_FRESH_VOLTAGE" => "Waiting for fresh voltage", _ => status.Replace('_', ' ').ToLowerInvariant()
+        "OUTSIDE_ANALYSIS_RANGE" => "Waiting for steady load", "POWER_UNAVAILABLE" => "Power unavailable", "WAITING_FOR_FRESH_VOLTAGE" => "Waiting for fresh voltage",
+        "SOURCE_UNAVAILABLE" => "Source unavailable", "TIMESTAMP_INVALID" => "Timestamp invalid", "STALE" => "Stale telemetry", "SENSOR_UNCHARACTERIZED" => "Sensor uncharacterized",
+        "ANALYSIS_LOAD_UNAVAILABLE" => "Analysis load unavailable", "RESIDUAL_UNAVAILABLE" => "Residual unavailable", "RESIDUAL_GAP" => "Residual gap", "RESIDUAL_IDENTITY_MISMATCH" => "Residual identity mismatch", "RESIDUAL_INVALID" => "Residual invalid",
+        "POWER_LIMIT_INCREASE" => "Power-limit increase observed", "POWER_LIMIT_OK" => "Power-limit observation", "POWER_LIMIT_UNAVAILABLE" => "Power-limit data unavailable", _ => status.Replace('_', ' ').ToLowerInvariant()
     };
     sealed record BinChoice(int Value, int Width) { public override string ToString() => $"{Value}–{Value + Width} W"; }
 }

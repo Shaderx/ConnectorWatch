@@ -35,6 +35,43 @@ public static class GuiTests
         Check(lifecycleSnapshot.ReferenceState == "REFERENCE_UNVERIFIED" &&
             lifecycleSnapshot.ReferenceCompatibility == "LEGACY",
             "Reference lifecycle state remains visible to the GUI");
+        var powerPathSnapshot = Snapshot.Parse($$"""
+        {
+          "timestamp_utc":"{{now:O}}",
+          "voltage_source":"legacy path",
+          "electrical":{
+            "Source":"typed source path",
+            "Connector":{
+              "Voltage":{"Value":12.1,"Availability":"Present","Unit":"V"},
+              "Current":{"Value":36.5,"Availability":"Present","Unit":"A"},
+              "Power":{"Value":441.65,"Availability":"Present","Unit":"W"}
+            },
+            "Pcie":{
+              "Voltage":{"Value":12.0,"Availability":"Present","Unit":"V"},
+              "Current":{"Value":4.1,"Availability":"Present","Unit":"A"},
+              "Power":{"Value":49.2,"Availability":"Present","Unit":"W"}
+            },
+            "Freshness":{"IsFresh":true,"Kind":"HostPollTimestampUnverified","Detail":"poll time only"}
+          },
+          "analysis_load":{"Source":"CONNECTOR_POWER","Value":441.65,"Unit":"W","IsAvailable":true,"Freshness":{"IsFresh":false,"Kind":"VerifiedSourceTimestamp"},"Detail":"stale selected load"},
+          "reference_lifecycle":{"state":"REFERENCE_UNVERIFIED","compatibility":"COMPATIBLE"},
+          "differential_model":{"is_loaded":true,"is_fitted":true,"state":"FITTED","apparent_slope_v_per_unit":-0.0002,"learning_samples":12,"detail":"fitted"},
+          "differential_prediction":{"is_available":true,"expected_voltage_v":12.0,"observed_voltage_v":11.8,"residual_v":-0.2,"excess_droop_v":-0.19,"apparent_slope_v_per_unit":-0.0002,"qualification":"QUALIFIED","detail":"prediction"},
+          "residual_detector":{"detector":"ewma","status":"SUDDEN_DROOP","is_available":true,"is_alert":true,"filtered_residual_v":-0.18,"consecutive_samples":3,"detail":"alert"},
+          "power_limit_watchdog":{
+            "result":{"Status":"POWER_LIMIT_OK","BoardPowerStatus":"BOARD_POWER_AVAILABLE","IsReadOnly":true,"NoSafetyCertification":true,"LimitAvailable":true,"BoardPowerAvailable":true,"IsFresh":true,"FreshnessVerified":false,"ConfiguredLimitWatts":450,"ObservedLimitWatts":450,"BoardPowerWatts":440,"IncidentLatched":false,"Detail":"read-only"}
+          },
+          "incidents":[{"incident_id":"i1","detector":"residual","Status":"SUDDEN_DROOP","severity":"HIGH","state":"LATCHED","TriggeredAtUtc":"{{now.AddSeconds(-1):O}}","post_complete":false}]
+        }
+        """);
+        Check(powerPathSnapshot.ElectricalSourcePath == "typed source path" && powerPathSnapshot.ConnectorVoltage == 12.1 && powerPathSnapshot.ConnectorCurrent == 36.5 && powerPathSnapshot.ConnectorPower == 441.65 && powerPathSnapshot.PciePower == 49.2, "Typed connector and PCIe V/A/W path is decoded");
+        Check(powerPathSnapshot.ElectricalStatus == "UNVERIFIED" && !powerPathSnapshot.ElectricalFreshnessVerified && powerPathSnapshot.AnalysisLoadStatus == "STALE", "Host-poll unverified and stale source states remain explicit");
+        Check(powerPathSnapshot.AnalysisLoadSource == "CONNECTOR_POWER" && powerPathSnapshot.DifferentialModelFitted && powerPathSnapshot.DifferentialModelSlope == -0.0002 && powerPathSnapshot.ExpectedVoltage == 12.0 && powerPathSnapshot.Residual == -0.2, "Analysis load and differential prediction fields are decoded");
+        Check(powerPathSnapshot.ResidualDetectorAlert && powerPathSnapshot.ResidualDetectorStatus == "SUDDEN_DROOP", "Residual detector state is decoded");
+        Check(powerPathSnapshot.WatchdogAvailable && powerPathSnapshot.WatchdogReadOnly && powerPathSnapshot.WatchdogNoSafetyCertification && powerPathSnapshot.WatchdogBoardPower == 440, "Power-limit watchdog remains read-only in the GUI model");
+        Check(powerPathSnapshot.IncidentCount == 1 && powerPathSnapshot.ActiveIncidentCount == 1 && powerPathSnapshot.LatestIncidentState == "LATCHED", "Incident count and lifecycle state are decoded");
+        var unavailableLoad = Snapshot.Parse($"{{\"timestamp_utc\":\"{now:O}\",\"analysis_load\":{{\"Source\":\"CONNECTOR_POWER\",\"IsAvailable\":false,\"Freshness\":{{\"IsFresh\":false,\"Kind\":\"VerifiedSourceTimestamp\"}}}}}}");
+        Check(unavailableLoad.AnalysisLoadStatus == "STALE" && unavailableLoad.AnalysisLoadValue == null, "Unavailable selected load stays blank and explicitly stale");
         var csv = TelemetryStore.ParseCsv("one,\"two,three\",\"a\"\"b\"");
         Check(csv.SequenceEqual(new[] { "one", "two,three", "a\"b" }), "CSV quoting and escaped quotes");
         var bounded = new BoundedBuffer<int>(7);
