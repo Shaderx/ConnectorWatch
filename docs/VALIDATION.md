@@ -1,6 +1,6 @@
 # Validation and release limits
 
-ConnectorWatch v1.1.1 is an experimental release. The checks below describe what can be reproduced offline from the source tree and what remains outside that evidence. A public build is not declared hardware-tested here; hardware validation must be confirmed separately for the exact published artifact and machine.
+ConnectorWatch vNext is experimental. The checks below describe what can be reproduced offline from the source tree and what remains outside that evidence. A public build is not declared hardware-tested here; hardware validation must be confirmed separately for the exact published artifact and machine.
 
 ## Reproduce the offline checks
 
@@ -13,7 +13,9 @@ dotnet run --project .\src\ConnectorWatch.Gui\ConnectorWatch.Gui.csproj -- --dem
 
 The daemon self-test uses parser, analysis, persistence, control, and native-decoder fixtures. It does not initialize NVML, load NVAPI, invoke the direct reader, or query a GPU. The GUI command uses synthetic demo data and checks dashboard/tray behavior without attaching to a live daemon. These are safe offline checks; they do not prove that a physical sensor source is correct.
 
-The current vNext offline results include the existing daemon control/storage/native ABI suite, typed electrical/provenance/freshness fixtures, bounded NDJSON-tail regressions, and reference lifecycle fixtures. The lifecycle checks cover candidate/non-acceptance, explicit freeze and archive, identity mismatch, restart/degraded classification, legacy migration, and GUI compatibility mapping. The daemon suite passes, both daemon and GUI projects build with zero warnings, and seven synthetic UI/tray lifecycle checks pass. These results cover source-tree behavior only and do not certify a physical sensor, connector, or packaged artifact.
+The current vNext offline results include the existing daemon control/storage/native ABI suite plus typed electrical/provenance/freshness, bounded NDJSON-tail, reference lifecycle, deterministic replay, robust differential modelling, fast/EWMA residual detection, incident latching, recorded-data characterization, read-only power-limit monitoring, and disabled mock-mitigation fixtures. The daemon suite passes, both daemon and GUI projects build with zero warnings, and the synthetic UI/tray checks pass. These results cover source-tree behavior only and do not certify a physical sensor, connector, or packaged artifact.
+
+The repository disables shared Roslyn compilation because the compiler-server process was observed crashing under concurrent Windows builds. Run daemon and GUI builds serially; this changes build-process reuse, not application behavior.
 
 To make a release package after the source checks pass:
 
@@ -35,8 +37,15 @@ The intended self-contained output is `dist/ConnectorWatch-win-x64`. The package
 | Direct decoder | ABI fixtures, buffer-size checks, canaries, metadata, freshness markers, and worker timeout ownership are covered offline | The direct native provider still requires the supported Windows board/driver and separate physical validation |
 | Detector | Bin learning, stable-sample gating, persisted references, rolling windows, percentile markers, gaps, repeated timestamps, and threshold transitions are covered | Thresholds are comparisons, not safety limits |
 | Reference lifecycle | Typed identity, candidate versus frozen accepted model, explicit accept/archive commands, legacy migration, restart/degraded/mismatch state, immutable archive history, and status exposure are covered | Acceptance is an operator review action; it does not certify hardware health or connector safety |
-| Files | Atomic status, daily telemetry, transition events, baseline identity, and single-writer behavior are covered | Disk retention is manual and can grow until archived or deleted |
-| GUI | Synthetic history, histogram eligibility, warning acknowledgement, bounds, truncation, unavailable state, close-to-tray, reopen, and tray lifecycle are covered | WPF rendering and Windows notification behavior can vary by framework and host |
+| Differential model | Qualified learning, robust fitting, frozen artifact/hash, identity matching, expected voltage, residual, slope units, and insufficient-evidence states are covered | A V/A or V/W association is descriptive and is not connector resistance or causality |
+| Residual detection | Abrupt fast-path and time-aware EWMA changes, gaps, poor quality, and recovery are covered with deterministic fixtures | Synthetic thresholds and latency do not establish physical warning performance |
+| Replay | Healthy, noisy, gradual-sag, abrupt, missing, stale, and restart fixtures produce deterministic precision/recall/latency and status metrics | Synthetic replay complements but does not replace representative recorded traces |
+| Incidents | Deterministic latching, bounded pre/trigger/post windows, persistence, acknowledgement, resolution, and restart behavior are covered | Acknowledgement records operator attention; it cannot clear evidence or accept a reference |
+| Recorded data | CSV/JSON/JSONL/NDJSON ingestion, cadence, gaps, duplicates, coverage, ranges, associations, and evidence labels are covered | Characterization is descriptive; incomplete channels and long capture gaps remain explicit |
+| Power-limit watchdog | Read-only baseline, drift, stale/unavailable readings, identity and clock discontinuities, latching, and persistence are covered | It observes the reported limit and cannot prove firmware behavior or prevent a fault |
+| Optional mitigation | Disabled-by-default, finite identity-bound lease, strict downward-only floor/target rules, audit-before-write, readback, restart re-arm, and adversarial fake-adapter behavior are covered | The production daemon has no power-limit write adapter; mitigation is not enabled or hardware-tested |
+| Files | Atomic status, daily telemetry, transition events, models, incidents, baseline identity, and single-writer behavior are covered | Disk retention is manual and can grow until archived or deleted |
+| GUI | Typed source/freshness/load, reference/model/incident/watchdog states, synthetic history, acknowledgement, bounds, truncation, unavailable state, close-to-tray, reopen, and tray lifecycle are covered | WPF rendering and Windows notification behavior can vary by framework and host |
 | Memory hardening | Bounded buffers, FIFO identifier sets, large-record handling, locked-file recovery, pooled history reads, redraw retention, and native worker behavior are covered in finite tests | These tests are not a multi-day driver or WPF reliability certification |
 
 ## Memory-hardening results

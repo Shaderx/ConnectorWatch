@@ -54,6 +54,18 @@ are not altered by later learning. The current state, compatibility, candidate,
 accepted snapshot, and migration detail are exposed under
 `reference_lifecycle` in `status.json` and live status.
 
+Operator actions are available through the same identity-checked control pipe:
+
+```powershell
+.\ConnectorWatch.exe --config .\config.json --accept-reference --operator "name" --note "known-good inspection"
+.\ConnectorWatch.exe --config .\config.json --migrate-reference --operator "name" --note "reviewed legacy evidence"
+.\ConnectorWatch.exe --config .\config.json --archive-reference --operator "name" --note "hardware changed"
+.\ConnectorWatch.exe --config .\config.json --acknowledge-incident --incident-id "incident-id" --operator "name"
+.\ConnectorWatch.exe --config .\config.json --resolve-incident --incident-id "incident-id" --operator "name" --note "inspection complete"
+```
+
+Acknowledgement records that an incident was seen. It does not resolve the incident, change detector state, or accept a reference.
+
 Start the dashboard with `ConnectorWatch.Gui.exe` or `Start-GUI.cmd`. It starts one hidden daemon when the data directory is not already owned and attaches to an existing compatible daemon when one is running. To run without a window, start `ConnectorWatch.exe`, `Start.cmd`, or `RunBackground.ps1` from the extracted directory. The headless executable has no tray icon.
 
 Pressing **X** or **Alt+F4** hides the dashboard in the notification area; monitoring continues. Use the tray menu or double-click the icon to restore it. **Exit GUI — keep monitoring** closes the dashboard and leaves the daemon running. **Stop monitoring and exit** requests a graceful daemon stop and waits for its stopped state.
@@ -85,6 +97,9 @@ The daemon writes these files under `DataDirectory`:
 | `events.csv` | Status transitions and details |
 | `baseline.json` | Compatibility mirror with the historical `Bins` shape; accepted values only populate `Reference` |
 | `reference.json` | Versioned candidate/accepted reference lifecycle, identity, archives, and migration metadata |
+| `differential-model.json` | Frozen identity-bound robust model fitted only from qualified accepted-reference evidence |
+| `incidents.json` | Latched incident summaries, acknowledgement/resolution records, and bounded forensic windows |
+| `power-limit-watchdog.json` | Read-only observed power-limit baseline and drift history |
 | `monitor.lock` | Single-writer guard for the data directory |
 
 The dashboard shows stale or stopped readings as unavailable. It records monitoring loss separately, including when the native daemon terminates. Windows notification settings can suppress tray notifications; the dashboard banner and warning history remain available. When the dashboard owns presentation, only one GUI receives the daemon's heartbeat lease. If it exits unexpectedly, the daemon resumes headless warnings, including for an active warning that began while the GUI owned presentation.
@@ -103,9 +118,13 @@ An abrupt process termination can lose the unflushed interval. Checkpoints use n
 
 The default analyzer uses 25 W load bins, ignores analysis below 100 W, and waits for five successive fresh samples in a bin. The first 300 eligible readings learn a candidate median and fifth percentile for each bin. The candidate remains unverified until an operator explicitly accepts it; only then does the rolling window compare against those frozen values. The rolling window contains at most 60 eligible readings no older than 30 minutes. The example thresholds are a 0.20 V sustained median or fifth-percentile loss, and a 0.25 V single-reading sudden droop, with five consecutive eligible updates required for a sustained alert.
 
+Acceptance also freezes a robust differential voltage model using one explicitly labelled load proxy plus available board-power, temperature, fan, and thermal features. The live residual is observed voltage minus model-expected voltage. A fast residual detector catches abrupt changes while a time-aware EWMA looks for persistent drift; gaps, poor coverage, and identity changes make the result unavailable or degraded. A reported voltage-per-amp or voltage-per-watt slope is descriptive evidence, not a connector-resistance measurement. Incidents latch detector evidence with bounded pre-trigger and post-trigger observations so a transient cannot disappear merely because the live value recovers.
+
 These thresholds are comparison settings, not electrical safety limits. Recheck a change at similar steady power and temperature. A source gap, restart, repeated timestamp, or load transition interrupts continuity and requires settling again. A saved reference belongs to its source, GPU, and configuration. Identity mismatch is reported as `REFERENCE_INVALID`; source degradation reports `REFERENCE_STALE` without deleting the accepted snapshot. Use the explicit `archive-reference` operation after changing a cable, PSU, sensor, GPU, or analysis configuration instead of resetting state merely to silence an alert. A legacy `baseline.json` is imported as an unverified candidate and requires explicit migration acknowledgement; migration never claims that the old values were known healthy.
 
 The direct reader is guarded by the target identity and topology checks described in [the architecture](docs/ARCHITECTURE.md). Its native setup is fail-closed: a rejected identity, multiple GPUs, incompatible driver or board, missing library, failed initialization, or possible native timeout records voltage as unavailable and does not retry or silently switch sources. NVML sensor fields that fail independently are left blank. The daemon never converts GPU core voltage or total board power into a connector-voltage measurement.
+
+The power-limit watchdog is observation-only: it detects reported-limit changes, stale readings, and identity discontinuities but contains no write path. The optional downward-only mitigation design remains disabled and mock-only; this release has no native adapter that can change a GPU power limit.
 
 ## Build, publish, and offline checks
 
@@ -138,7 +157,13 @@ The WPF demo and UI self-test use synthetic data and do not attach to a live dae
 dotnet run --project .\src\ConnectorWatch.Gui\ConnectorWatch.Gui.csproj -- --demo --ui-self-test --test-output .\gui-tests.json
 ```
 
-See [docs/VALIDATION.md](docs/VALIDATION.md) for the tested behavior and the limits of those checks. A passing offline self-test does not validate a user's GPU, driver, cabling, connector, or public release build.
+Recorded CSV/JSON evidence can be characterized without initializing NVML or the direct reader:
+
+```powershell
+dotnet run --project .\src\ConnectorWatch\ConnectorWatch.csproj -- --characterize .\data
+```
+
+See [docs/REPLAY.md](docs/REPLAY.md) for deterministic replay, [docs/RECORDED-DATA-CHARACTERIZATION.md](docs/RECORDED-DATA-CHARACTERIZATION.md) for the captured-data report, and [docs/VALIDATION.md](docs/VALIDATION.md) for tested behavior and limitations. A passing offline self-test does not validate a user's GPU, driver, cabling, connector, or public release build.
 
 ## Support boundary
 
