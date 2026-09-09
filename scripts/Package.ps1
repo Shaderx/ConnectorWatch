@@ -14,7 +14,7 @@ $stage = Join-Path $output 'stage'
 & "$PSScriptRoot/Publish.ps1" -OutputDirectory $stage
 $config = Get-Content "$stage/config.json" -Raw | ConvertFrom-Json
 if ($config.GpuUuid -ne '' -or $config.DataDirectory -ne 'data') { throw 'Release configuration must be unconfigured.' }
-if (Get-ChildItem $stage -Recurse -File | Where-Object { $_.Extension -in @('.pdb','.log') -or $_.Name -in @('status.json','baseline.json','events.csv','monitor.lock') -or $_.Name -like 'telemetry-*' }) { throw 'Runtime data or debug files found in release' }
+if (Get-ChildItem $stage -Recurse -File | Where-Object { $_.Extension -in @('.pdb','.log') -or $_.Name -in @('status.json','baseline.json','events.csv','monitor.lock','confidence-history.json') -or $_.Name -like 'telemetry-*' }) { throw 'Runtime data or debug files found in release' }
 & "$stage/ConnectorWatch.exe" --self-test
 if ($LASTEXITCODE -ne 0) { throw 'Packaged daemon tests failed' }
 $guiReport = Join-Path $output 'gui-tests.json'
@@ -30,6 +30,9 @@ foreach ($test in @(@('--self-test', $guiReport), @('--demo --ui-self-test', $ui
     } finally { $process.Dispose() }
 }
 $archive = Join-Path $output "ConnectorWatch-v$version-win-x64.zip"
+$releaseNotes = Join-Path $root "docs/RELEASE-$version.md"
+if (-not (Test-Path $releaseNotes)) { throw "Release notes missing: $releaseNotes" }
+Copy-Item $releaseNotes (Join-Path $output 'RELEASE-NOTES.md')
 Compress-Archive -Path "$stage/*" -DestinationPath $archive
 $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText((Join-Path $output 'SHA256SUMS.txt'), "$hash  $([IO.Path]::GetFileName($archive))`n")

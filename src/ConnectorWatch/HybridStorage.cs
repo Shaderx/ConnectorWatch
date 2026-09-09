@@ -9,6 +9,8 @@ public sealed class HybridStorage
     readonly Dictionary<string, StringBuilder> pending = new();
     int pendingChars;
     double lastFlush;
+    string? lastBaseline;
+    bool baselineWritten;
     readonly string directory;
     readonly double interval;
     public HybridStorage(string directory, double interval) { this.directory = directory; this.interval = interval; }
@@ -36,7 +38,12 @@ public sealed class HybridStorage
             writer.Write(entry.Value.ToString());
         }
         pending.Clear(); pendingChars = 0;
-        Atomic(Path.Combine(directory, "baseline.json"), baseline);
+        if (!baselineWritten || !string.Equals(lastBaseline, baseline, StringComparison.Ordinal))
+        {
+            Atomic(Path.Combine(directory, "baseline.json"), baseline);
+            lastBaseline = baseline;
+            baselineWritten = true;
+        }
         Atomic(Path.Combine(directory, "status.json"), status);
         lastFlush = elapsed;
     }

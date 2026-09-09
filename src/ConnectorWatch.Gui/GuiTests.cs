@@ -10,7 +10,41 @@ public static class GuiTests
     {
         var checks = new List<string>();
         void Check(bool ok, string name) { if (!ok) throw new Exception("FAIL: " + name); checks.Add(name); }
+        ElectricalTrendTests.Run(Check);
+        DegradationConfidenceTests.Run(Check);
+        ConfidenceHistoryTests.Run(Check);
         var now = DateTimeOffset.UtcNow;
+        var collecting = Snapshot.Parse("""
+            {"electrical":{"Connector":{"Voltage":{"Value":12.08},"Power":{"Value":34.5}},"Freshness":{"IsFresh":true,"Kind":"HostPollTimestampUnverified"}},
+             "analysis_load":{"Value":34.5,"IsAvailable":true,"Freshness":{"IsFresh":true,"Kind":"HostPollTimestampUnverified"}},
+             "acquisition":{"status":"SENSOR_UNCHARACTERIZED"},"differential_model":{"state":null,"is_loaded":false}}
+            """);
+        Check(MainWindow.QualitySummary(collecting).Length == 0,
+            "Fresh telemetry with unverified source timing and no learned model is not labeled degraded: " + MainWindow.QualitySummary(collecting));
+        collecting.Status = "OUTSIDE_ANALYSIS_RANGE";
+        collecting.ReferenceCompatibility = "LEGACY";
+        var collectingMessage = MainWindow.StatusMessage(collecting, true, 100);
+        Check(collectingMessage.StartsWith("Receiving telemetry.") && collectingMessage.Contains("timing is unverified") &&
+            collectingMessage.Contains("no model loaded") && collectingMessage.Contains("accepted compatible reference") && collectingMessage.Contains("above 100 W"),
+            "Live banner explains timing, model and reference limitations without implying missing samples");
+        collecting.ResidualDetectorAlert = true; collecting.ResidualDetectorStatus = "SUDDEN_DROOP";
+        Check(MainWindow.StatusMessage(collecting, true, 100, "Settings saved", "read failed").StartsWith("Sudden voltage drop"),
+            "Residual alert takes priority over readiness, operation and read messages");
+        Check(MainWindow.StatusMessage(collecting, false, 100).StartsWith("Monitoring unavailable"), "Historical alerts cannot imply live telemetry");
+        collecting.ResidualDetectorAlert = false; collecting.IncidentCount = 12; collecting.ActiveIncidentCount = 0;
+        Check(MainWindow.QualitySummary(collecting).Length == 0, "Resolved incident history does not degrade live telemetry");
+        collecting.ActiveIncidentCount = 1;
+        Check(MainWindow.StatusMessage(collecting, true, 100).StartsWith("1 active incident"), "Active incidents remain prominent");
+        collecting.ActiveIncidentCount = 0; collecting.ElectricalStatus = "STALE";
+        Check(MainWindow.StatusMessage(collecting, true, 100).StartsWith("Telemetry degraded: electrical stale"), "Stale electrical measurements still report degraded telemetry");
+        collecting.Status = "BASELINE_SHIFT";
+        Check(MainWindow.StatusMessage(collecting, true, 100).StartsWith("Sustained voltage shift"), "Trend alerts remain prominent even with degraded measurements");
+        collecting.Status = "NO_SHIFT_DETECTED"; collecting.ElectricalStatus = "AVAILABLE"; collecting.AnalysisLoadStatus = "AVAILABLE";
+        collecting.AcquisitionStatus = "HEALTHY"; collecting.ReferenceCompatibility = "COMPATIBLE";
+        collecting.DifferentialModelFitted = true; collecting.DifferentialModelState = "FITTED";
+        Check(!MainWindow.StatusMessage(collecting, true, 100).Contains("unavailable"), "Fitted healthy model does not show a missing-model warning");
+        collecting.AcquisitionStatus = "SOURCE_ERROR";
+        Check(MainWindow.StatusMessage(collecting, true, 100).StartsWith("Telemetry degraded:"), "Acquisition faults remain degraded");
         var logDirectory = Path.Combine(Path.GetTempPath(), "ConnectorWatch-log-test-" + Guid.NewGuid().ToString("N"));
         try
         {

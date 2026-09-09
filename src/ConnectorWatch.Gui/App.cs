@@ -34,6 +34,8 @@ public sealed class GuiSettings
     public double Top { get; set; } = -1;
     public int RangeMinutes { get; set; } = 15;
     public bool ShowPcie { get; set; }
+    public int ConfidenceRangeDays { get; set; } = 30;
+    public string ConfidenceCohort { get; set; } = "";
     public bool CloseTipShown { get; set; }
     public string[] Acknowledged { get; set; } = Array.Empty<string>();
     public Incident[] LocalIncidents { get; set; } = Array.Empty<Incident>();
@@ -160,8 +162,15 @@ public sealed class App : Application
             {
                 await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
                 window.UpdateLayout();
-                var visual = (FrameworkElement)window.Content;
-                var bmp = new RenderTargetBitmap((int)visual.ActualWidth, (int)visual.ActualHeight, 96, 96, PixelFormats.Pbgra32); bmp.Render(visual);
+                var visual = args.Contains("--render-confidence") ? window.ConfidencePreview! : args.Contains("--render-electrical") ? window.ElectricalTrendPreview! : (FrameworkElement)window.Content;
+                var bmp = new RenderTargetBitmap((int)visual.ActualWidth, (int)visual.ActualHeight, 96, 96, PixelFormats.Pbgra32);
+                if (args.Contains("--render-electrical") || args.Contains("--render-confidence"))
+                {
+                    var drawing = new DrawingVisual();
+                    using (var dc = drawing.RenderOpen()) dc.DrawRectangle(new VisualBrush(visual), null, new Rect(0, 0, visual.ActualWidth, visual.ActualHeight));
+                    bmp.Render(drawing);
+                }
+                else bmp.Render(visual);
                 var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bmp));
                 using (var f = File.Create(Option(args, "--render")!)) encoder.Save(f);
                 await window.ExitGui();

@@ -144,6 +144,7 @@ public static class Tests
             "desktop alert status filter");
         ControlServerTests.Run();
         HybridStorageTests.Run();
+        TelemetryCompressionTests.Run();
         DirectNvRailsTests.Run();
         ElectricalSamplesTests.Run();
         RailJsonTailTests.Run();

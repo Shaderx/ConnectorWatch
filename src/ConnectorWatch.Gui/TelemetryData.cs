@@ -15,6 +15,14 @@ public sealed record PointSample(DateTimeOffset Time, DateTimeOffset SensorTime,
 {
     public bool Eligible => Bin.HasValue && Status is "LEARNING_REFERENCE" or "REFERENCE_UNVERIFIED" or "WINDOW_WARMUP" or "NO_SHIFT_DETECTED" or "SUDDEN_DROOP" or "BASELINE_SHIFT";
     public bool Alert => Status is "SUDDEN_DROOP" or "BASELINE_SHIFT";
+
+    // These fields are additive so older callers can keep using the compact
+    // positional constructor.  Older telemetry has no provenance columns;
+    // spelling that out prevents an empty source from looking like a shared
+    // context in the trend view.
+    public string SourceIdentity { get; init; } = "Unknown";
+    public string FreshnessKind { get; init; } = "Unknown";
+    public string AcquisitionHealth { get; init; } = "Unknown";
 }
 public sealed record Incident(string Id, DateTimeOffset Time, string Status, string Detail, double? Voltage = null, double? Drop = null, int? Bin = null);
 public sealed record SnapshotIncident(string Id, string Detector, string Status, string Severity, string State,
@@ -450,7 +458,38 @@ public sealed class TelemetryStore
             Number(Get("input_voltage_v")) is not double v || v < 6 || v > 16) return null;
         double? pcie = null;
         try { using var ex = JsonDocument.Parse(Get("extra_voltages_json")); pcie = Snapshot.Num(ex.RootElement, "pcie_12v_v"); } catch (JsonException) { }
-        return new(t, sensor, v, pcie, Number(Get("analysis_power_w")), (int?)Number(Get("bin_w")), Get("status"), Number(Get("reference_v")), Number(Get("rolling_p05_v")), Number(Get("median_drop_v")), Get("detail"));
+        var sample = new PointSample(t, sensor, v, pcie, Number(Get("analysis_power_w")),
+            (int?)Number(Get("bin_w")), Get("status"), Number(Get("reference_v")),
+            Number(Get("rolling_p05_v")), Number(Get("median_drop_v")), Get("detail"))
+        {
+            SourceIdentity = ComposeSourceIdentity(Get("gpu_uuid"),
+                FirstNonEmpty(Get("electrical_source"), Get("voltage_source")),
+                Get("analysis_power_source"), Get("analysis_load_unit")),
+            FreshnessKind = FirstNonEmpty(Get("electrical_freshness_kind"), "Unknown"),
+            AcquisitionHealth = FirstNonEmpty(Get("acquisition_health"), "Unknown"),
+        };
+        return sample;
+    }
+    static string FirstNonEmpty(string preferred, string fallback) =>
+        string.IsNullOrWhiteSpace(preferred) ? fallback : preferred;
+    static readonly object SourceIdentityCacheGate = new();
+    static readonly Dictionary<string, string> SourceIdentityCache = new(StringComparer.Ordinal);
+    const int SourceIdentityCacheCapacity = 256;
+    internal static string ComposeSourceIdentity(string gpuUuid, string electricalSource,
+        string analysisPowerSource, string analysisLoadUnit)
+    {
+        var values = new[] { gpuUuid, electricalSource, analysisPowerSource, analysisLoadUnit };
+        if (values.All(string.IsNullOrWhiteSpace)) return "Unknown";
+        var identity = string.Join(" | ", values.Select(value => string.IsNullOrWhiteSpace(value) ? "Unknown" : value.Trim()));
+        // CSV rows usually repeat a small set of source contexts.  Reuse those
+        // strings without an unbounded global intern table; once the bounded
+        // cache is full, a new identity simply remains local to its sample.
+        lock (SourceIdentityCacheGate)
+        {
+            if (SourceIdentityCache.TryGetValue(identity, out var existing)) return existing;
+            if (SourceIdentityCache.Count < SourceIdentityCacheCapacity) SourceIdentityCache[identity] = identity;
+        }
+        return identity;
     }
     public static double? Number(string s) => double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var n) && double.IsFinite(n) ? n : null;
     sealed class Cursor

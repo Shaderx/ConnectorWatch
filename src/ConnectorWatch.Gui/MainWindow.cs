@@ -35,6 +35,23 @@ public sealed class MainWindow : Window
     readonly Border banner = new() { CornerRadius = new CornerRadius(8), Padding = new Thickness(14, 10, 14, 10), Margin = new Thickness(0, 0, 0, 14) };
     readonly ProgressBar progress = new() { Height = 5, Margin = new Thickness(0, 12, 0, 12), Maximum = 300, Foreground = Palette.Cyan, Background = Palette.Line, BorderThickness = new Thickness(0) };
     readonly HistoryPlot history = new() { Height = 170 };
+    readonly ElectricalTrendPlot electricalTrend = new() { Height = 190 };
+    readonly ConfidencePlot confidencePlot = new() { Height = 180 };
+    readonly TextBlock confidenceValue = Text("Learning", 28), confidenceCaption = Text("Gathering comparable days…", 12), confidenceDetails = Text("", 10);
+    readonly ComboBox confidenceRange = new() { Width = 100 }, confidenceCohort = new() { MinWidth = 180 };
+    readonly ConfidenceHistory? confidenceHistory;
+    readonly List<ConfidenceDay> confidenceDemoDays = new();
+    bool confidenceReadBusy;
+    DateTimeOffset confidenceLastRead;
+    bool renderingConfidence;
+    IReadOnlyList<ConfidenceDay>? confidenceRenderedDays;
+    (string Cohort, int Range, DateTime Day, bool Reading, double ShiftVolts) confidenceRenderedSelection;
+    internal FrameworkElement? ConfidencePreview { get; private set; }
+    readonly TextBlock electricalTrendSummary = Text("", 11);
+    readonly ComboBox electricalTrendBin = new() { MinWidth = 150 }, electricalTrendMode = new() { MinWidth = 155 };
+    internal FrameworkElement? ElectricalTrendPreview { get; private set; }
+    DateTimeOffset trendBuiltAt;
+    (int Range, DateTimeOffset? Focus, int? Bin, bool Initial)? trendSelection;
     readonly HistogramPlot histogram = new() { Height = 130 };
     readonly ComboBox range = new() { Width = 115 }, bins = new() { MinWidth = 170 };
     readonly CheckBox overlay = new() { Content = "PCIe overlay", Foreground = Palette.Muted, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(14, 0, 0, 0) };
@@ -56,6 +73,7 @@ public sealed class MainWindow : Window
     {
         this.configPath = configPath; this.config = config; this.data = data; this.settingsPath = settingsPath; this.demo = demo; this.noStart = noStart; this.render = render;
         store = new(data); client = new(data);
+        confidenceHistory = demo ? null : new ConfidenceHistory(data, Path.Combine(data, "confidence-history.json"), config.BinWatts);
         try { if (File.Exists(settingsPath)) settings = JsonSerializer.Deserialize<GuiSettings>(TelemetryStore.ReadShared(settingsPath)) ?? new(); } catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { }
         foreach (var id in settings.Acknowledged ?? Array.Empty<string>()) acknowledged.Add(id);
         if (!demo) { localIncidents.AddRange(settings.LocalIncidents ?? Array.Empty<Incident>()); store.Incidents.AddRange(localIncidents); }
@@ -110,6 +128,16 @@ public sealed class MainWindow : Window
             var card = Panel(Vertical(label, values[i], notes[i])); card.Margin = new Thickness(i == 0 ? 0 : 5, 0, i == 3 ? 0 : 5, 0); Grid.SetColumn(card, i); cards.Children.Add(card);
         }
         content.Children.Add(cards);
+        foreach (var text in new[] { "7 days", "30 days", "90 days" }) confidenceRange.Items.Add(text);
+        confidenceRange.SelectedIndex = settings.ConfidenceRangeDays == 7 ? 0 : settings.ConfidenceRangeDays == 90 ? 2 : 1;
+        settings.ConfidenceRangeDays = confidenceRange.SelectedIndex == 0 ? 7 : confidenceRange.SelectedIndex == 2 ? 90 : 30;
+        confidenceRange.SelectionChanged += (_, _) => { settings.ConfidenceRangeDays = confidenceRange.SelectedIndex == 0 ? 7 : confidenceRange.SelectedIndex == 2 ? 90 : 30; RenderConfidence(); SaveSettings(); };
+        confidenceCohort.Items.Add("Automatic comparison"); confidenceCohort.SelectedIndex = 0;
+        confidenceCohort.SelectionChanged += (_, _) => { if (renderingConfidence) return; settings.ConfidenceCohort = (confidenceCohort.SelectedItem as ConfidenceCohortChoice)?.Key ?? ""; RenderConfidence(); SaveSettings(); };
+        var confidenceAdvanced = new Expander { Header = "Comparison details", Foreground = Palette.Muted, Content = Vertical(confidenceCohort, confidenceDetails), Margin = new Thickness(0, 6, 0, 0) };
+        var confidencePanel = Panel(Vertical(Header("Electrical degradation confidence", confidenceRange), confidenceValue, confidenceCaption, confidencePlot,
+            Text("Higher means stronger evidence of a persistent voltage decline under similar load.\nExperimental evidence score, not a measured probability of hardware damage. Updated from completed days.", 10), confidenceAdvanced));
+        ConfidencePreview = confidencePanel; confidencePanel.Margin = new Thickness(0, 0, 0, 16); content.Children.Add(confidencePanel);
         powerPath.Foreground = Palette.Text; degradation.Foreground = Palette.Amber;
         var pathPanel = Panel(Vertical(Header("Power path and data quality"), powerPath, degradation)); pathPanel.Margin = new Thickness(0, 0, 0, 16); content.Children.Add(pathPanel);
         range.Items.Add("15 minutes"); range.Items.Add("1 hour"); range.Items.Add("24 hours");
@@ -120,6 +148,17 @@ public sealed class MainWindow : Window
         range.Margin = new Thickness(14, 0, 0, 0);
         var legend = Text("16-pin input  •  cyan     PCIe supply  •  violet     Alert  •  red", 10); legend.Foreground = Palette.Muted;
         var chartPanel = Panel(Vertical(Header("Voltage history", chartOptions), history, legend)); chartPanel.Margin = new Thickness(0, 0, 0, 16); content.Children.Add(chartPanel);
+        electricalTrendBin.Items.Add("Most sampled load"); electricalTrendBin.SelectedIndex = 0;
+        electricalTrendMode.Items.Add("Initial observation"); electricalTrendMode.Items.Add("Recorded reference"); electricalTrendMode.SelectedIndex = 0;
+        electricalTrendBin.SelectionChanged += (_, _) => { if (!busy) RenderData(); };
+        electricalTrendMode.SelectionChanged += (_, _) => { if (!busy) RenderData(); };
+        var trendOptions = new WrapPanel();
+        trendOptions.Children.Add(Text("Compare with  ", 11)); trendOptions.Children.Add(electricalTrendMode);
+        electricalTrendBin.Margin = new Thickness(12, 0, 0, 0); trendOptions.Children.Add(electricalTrendBin);
+        var trendPanel = Panel(Vertical(Header("Electrical degradation trend"), trendOptions, electricalTrend, electricalTrendSummary,
+            Text("Up = lower voltage at comparable load. Shading = observed 5th–95th percentile spread, not a confidence interval.\nThis comparison does not establish connector damage. Uses the time range above; history is retained up to 24 hours.", 10)));
+        ElectricalTrendPreview = trendPanel;
+        trendPanel.Margin = new Thickness(0, 0, 0, 16); content.Children.Add(trendPanel);
         var middle = new Grid { Margin = new Thickness(0, 0, 0, 16) }; middle.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.3, GridUnitType.Star) }); middle.ColumnDefinitions.Add(new ColumnDefinition());
         bins.Items.Add("Current load bin"); bins.Items.Add("All loads (descriptive)"); bins.SelectedIndex = 0;
         bins.SelectionChanged += (_, _) => { if (!busy) RenderData(); };
@@ -199,6 +238,7 @@ public sealed class MainWindow : Window
                 connected = await client.Send("hello") != null;
                 if (connected) await client.Send("lease");
                 await store.RefreshAsync();
+                QueueConfidenceRefresh();
                 if (store.ReadError.Length > 0) GuiLog.Current.Write("telemetry_read_error", new { data, store.ReadError }, throttle: true);
             }
             var s = store.Current; bool fresh = s?.Fresh(config.MaxAgeSeconds) == true;
@@ -247,10 +287,9 @@ public sealed class MainWindow : Window
         change.Text = fresh && s?.Drop is double dr ? $"{-dr * 1000:+0;−0;0} mV" : "—";
         referenceNote.Text = s?.Reference is double r ? $"Reference {r:F3} V" : "Awaiting a learned reference";
         bool alert = fresh && (s?.Status is "SUDDEN_DROOP" or "BASELINE_SHIFT" || s?.ResidualDetectorAlert == true || s?.ActiveIncidentCount > 0);
-        string quality = QualitySummary(s);
-        string message = operation.Length > 0 ? operation : store.ReadError.Length > 0 ? "Data read issue: " + store.ReadError : !fresh ? "Monitoring unavailable. Values shown in history are past observations." : quality.Length > 0 ? "Telemetry degraded: " + quality + "." : alert ? Friendly(s!.Status) + ". Save your work and reduce GPU load while investigating." : s!.Status == "OUTSIDE_ANALYSIS_RANGE" ? $"Collecting telemetry. Analysis starts during steady connector load above {config.MinAnalysisWatts} W." : Friendly(s!.Status) + ". Aggregate rail readings do not certify connector safety.";
+        string message = StatusMessage(s, fresh, config.MinAnalysisWatts, operation, store.ReadError);
         if (demo) message = "Synthetic demonstration — charts and warnings below are test data.";
-        bannerText.Text = message; bannerText.Foreground = alert ? Palette.Red : Palette.Muted;
+        bannerText.Text = message; bannerText.Foreground = alert ? Palette.Red : !fresh || QualitySummary(s).Length > 0 || store.ReadError.Length > 0 ? Palette.Amber : Palette.Muted;
         banner.Background = Palette.Panel; banner.BorderBrush = alert ? Palette.Red : Palette.Line; banner.BorderThickness = new Thickness(1);
         powerPath.Text = $"Source path  {SourceLabel(s)}\n16-pin  {FormatValue(s?.ConnectorVoltage ?? s?.Voltage, "V", 3)}  ·  {FormatValue(s?.ConnectorCurrent ?? s?.Current, "A", 2)}  ·  {FormatValue(s?.ConnectorPower ?? (s?.ElectricalSource.Length == 0 ? s?.Power : null), "W", 1)}\nPCIe  {FormatValue(s?.PcieVoltage ?? s?.Pcie, "V", 3)}  ·  {FormatValue(s?.PcieCurrent ?? s?.PcieCurrent, "A", 2)}  ·  {FormatValue(s?.PciePower, "W", 1)}\nSelected analysis load  {FormatValue(s?.AnalysisLoadValue, s?.AnalysisLoadUnit, 1)}  ·  {SourceLabel(s?.AnalysisLoadSource)}  ·  {s?.AnalysisLoadStatus ?? "UNAVAILABLE"}";
         degradation.Text = QualityDetails(s);
@@ -263,16 +302,33 @@ public sealed class MainWindow : Window
     static string FormatValue(double? value, string? unit, int decimals) => value is double number && double.IsFinite(number) ? number.ToString($"F{decimals}", CultureInfo.InvariantCulture) + (string.IsNullOrWhiteSpace(unit) ? "" : " " + unit) : "—";
     static string SourceLabel(Snapshot? s) => SourceLabel(s?.ElectricalSource ?? "");
     static string SourceLabel(string? source) => string.IsNullOrWhiteSpace(source) ? "Unavailable" : source;
-    static string QualitySummary(Snapshot? s)
+    internal static string QualitySummary(Snapshot? s)
     {
         if (s == null) return "";
         var states = new List<string>();
-        if (s.ElectricalStatus is "STALE" or "UNAVAILABLE" or "UNVERIFIED") states.Add("electrical " + s.ElectricalStatus.ToLowerInvariant());
-        if (s.AnalysisLoadStatus is "STALE" or "UNAVAILABLE" or "UNVERIFIED") states.Add("analysis load " + s.AnalysisLoadStatus.ToLowerInvariant());
-        if (s.AcquisitionStatus.Length > 0 && !string.Equals(s.AcquisitionStatus, "HEALTHY", StringComparison.OrdinalIgnoreCase)) states.Add("acquisition " + Friendly(s.AcquisitionStatus));
-        if (s.DifferentialModelState is "" or "UNAVAILABLE" or "UNFITTED") states.Add("differential model unavailable");
-        if (s.IncidentCount > 0) states.Add($"{s.ActiveIncidentCount} active incident(s) of {s.IncidentCount}");
+        if (s.ElectricalStatus is "STALE" or "UNAVAILABLE") states.Add("electrical " + s.ElectricalStatus.ToLowerInvariant());
+        if (s.AnalysisLoadStatus is "STALE" or "UNAVAILABLE") states.Add("analysis load " + s.AnalysisLoadStatus.ToLowerInvariant());
+        if (s.AcquisitionStatus.Length > 0 && s.AcquisitionStatus is not ("HEALTHY" or "SENSOR_UNCHARACTERIZED")) states.Add("acquisition " + Friendly(s.AcquisitionStatus));
         return string.Join("; ", states);
+    }
+    internal static string StatusMessage(Snapshot? s, bool fresh, int minWatts, string operation = "", string readError = "")
+    {
+        if (!fresh || s == null) return "Monitoring unavailable. Values shown in history are past observations.";
+        string alert = s.Status is "SUDDEN_DROOP" or "BASELINE_SHIFT" ? Friendly(s.Status) :
+            s.ResidualDetectorAlert ? Friendly(s.ResidualDetectorStatus) : s.ActiveIncidentCount > 0 ? $"{s.ActiveIncidentCount} active incident(s) need attention" : "";
+        if (alert.Length > 0) return alert + ". Save your work and reduce GPU load while investigating.";
+        if (operation.Length > 0) return operation;
+        if (readError.Length > 0) return "Data read issue: " + readError;
+        string quality = QualitySummary(s);
+        if (quality.Length > 0) return "Telemetry degraded: " + quality + ".";
+        var notes = new List<string>();
+        if (s.ElectricalStatus == "UNVERIFIED" || s.AnalysisLoadStatus == "UNVERIFIED") notes.Add("Sensor update timing is unverified.");
+        if (s.AcquisitionStatus == "SENSOR_UNCHARACTERIZED") notes.Add("Sensor response has not been characterized.");
+        if (s.DifferentialModelState is "" or "UNAVAILABLE") notes.Add("Differential analysis unavailable: no model loaded.");
+        else if (!s.DifferentialModelFitted) notes.Add("Differential model is not fitted yet.");
+        if (s.ReferenceCompatibility == "LEGACY") notes.Add("Saved reference is unverified; analysis needs an accepted compatible reference.");
+        string activity = s.Status == "OUTSIDE_ANALYSIS_RANGE" ? $"Waiting for steady connector load above {minWatts} W." : Friendly(s.Status) + ".";
+        return "Receiving telemetry. " + activity + (notes.Count > 0 ? " " + string.Join(" ", notes) : " Aggregate rail readings do not certify connector safety.");
     }
     static string QualityDetails(Snapshot? s)
     {
@@ -287,6 +343,120 @@ public sealed class MainWindow : Window
         if (bins.SelectedIndex == 1) return null;
         if (bins.SelectedItem is BinChoice b) return b.Value;
         return store.Current?.Bin;
+    }
+    void QueueConfidenceRefresh()
+    {
+        if (confidenceHistory == null || confidenceReadBusy || (DateTimeOffset.UtcNow - confidenceLastRead).TotalMinutes < 5) return;
+        confidenceReadBusy = true; confidenceLastRead = DateTimeOffset.UtcNow;
+        _ = Task.Run(async () =>
+        {
+            try { await confidenceHistory.RefreshAsync(DateTimeOffset.UtcNow); }
+            catch (Exception ex) { GuiLog.Current.Write("confidence_history_error", new { data }, ex, throttle: true); }
+            finally
+            {
+                if (!exiting) await Dispatcher.InvokeAsync(() => { confidenceReadBusy = false; RenderConfidence(); });
+            }
+        });
+    }
+    void RenderConfidence()
+    {
+        if (renderingConfidence) return;
+        renderingConfidence = true;
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            var days = demo ? (IReadOnlyList<ConfidenceDay>)confidenceDemoDays : confidenceHistory?.Days ?? Array.Empty<ConfidenceDay>();
+            var selection = (settings.ConfidenceCohort, settings.ConfidenceRangeDays, now.UtcDateTime.Date, confidenceReadBusy, config.ShiftVolts);
+            if (ReferenceEquals(days, confidenceRenderedDays) && selection == confidenceRenderedSelection) return;
+            var groups = days.Where(d => !string.IsNullOrWhiteSpace(d.Cohort)).GroupBy(d => d.Cohort).ToArray();
+            foreach (var group in groups)
+            {
+                if (confidenceCohort.Items.OfType<ConfidenceCohortChoice>().Any(c => c.Key == group.Key)) continue;
+                var last = group.OrderBy(d => d.Day).Last();
+                confidenceCohort.Items.Add(new ConfidenceCohortChoice(group.Key, $"{last.MinLoad:F0}–{last.MaxLoad:F0} W · {last.Day:dd MMM}"));
+            }
+            if (string.IsNullOrWhiteSpace(settings.ConfidenceCohort))
+            {
+                settings.ConfidenceCohort = groups.Where(g => g.Any(d => DegradationConfidence.SupportsDay(d, g.Key)))
+                    .OrderBy(g => g.Min(d => d.Day)).ThenByDescending(g => g.Sum(d => d.MinuteCount)).FirstOrDefault()?.Key ?? "";
+                if (settings.ConfidenceCohort.Length > 0 && !demo) SaveSettings();
+            }
+            confidenceCohort.SelectedItem = confidenceCohort.Items.OfType<ConfidenceCohortChoice>().FirstOrDefault(c => c.Key == settings.ConfidenceCohort) ?? (object)"Automatic comparison";
+            var end = new DateTimeOffset(now.UtcDateTime.Date, TimeSpan.Zero);
+            var from = end.AddDays(-settings.ConfidenceRangeDays);
+            bool confidenceConfigurationError = false;
+            IReadOnlyList<ConfidencePoint> points;
+            if (string.IsNullOrWhiteSpace(settings.ConfidenceCohort)) points = Array.Empty<ConfidencePoint>();
+            else
+            {
+                try { points = DegradationConfidence.Build(days, settings.ConfidenceCohort, now, config.ShiftVolts); }
+                catch (ArgumentOutOfRangeException) { points = Array.Empty<ConfidencePoint>(); confidenceConfigurationError = true; }
+            }
+            confidencePlot.From = from; confidencePlot.To = end;
+            confidencePlot.Points = points.Where(p => p.Day >= from && p.Day < end).ToArray();
+            var latest = points.LastOrDefault();
+            if (confidenceConfigurationError)
+            {
+                confidenceValue.Text = "Unavailable";
+                confidenceValue.Foreground = Palette.Amber;
+                confidenceCaption.Text = "Confidence unavailable: configure a finite positive voltage-shift threshold.";
+            }
+            else if (latest?.Score is double score)
+            {
+                confidenceValue.Text = $"{score:F0}%";
+                confidenceValue.Foreground = score >= 70 ? Palette.Red : score >= 35 ? Palette.Amber : Palette.Cyan;
+                string level = score >= 70 ? "Strong evidence" : score >= 35 ? "Some evidence" : "Little evidence";
+                confidenceCaption.Text = $"{level} of sustained voltage decline · through {latest.Day:dd MMM} · {latest.EvidenceDays} comparable days this week";
+            }
+            else
+            {
+                confidenceValue.Text = confidenceReadBusy && days.Count == 0 ? "Reading history…" : points.Any(p => p.Score.HasValue) ? "No recent comparison" : "Learning";
+                confidenceValue.Foreground = Palette.Muted;
+                confidenceCaption.Text = "Needs three comparable days. Missing measurements do not mean low degradation confidence.";
+            }
+            confidencePlot.EmptyText = confidenceConfigurationError ? "Confidence unavailable: configure a finite positive voltage-shift threshold." : confidenceReadBusy && days.Count == 0 ? "Reading recorded history…" : "Learning — needs three comparable days.";
+            confidenceDetails.Text = "Approximate load matching. Each day needs 10 sampled minutes across at least 30 minutes.\nConfidence combines the size, persistence and number of comparable days in the last week.\nThe voltage-drop threshold is " + (config.ShiftVolts * 1000).ToString("F0", CultureInfo.InvariantCulture) + " mV; this policy is not a calibrated failure probability. Sensor freshness may remain unverified. These readings cannot isolate the cause.\n" + (demo ? "Synthetic demonstration." : confidenceHistory?.Status ?? "Waiting for recorded data.");
+            if (confidenceConfigurationError)
+                confidenceDetails.Text = "Confidence unavailable because ShiftVolts is not finite and positive. The confidence score is an operational evidence summary, not a calibrated failure probability.";
+            confidenceDetails.ToolTip = settings.ConfidenceCohort;
+            confidenceRenderedDays = days;
+            confidenceRenderedSelection = (settings.ConfidenceCohort, settings.ConfidenceRangeDays, now.UtcDateTime.Date, confidenceReadBusy, config.ShiftVolts);
+            confidencePlot.InvalidateVisual();
+        }
+        finally { renderingConfidence = false; }
+    }
+    void RenderElectricalTrend(DateTimeOffset from, DateTimeOffset to)
+    {
+        int? chosen = (electricalTrendBin.SelectedItem as BinChoice)?.Value;
+        bool initial = electricalTrendMode.SelectedIndex == 0;
+        var selection = (settings.RangeMinutes, focusTime, chosen, initial);
+        // Minute aggregates need not be rebuilt on every one-second UI tick.
+        if (trendSelection == selection && (DateTimeOffset.UtcNow - trendBuiltAt).TotalSeconds < 10) return;
+        trendSelection = selection; trendBuiltAt = DateTimeOffset.UtcNow;
+        var candidates = store.Samples.Where(p => p.Time >= from && p.Time <= to && p.Eligible).ToArray();
+        foreach (int value in candidates.Where(p => p.Bin.HasValue).Select(p => p.Bin!.Value).Distinct().Order())
+            if (!electricalTrendBin.Items.OfType<BinChoice>().Any(b => b.Value == value)) electricalTrendBin.Items.Add(new BinChoice(value, config.BinWatts));
+        chosen ??= candidates.Where(p => p.Bin.HasValue && (initial || p.Reference.HasValue)).GroupBy(p => p.Bin)
+            .OrderByDescending(g => g.Count()).ThenBy(g => g.Key).FirstOrDefault()?.Key;
+        var result = ElectricalTrend.Build(store.Samples, from, to, chosen, Math.Max(config.MaxAgeSeconds, config.SampleSeconds * 2), initial);
+        electricalTrend.From = from; electricalTrend.To = to;
+        electricalTrend.Points = result.Points.Select(p => new TrendPlotPoint(p.Time, p.MedianDropMv, p.P05DropMv, p.P95DropMv,
+            p.SegmentId, p.Count, $"{p.Count} unique observations over {p.SpanSeconds:F1}s\nLoad {p.LoadMin:F1}–{p.LoadMax:F1} W\nComparison {p.Reference:F4} V\n" +
+            (p.Unverified ? "Source timing or reference is unverified; count does not imply independent measurements." : "Source-timestamp metadata recorded; count does not imply independent measurements."))).ToArray();
+        electricalTrend.EmptyText = result.Reason switch {
+            "NO_DATA" or "NO_LOAD_BIN" => "No comparable loaded observations in this range.",
+            "REFERENCE_UNAVAILABLE" => "No recorded reference. Choose Initial observation to compare recorded voltages.",
+            "SETTLING_OR_UNAVAILABLE" => "No settled, available readings for this load band.",
+            _ => "Need at least five comparable observations per interval."
+        };
+        var latest = result.Points.LastOrDefault(p => p.Supported);
+        string band = chosen.HasValue ? $"{chosen}–{chosen + config.BinWatts} W load band" : "No eligible load band";
+        string comparison = initial ? result.AnchorTime.HasValue ? $"Initial observation at {result.AnchorTime.Value.LocalDateTime:HH:mm:ss}; zero is the starting observation" : "Waiting for an initial observation interval" : "Recorded reference; historical reference acceptance is not verified by CSV";
+        electricalTrendSummary.Text = band + " · " + comparison + "\n" +
+            (latest == null ? electricalTrend.EmptyText : $"Latest interval from {latest.Start.LocalDateTime:HH:mm}: {latest.MedianDropMv:+0.0;-0.0;0.0} mV drop · {latest.Count} observations · {latest.SpanSeconds:F1}s sampled span") +
+            "\nMost recent source context only. One-minute intervals; gaps are disconnected. Source-timing and legacy-reference limitations remain visible in hover details.";
+        electricalTrendSummary.ToolTip = "Comparison context (GPU, electrical source, load source, unit):\n" + result.ContextIdentity.Replace(" | ", "\n");
+        electricalTrend.InvalidateVisual();
     }
     void RenderData()
     {
@@ -309,6 +479,8 @@ public sealed class MainWindow : Window
         histogram.InvalidateVisual();
         var h = histogram.Histogram;
         histogramStats.Text = $"{h.Total:N0} unique samples · {h.Width:F2} V buckets" + (selected.HasValue ? $" · {selected}–{selected + config.BinWatts} W" : "") + "\n" + (h.Total > 0 ? $"Median {h.Median:F3} V   P05 {h.P05:F3} V" : "Choose a historical load bin or All loads.") + (all ? "\nAll loads: descriptive distribution only." : "\nAmber: reference median · Violet: reference P05");
+        RenderElectricalTrend(from, end);
+        RenderConfidence();
         analysisTitle.Text = s == null || !s.Fresh(config.MaxAgeSeconds) ? "Monitoring unavailable" : Friendly(s.Status);
         progress.Maximum = config.BaselineSamples; progress.Value = s?.Reference.HasValue == true ? config.BaselineSamples : Math.Min(config.BaselineSamples, s?.Learning ?? 0);
         string binLabel = s?.Bin is int bnow ? $"{bnow}–{bnow + config.BinWatts} W connector load" : "No eligible load bin";
@@ -416,11 +588,22 @@ public sealed class MainWindow : Window
         { settings.CloseTipShown = true; tray.ShowBalloonTip(4000, "Still monitoring", "ConnectorWatch is in the tray beside the clock. Double-click its icon to return.", Forms.ToolTipIcon.Info); SaveSettings(); }
     }
     public void Restore() { Show(); if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal; Activate(); }
-    public void SessionEnding() { exiting = true; timer.Stop(); SaveSettings(); tray?.Dispose(); }
+    public void SessionEnding()
+    {
+        exiting = true; timer.Stop(); SaveSettings(); tray?.Dispose();
+        FlushConfidenceHistory(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+    }
+    async Task FlushConfidenceHistory(TimeSpan timeout)
+    {
+        if (confidenceHistory is null) return;
+        try { await Task.Run(() => confidenceHistory.FlushAsync()).WaitAsync(timeout).ConfigureAwait(false); }
+        catch (Exception ex) { GuiLog.Current.Write("confidence_history_shutdown_checkpoint", new { data }, ex, throttle: true); }
+    }
     public async Task ExitGui()
     {
         if (exiting) return; exiting = true; timer.Stop();
         if (!demo) await client.Send("release");
+        await FlushConfidenceHistory(TimeSpan.FromSeconds(5));
         SaveSettings(); tray?.Dispose(); trayMenu?.Dispose(); SystemParameters.StaticPropertyChanged -= ThemeChanged; Close(); Application.Current.Shutdown();
     }
     async Task StopAndExit()
@@ -446,10 +629,20 @@ public sealed class MainWindow : Window
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { GuiLog.Current.Write("settings_write_error", new { settingsPath }, ex, throttle: true); operation = "Could not save dashboard preferences: " + ex.Message; }
     }
-    void ThemeChanged(object? sender, PropertyChangedEventArgs e) { if (e.PropertyName == nameof(SystemParameters.HighContrast)) { Background = Palette.Bg; Foreground = Palette.Text; history.InvalidateVisual(); histogram.InvalidateVisual(); } }
+    void ThemeChanged(object? sender, PropertyChangedEventArgs e) { if (e.PropertyName == nameof(SystemParameters.HighContrast)) { Background = Palette.Bg; Foreground = Palette.Text; history.InvalidateVisual(); histogram.InvalidateVisual(); electricalTrend.InvalidateVisual(); confidencePlot.InvalidateVisual(); } }
     void FillDemo()
     {
         var now = DateTimeOffset.UtcNow; var random = new Random(5090);
+        for (int day = 0; day < 45; day++)
+        {
+            var at = new DateTimeOffset(now.UtcDateTime.Date, TimeSpan.Zero).AddDays(day - 45);
+            confidenceDemoDays.Add(new ConfidenceDay {
+                Day = at, Cohort = "Synthetic 425–450 W", Epoch = "demo-reference-1", MedianDropMv = Math.Max(0, (day - 22) * 13),
+                MinuteCount = 60, ObservationCount = 3600, FirstSample = at.AddHours(12), LastSample = at.AddHours(14),
+                MinLoad = 430, MaxLoad = 440, MedianLoad = 435, P10Load = 431, P90Load = 439,
+                AnchorMedianLoad = 435, AnchorP10Load = 431, AnchorP90Load = 439, BinWidth = 25, Unverified = true
+            });
+        }
         for (int i = 0; i < 900; i++)
         {
             var t = now.AddSeconds(i - 899); double v = 12.07 + .008 * Math.Sin(i / 19.0) + random.NextDouble() * .012;
@@ -471,6 +664,27 @@ public sealed class MainWindow : Window
         var checks = new List<string>();
         void Check(bool passed, string name) { if (!passed) throw new Exception("UI test failed: " + name); checks.Add(name); }
         Check(IsVisible && tray?.Visible == true, "Dashboard and notification icon start visible");
+        Check(confidencePlot.Points.Count == 30 && confidencePlot.Points.Any(p => p.Score == 0) && confidencePlot.Points.Any(p => p.Score >= 90), "Long-term confidence uses daily points and shows increasing synthetic evidence");
+        double savedConfidenceShift = config.ShiftVolts;
+        config.ShiftVolts = 0;
+        RenderConfidence();
+        Check(confidenceValue.Text == "Unavailable" && confidencePlot.Points.Count == 0 && confidenceCaption.Text.Contains("configure a finite positive", StringComparison.Ordinal), "Invalid confidence threshold leaves the dashboard running with a clear unavailable state");
+        config.ShiftVolts = savedConfidenceShift;
+        RenderConfidence();
+        Check(confidencePlot.Points.Count == 30 && confidencePlot.Points.Any(p => p.Score >= 90), "Valid confidence threshold restores daily evidence rendering");
+        var incompleteConfidenceDay = confidenceDemoDays[0] with { P10Load = null };
+        Check(!DegradationConfidence.SupportsDay(incompleteConfidenceDay, incompleteConfidenceDay.Cohort), "Automatic cohort validity requires complete comparable load evidence");
+        var lastConfidence = confidencePlot.Points.Last().Score;
+        confidenceRange.SelectedIndex = 0;
+        Check(confidencePlot.Points.Count == 7 && confidencePlot.Points.Last().Score == lastConfidence, "Changing confidence display range does not retrain the comparison");
+        confidenceRange.SelectedIndex = 2;
+        Check(confidencePlot.Points.Count == 90 && confidencePlot.Points.Any(p => p.Score == null), "Ninety-day confidence keeps missing history as gaps");
+        confidenceRange.SelectedIndex = 1;
+        Check(electricalTrend.Points.Any(p => p.Median > 150) && electricalTrendSummary.Text.Contains("425–450 W"), "Electrical chart shows synthetic voltage deterioration at a historical load band");
+        electricalTrendMode.SelectedIndex = 1;
+        Check(electricalTrendSummary.Text.Contains("Recorded reference") && electricalTrend.Points.Any(p => p.Median > 150), "Electrical chart switches to recorded reference comparison");
+        electricalTrendMode.SelectedIndex = 0;
+        Check(electricalTrendSummary.Text.Contains("Initial observation"), "Electrical chart labels the observational comparison explicitly");
         Close(); await Task.Delay(50);
         Check(!IsVisible && !exiting && timer.IsEnabled && tray?.Visible == true, "Close hides window while tray and polling stay active");
         Restore(); await Task.Delay(50);
@@ -540,4 +754,5 @@ public sealed class MainWindow : Window
         "POWER_LIMIT_INCREASE" => "Power-limit increase observed", "POWER_LIMIT_OK" => "Power-limit observation", "POWER_LIMIT_UNAVAILABLE" => "Power-limit data unavailable", _ => status.Replace('_', ' ').ToLowerInvariant()
     };
     sealed record BinChoice(int Value, int Width) { public override string ToString() => $"{Value}–{Value + Width} W"; }
+    sealed record ConfidenceCohortChoice(string Key, string Label) { public override string ToString() => Label; }
 }

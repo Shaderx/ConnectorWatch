@@ -25,6 +25,16 @@ public static class HybridStorageTests
             Check(File.ReadAllText(Path.Combine(directory, "telemetry-2026-09-07.csv")) == HybridStorage.Header + "first\n", "pre-midnight batch retains its UTC day");
             Check(File.ReadAllText(Path.Combine(directory, "telemetry-2026-09-08.csv")) == HybridStorage.Header + "second\n", "post-midnight batch receives header");
             Check(File.ReadAllText(Path.Combine(directory, "events.csv")) == "transition\n", "event batch persisted");
+            var baselinePath = Path.Combine(directory, "baseline.json");
+            var baselineWriteTime = File.GetLastWriteTimeUtc(baselinePath);
+            Thread.Sleep(25);
+            storage.Flush(30.5, "{\"stopped\":false}", "{}");
+            Check(File.GetLastWriteTimeUtc(baselinePath) == baselineWriteTime,
+                "unchanged baseline is not rewritten on each checkpoint");
+            Thread.Sleep(25);
+            storage.Flush(30.75, "{\"stopped\":false}", "{\"changed\":true}");
+            Check(File.ReadAllText(baselinePath) == "{\"changed\":true}",
+                "changed baseline is persisted");
             storage.Add(time.AddSeconds(2), "third\n");
             storage.Flush(31, "{\"stopped\":true}", "{\"saved\":true}");
             Check(File.ReadAllText(Path.Combine(directory, "telemetry-2026-09-08.csv")) == HybridStorage.Header + "second\nthird\n", "forced shutdown flush preserves pending rows without duplicate header");

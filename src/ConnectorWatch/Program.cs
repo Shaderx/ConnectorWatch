@@ -1011,6 +1011,10 @@ public static class Program
             using var shutdown = RegisterShutdown(stop);
             using var control = new ControlServer(data, stop);
             control.Start();
+            using var telemetryCompression = OperatingSystem.IsWindows()
+                ? new TelemetryCompressionMaintenance(data, LogRecoverableFailure)
+                : null;
+            telemetryCompression?.Start(stop.Token);
             try { c.GpuUuid = Nvml.ResolveUuid(c.GpuUuid); }
             catch (Exception ex)
             {
@@ -1677,6 +1681,20 @@ public static class Program
         }
     }
     static string? Option(string[] args, string name) { int i = Array.IndexOf(args, name); return i < 0 ? null : i + 1 < args.Length ? args[i + 1] : throw new Exception("Missing value for " + name); }
+
+    static void LogRecoverableFailure(Exception ex)
+    {
+        Console.Error.WriteLine("ConnectorWatch recoverable failure: " + ex.Message);
+        try
+        {
+            string logs = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ConnectorWatch", "logs");
+            Directory.CreateDirectory(logs);
+            string log = Path.Combine(logs, "errors.log");
+            if (File.Exists(log) && new FileInfo(log).Length > 1024 * 1024) File.Move(log, log + ".previous", true);
+            File.AppendAllText(log, $"{DateTimeOffset.UtcNow:O} {ex}\n");
+        }
+        catch (Exception logError) { Console.Error.WriteLine("Unable to save diagnostic: " + logError.Message); }
+    }
 
     static int SendOperatorCommand(string dataDirectory, string command,
         string? operatorName, string? note, string? incidentId)
