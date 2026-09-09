@@ -48,6 +48,7 @@ public sealed class MainWindow : Window
     List<PointSample> visiblePoints = new();
     List<PointSample> distributionPoints = new();
     bool exiting, busy, initialized, connected, hadFresh, firstPoll = true, lossNotified, allWarnings;
+    long lastRefreshStarted;
     DateTimeOffset? focusTime;
     DateTimeOffset lastNotification;
     string operation = "";
@@ -188,6 +189,9 @@ public sealed class MainWindow : Window
     async Task Refresh()
     {
         if (busy || exiting) return; busy = true;
+        long refreshStarted = Stopwatch.GetTimestamp();
+        double? refreshGapSeconds = lastRefreshStarted == 0 ? null : Stopwatch.GetElapsedTime(lastRefreshStarted, refreshStarted).TotalSeconds;
+        lastRefreshStarted = refreshStarted;
         try
         {
             if (!demo)
@@ -195,12 +199,17 @@ public sealed class MainWindow : Window
                 connected = await client.Send("hello") != null;
                 if (connected) await client.Send("lease");
                 await store.RefreshAsync();
+                if (store.ReadError.Length > 0) GuiLog.Current.Write("telemetry_read_error", new { data, store.ReadError }, throttle: true);
             }
             var s = store.Current; bool fresh = s?.Fresh(config.MaxAgeSeconds) == true;
             if (firstPoll) { foreach (var w in store.Incidents) notified.Add(w.Id); firstPoll = false; }
-            if (fresh) { hadFresh = true; lossNotified = false; }
+            if (fresh) {
+                if (lossNotified) GuiLog.Current.Write("telemetry_recovered", new { data, snapshot_time = s!.Time, connected });
+                hadFresh = true; lossNotified = false;
+            }
             if (!fresh && (hadFresh || s != null) && !lossNotified)
             {
+                GuiLog.Current.Write("telemetry_lost", new { data, snapshot_time = s?.Time, sample_age_seconds = s == null ? (double?)null : (DateTimeOffset.UtcNow - s.Time).TotalSeconds, config.MaxAgeSeconds, stopped = s?.Stopped, connected, daemon_pid = client.Identity?.Pid, store.ReadError, refreshGapSeconds, refresh_duration_seconds = Stopwatch.GetElapsedTime(refreshStarted).TotalSeconds });
                 lossNotified = true; var id = DateTimeOffset.UtcNow.ToString("O") + "|MONITOR_STOPPED";
                 var incident = new Incident(id, DateTimeOffset.UtcNow, "MONITOR_STOPPED", "Monitoring stopped or output is stale. Last values are historical.");
                 store.Incidents.Add(incident); localIncidents.Add(incident);
@@ -215,7 +224,7 @@ public sealed class MainWindow : Window
             busy = false;
             UpdateStatus(); if (IsVisible || render) RenderData();
         }
-        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { operation = ex.Message; UpdateStatus(); }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { GuiLog.Current.Write("refresh_error", new { data }, ex, throttle: true); operation = ex.Message; UpdateStatus(); }
         finally { busy = false; }
     }
     void UpdateStatus()
@@ -435,7 +444,7 @@ public sealed class MainWindow : Window
             settings.Acknowledged = acknowledged.ToArray(); settings.LocalIncidents = localIncidents.ToArray(); Directory.CreateDirectory(Path.GetDirectoryName(settingsPath)!);
             File.WriteAllText(settingsPath + ".tmp", JsonSerializer.Serialize(settings)); File.Move(settingsPath + ".tmp", settingsPath, true);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { operation = "Could not save dashboard preferences: " + ex.Message; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { GuiLog.Current.Write("settings_write_error", new { settingsPath }, ex, throttle: true); operation = "Could not save dashboard preferences: " + ex.Message; }
     }
     void ThemeChanged(object? sender, PropertyChangedEventArgs e) { if (e.PropertyName == nameof(SystemParameters.HighContrast)) { Background = Palette.Bg; Foreground = Palette.Text; history.InvalidateVisual(); histogram.InvalidateVisual(); } }
     void FillDemo()

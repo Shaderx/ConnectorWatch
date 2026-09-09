@@ -62,7 +62,7 @@ public sealed class ControlClient
             if (command == "hello") Identity = r;
             return r.Ok ? r : null;
         }
-        catch (Exception ex) when (ex is IOException or OperationCanceledException or UnauthorizedAccessException or JsonException) { return null; }
+        catch (Exception ex) when (ex is IOException or OperationCanceledException or UnauthorizedAccessException or JsonException) { GuiLog.Current.Write("control_error", new { command, data }, ex, throttle: true); return null; }
     }
     static async Task<string?> ReadResponse(Stream stream, CancellationToken token)
     {
@@ -89,11 +89,14 @@ public sealed class App : Application
         try
         {
             if (args.Contains("--self-test")) { GuiTests.Run(Option(args, "--test-output")); return 0; }
+            GuiLog.Current.Write("gui_start", new { executable = Environment.ProcessPath });
+            AppDomain.CurrentDomain.UnhandledException += (_, e) => GuiLog.Current.Write("unhandled_exception", new { e.IsTerminating }, e.ExceptionObject as Exception);
             var app = new App { ShutdownMode = ShutdownMode.OnExplicitShutdown };
             if (!SystemParameters.HighContrast) app.Resources.MergedDictionaries.Add(new ResourceDictionary { Source = new Uri("/ConnectorWatch.Gui;component/Theme.xaml", UriKind.Relative) });
             app.Startup += async (_, _) => await app.Start(args);
             app.DispatcherUnhandledException += (_, e) =>
             {
+                GuiLog.Current.Write("dispatcher_exception", exception: e.Exception);
                 MessageBox.Show(e.Exception.Message, "ConnectorWatch dashboard", MessageBoxButton.OK, MessageBoxImage.Error);
                 e.Handled = true;
             };
@@ -101,6 +104,7 @@ public sealed class App : Application
         }
         catch (Exception ex)
         {
+            GuiLog.Current.Write("main_error", exception: ex);
             var output = Option(args, "--test-output");
             if (output != null) File.WriteAllText(output, ex.ToString());
             else MessageBox.Show(ex.Message, "ConnectorWatch", MessageBoxButton.OK, MessageBoxImage.Error);
@@ -115,6 +119,7 @@ public sealed class App : Application
             string configPath = Path.GetFullPath(Option(args, "--config") ?? Path.Combine(AppContext.BaseDirectory, "config.json"));
             var config = demo ? new GuiConfig { GpuUuid = "Demonstration · synthetic readings" } : JsonSerializer.Deserialize<GuiConfig>(TelemetryStore.ReadShared(configPath)) ?? throw new InvalidDataException("Invalid configuration");
             string data = demo ? Path.Combine(Path.GetTempPath(), "ConnectorWatch-demo") : Path.GetFullPath(config.DataDirectory, Path.GetDirectoryName(configPath)!);
+            GuiLog.Current.Write("configuration_loaded", new { configPath, data, config.MaxAgeSeconds, config.SampleSeconds, demo });
             string endpoint = ControlEndpoint.Name(data) + "-gui";
             string settings = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ConnectorWatch", endpoint + ".json");
             single = new Mutex(true, "Local\\" + endpoint, out bool owns);
@@ -164,6 +169,7 @@ public sealed class App : Application
         }
         catch (Exception ex)
         {
+            GuiLog.Current.Write("startup_error", exception: ex);
             if (Option(args, "--test-output") is string report) File.WriteAllText(report, ex.ToString());
             else if (Option(args, "--render") is string preview) File.WriteAllText(preview + ".error.txt", ex.ToString());
             else MessageBox.Show(ex.Message, "ConnectorWatch startup", MessageBoxButton.OK, MessageBoxImage.Error);

@@ -170,6 +170,10 @@ See [docs/REPLAY.md](docs/REPLAY.md) for deterministic replay, [docs/RECORDED-DA
 
 ## Support boundary
 
+GUI diagnostics are saved to `%LOCALAPPDATA%\ConnectorWatch\logs\gui.jsonl` (one JSON event per line), with the previous file at `gui.jsonl.1`. The log rotates at 2 MiB and keeps one backup. Repeated control, read, and refresh errors are limited to one entry per event type per minute. Logging is best effort if the directory is unwritable.
+
+Telemetry-loss entries include the last snapshot time, sample age, freshness threshold, daemon connection state, data directory, and GUI refresh timing. Recovery is logged separately. Startup failures and unexpected GUI exceptions include exception details. Timestamps are UTC; these logs help distinguish delayed GUI refreshes from missing samples but do not measure CPU usage.
+
 The direct native path is intended for Windows x64 and retains the validated hardware identity `PCI0x2B8510DE`, subsystem `0x89EE1043`, with NVIDIA driver `616.56`. The physically validated scope is one ASUS TUF RTX 5090 configuration. Same-board units are experimental until independently checked. Multiple GPUs fail closed. Other boards and other driver versions are unsupported by the direct path and must not be treated as compatible because the card name looks similar.
 
 The daemon's managed NVML telemetry core is portable in principle and can be built for other platforms, but this release supplies the Windows WPF GUI and the Windows direct rail reader. A Linux build may retain ordinary NVML logging where the driver provides `libnvidia-ml.so.1`; it does not provide the Windows native rail path or a Linux GUI.

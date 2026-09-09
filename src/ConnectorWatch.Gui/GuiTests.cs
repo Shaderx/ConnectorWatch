@@ -11,6 +11,27 @@ public static class GuiTests
         var checks = new List<string>();
         void Check(bool ok, string name) { if (!ok) throw new Exception("FAIL: " + name); checks.Add(name); }
         var now = DateTimeOffset.UtcNow;
+        var logDirectory = Path.Combine(Path.GetTempPath(), "ConnectorWatch-log-test-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            string logPath = Path.Combine(logDirectory, "gui.jsonl");
+            var log = new GuiLog(logPath);
+            log.Write("telemetry_lost", new { sample_age_seconds = 9 }, new IOException("fixture error"), throttle: true);
+            log.Write("telemetry_lost", throttle: true);
+            var lines = File.ReadAllLines(logPath);
+            Check(lines.Length == 1, "Repeated diagnostic errors are throttled");
+            using var entry = JsonDocument.Parse(lines[0]);
+            Check(entry.RootElement.GetProperty("details").GetProperty("sample_age_seconds").GetInt32() == 9 &&
+                entry.RootElement.GetProperty("exception").GetString()!.Contains("fixture error"), "Diagnostic context and exceptions persist as JSON");
+            var rotating = new GuiLog(logPath, 1);
+            rotating.Write("telemetry_recovered");
+            Check(File.Exists(logPath + ".1") && File.ReadAllLines(logPath).Length == 1, "Diagnostic log rotates");
+            rotating.Write("next_event");
+            Check(File.ReadAllText(logPath + ".1").Contains("telemetry_recovered"), "Rotation replaces the previous backup");
+            new GuiLog(Path.Combine(logPath, "invalid.jsonl")).Write("unwritable_log");
+            Check(true, "Logging failure does not escape into GUI");
+        }
+        finally { if (Directory.Exists(logDirectory)) Directory.Delete(logDirectory, true); }
         LiveStorageChecks(Check);
         PointSample Point(int i, double v, int? bin = 425, string state = "NO_SHIFT_DETECTED") => new(now.AddSeconds(i), now.AddSeconds(i), v, 12.1, 440, bin, state, 12.1, 12.09, 12.1 - v, "");
         var samples = new[] { Point(-5, 12.1), Point(-4, 12.11), Point(-4, 12.11), Point(-3, 11.8, 450), Point(-2, 12, null, "OUTSIDE_ANALYSIS_RANGE"), Point(-1, 12.2, 425, "LOAD_SETTLING") };
