@@ -88,7 +88,10 @@ public static class DeploymentTests
             var traversal = Path.Combine(root, "traversal");
             Directory.CreateDirectory(traversal);
             var traversalConfig = Path.Combine(traversal, "config.json");
-            File.WriteAllText(traversalConfig, "{\"DataDirectory\":\"..\\\\portable\\\\data\"}");
+            File.WriteAllText(traversalConfig, JsonSerializer.Serialize(new
+            {
+                DataDirectory = Path.Combine("..", "portable", "data"),
+            }));
             bool rejected = false;
             try
             {
