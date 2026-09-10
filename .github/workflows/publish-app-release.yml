@@ -71,7 +71,8 @@ jobs:
           if ($env:ROLLBACK_POLICY -and $env:ROLLBACK_POLICY -notmatch '^[A-Za-z0-9_./-]+$') { throw 'Rollback policy path contains unsupported characters.' }
           $json = gh release list --limit 1000 --json tagName,isDraft
           if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate immutable app releases.' }
-          $metadataRevisions = @($json | ConvertFrom-Json | Where-Object { -not $_.isDraft } | ForEach-Object {
+          $releaseRows = @($json | ConvertFrom-Json)
+          $metadataRevisions = @($releaseRows | Where-Object { -not $_.isDraft } | ForEach-Object {
             $match = [regex]::Match($_.tagName, '^app-metadata-r([0-9]+)$')
             if ($match.Success) { [long]$match.Groups[1].Value }
           })
@@ -89,9 +90,10 @@ jobs:
             }
           }
           if ($env:MODE -eq 'Prepare') {
-            $targetJson = gh release view "app-v$env:VERSION" --json isDraft
-            if ($LASTEXITCODE -eq 0) {
-              if (($targetJson | ConvertFrom-Json).isDraft) { throw 'Target app release exists only as a draft; complete or remove that failed draft before Prepare.' }
+            $targetRows = @($releaseRows | Where-Object { $_.tagName -ceq "app-v$env:VERSION" })
+            if ($targetRows.Count -gt 1) { throw 'Immutable app release enumeration returned duplicate target tags.' }
+            if ($targetRows.Count -eq 1) {
+              if ($targetRows[0].isDraft) { throw 'Target app release exists only as a draft; complete or remove that failed draft before Prepare.' }
               Add-Content -LiteralPath $env:GITHUB_ENV -Value 'TARGET_APP_RELEASE_EXISTS=true'
             } else { Add-Content -LiteralPath $env:GITHUB_ENV -Value 'TARGET_APP_RELEASE_EXISTS=false' }
           }
@@ -268,10 +270,14 @@ jobs:
           GH_REPO: ${{ github.repository }}
           APP_TRUST: ${{ inputs.app_trust_path }}
           SIGNING_MODE: ${{ inputs.signing_mode }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $targetJson = gh release view "app-v$env:VERSION" --json isDraft
-          if ($LASTEXITCODE -ne 0) { Add-Content -LiteralPath $env:GITHUB_ENV -Value 'TARGET_APP_RELEASE_EXISTS=false'; return }
-          if (($targetJson | ConvertFrom-Json).isDraft) { throw 'Target app release is an incomplete draft.' }
+          $releaseJson = gh release list --limit 1000 --json tagName,isDraft
+          if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate immutable app releases while binding Publish.' }
+          $targetRows = @($releaseJson | ConvertFrom-Json | Where-Object { $_.tagName -ceq "app-v$env:VERSION" })
+          if ($targetRows.Count -gt 1) { throw 'Immutable app release enumeration returned duplicate target tags.' }
+          if ($targetRows.Count -eq 0) { Add-Content -LiteralPath $env:GITHUB_ENV -Value 'TARGET_APP_RELEASE_EXISTS=false'; $global:LASTEXITCODE = 0; return }
+          if ($targetRows[0].isDraft) { throw 'Target app release is an incomplete draft.' }
           $preparedInstallers = @(Get-ChildItem prepared -Filter ConnectorWatch-Setup.exe -Recurse -File)
           if ($preparedInstallers.Count -ne 1) { throw 'Prepared artifact must contain exactly one installer.' }
           $remote = Join-Path $env:RUNNER_TEMP 'immutable-target-installer.exe'
@@ -344,9 +350,13 @@ jobs:
         shell: pwsh
         env: { GH_TOKEN: '${{ github.token }}', GH_REPO: '${{ github.repository }}', VERSION: '${{ inputs.version }}', NOTES: '${{ inputs.release_notes_path }}', SIGNING_MODE: '${{ inputs.signing_mode }}' }
         run: |
-          $tag="app-v$env:VERSION"; gh release view $tag --json isDraft | Out-File existing.json
-          if ($LASTEXITCODE -eq 0) { if (-not (Get-Content -Raw existing.json | ConvertFrom-Json).isDraft) { throw 'Immutable app release exists.' } }
-          else {
+          $tag="app-v$env:VERSION"
+          $releaseJson = gh release list --limit 1000 --json tagName,isDraft
+          if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate immutable app releases before publication.' }
+          $targetRows = @($releaseJson | ConvertFrom-Json | Where-Object { $_.tagName -ceq $tag })
+          if ($targetRows.Count -gt 1) { throw 'Immutable app release enumeration returned duplicate target tags.' }
+          if ($targetRows.Count -eq 1 -and -not $targetRows[0].isDraft) { throw 'Immutable app release exists.' }
+          if ($targetRows.Count -eq 0) {
             $title = if ($env:SIGNING_MODE -eq 'SelfSigned') { "ConnectorWatch $env:VERSION (self-signed)" } else { "ConnectorWatch $env:VERSION" }
             gh release create $tag --target $env:GITHUB_SHA --draft --title $title --notes-file $env:NOTES --latest=false
             if ($LASTEXITCODE -ne 0) { throw 'Draft creation failed.' }
@@ -359,9 +369,16 @@ jobs:
         shell: pwsh
         env: { GH_TOKEN: '${{ github.token }}', GH_REPO: '${{ github.repository }}', REVISION: '${{ inputs.revision }}' }
         run: |
-          $tag="app-metadata-r$env:REVISION"; gh release view $tag --json isDraft | Out-File existing-metadata.json
-          if ($LASTEXITCODE -eq 0) { if (-not (Get-Content -Raw existing-metadata.json | ConvertFrom-Json).isDraft) { throw 'Immutable app metadata revision exists.' } }
-          else { gh release create $tag --target $env:GITHUB_SHA --draft --title "ConnectorWatch app metadata revision $env:REVISION" --notes 'Immutable authenticated application update metadata.' --latest=false; if ($LASTEXITCODE -ne 0) { throw 'Metadata draft creation failed.' } }
+          $tag="app-metadata-r$env:REVISION"
+          $releaseJson = gh release list --limit 1000 --json tagName,isDraft
+          if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate immutable app releases before metadata publication.' }
+          $targetRows = @($releaseJson | ConvertFrom-Json | Where-Object { $_.tagName -ceq $tag })
+          if ($targetRows.Count -gt 1) { throw 'Immutable metadata enumeration returned duplicate target tags.' }
+          if ($targetRows.Count -eq 1 -and -not $targetRows[0].isDraft) { throw 'Immutable app metadata revision exists.' }
+          if ($targetRows.Count -eq 0) {
+            gh release create $tag --target $env:GITHUB_SHA --draft --title "ConnectorWatch app metadata revision $env:REVISION" --notes 'Immutable authenticated application update metadata.' --latest=false
+            if ($LASTEXITCODE -ne 0) { throw 'Metadata draft creation failed.' }
+          }
           gh release upload $tag artifacts/app-release/app-release.payload.json artifacts/app-release/app-release.envelope.json --clobber; if ($LASTEXITCODE -ne 0) { throw 'Immutable metadata upload failed; discovery unchanged.' }
           gh release edit $tag --draft=false --latest=false; if ($LASTEXITCODE -ne 0) { throw 'Immutable metadata publish failed; discovery unchanged.' }
       - name: Publish stable installer and signed discovery last
@@ -369,8 +386,12 @@ jobs:
         shell: pwsh
         env: { GH_TOKEN: '${{ github.token }}', GH_REPO: '${{ github.repository }}', SIGNING_MODE: '${{ inputs.signing_mode }}' }
         run: |
-          $tag='app-stable'; gh release view $tag >$null 2>&1
-          if ($LASTEXITCODE -ne 0) {
+          $tag='app-stable'
+          $releaseJson = gh release list --limit 1000 --json tagName,isDraft
+          if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate app releases before stable publication.' }
+          $targetRows = @($releaseJson | ConvertFrom-Json | Where-Object { $_.tagName -ceq $tag })
+          if ($targetRows.Count -gt 1) { throw 'Stable app release enumeration returned duplicate target tags.' }
+          if ($targetRows.Count -eq 0) {
             $title = if ($env:SIGNING_MODE -eq 'SelfSigned') { 'ConnectorWatch stable application (self-signed)' } else { 'ConnectorWatch stable application' }
             gh release create $tag --target $env:GITHUB_SHA --title $title --notes 'Stable signed installer and authenticated app metadata.' --latest=false
             if ($LASTEXITCODE -ne 0) { throw 'Stable release creation failed.' }
