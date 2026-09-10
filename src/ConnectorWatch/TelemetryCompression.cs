@@ -35,7 +35,8 @@ public sealed class TelemetryCompressionMaintenance : IDisposable
         {
             if (worker is not null) throw new InvalidOperationException("Telemetry compression maintenance is already running.");
             lifetime = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
-            worker = Task.Run(() => RunLoop(lifetime.Token));
+            var maintenanceToken = lifetime.Token;
+            worker = Task.Run(() => RunLoop(maintenanceToken));
         }
     }
 

@@ -11,8 +11,10 @@ Use the `Prepare or publish protected application release` workflow from a
 protected branch. Configure required reviewers on the `app-release-publication`
 GitHub Environment. Its secrets are `APP_AUTHENTICODE_PFX_BASE64`,
 `APP_AUTHENTICODE_PFX_PASSWORD`, and `APP_RELEASE_SIGNING_KEY_PEM`. Its variables
-are `APP_AUTHENTICODE_TIMESTAMP_URL`, `APP_RELEASE_KEY_ID`, and
-`APP_RELEASE_PUBLIC_KEY_SPKI_BASE64`. Private keys and PFX material never belong
+are `APP_RELEASE_KEY_ID` and `APP_RELEASE_PUBLIC_KEY_SPKI_BASE64`. A future
+`PublicTrusted` release may additionally configure an explicit HTTPS RFC 3161
+timestamp service through `APP_AUTHENTICODE_TIMESTAMP_URL`; the initial
+`SelfSigned` release has no external timestamp-service requirement. Private keys and PFX material never belong
 in the repository or ordinary build jobs; public `.cer` identity files may be
 published for fingerprint inspection.
 
@@ -41,8 +43,9 @@ be empty only when `self_signed_publisher_certificate_sha256` contains a pin.
 A bridge release may contain both arrays; the selected `signing_mode`
 determines which array the build and publication checks use.
 
-`SelfSigned` builds use the same configured RFC 3161 timestamp service and do
-not import the certificate into `Root` or `TrustedPublisher`.
+`SelfSigned` builds do not require an external timestamp service and omit
+timestamping. Their certificate validity is checked at verification time; they
+do not import the certificate into `Root` or `TrustedPublisher`.
 The build imports the PFX only into the ephemeral maintainer
 `Cert:\CurrentUser\My` store, signs the application files, installer, and
 Inno uninstaller, and verifies each content signature with the packaged

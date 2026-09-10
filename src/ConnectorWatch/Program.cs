@@ -1700,7 +1700,7 @@ public static class Program
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine("ConnectorWatch stopped: " + ex.Message);
+            Console.Error.WriteLine("ConnectorWatch stopped: " + (args.Contains("--self-test") ? ex.ToString() : ex.Message));
             try
             {
                 string logs = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ConnectorWatch", "logs");

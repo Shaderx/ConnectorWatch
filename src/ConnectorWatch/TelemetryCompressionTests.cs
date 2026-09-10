@@ -104,6 +104,12 @@ public static class TelemetryCompressionTests
                 background.Start(shutdown.Token);
                 shutdown.Cancel();
             }
+            for (int iteration = 0; iteration < 2048; iteration++)
+            {
+                using var immediateShutdown = new CancellationTokenSource();
+                using var immediateDispose = new TelemetryCompressionMaintenance(directory, failures.Add);
+                immediateDispose.Start(immediateShutdown.Token);
+            }
             Console.WriteLine("PASS: telemetry compression retention, round-trip, conflict and safety checks.");
         }
         finally { Directory.Delete(directory, true); }

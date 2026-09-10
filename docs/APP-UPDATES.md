@@ -8,6 +8,10 @@ be empty when the self-signed array is populated. During bridge rotation both
 arrays can be present, but the release's `SigningMode` selects the signer pin
 used by the protected build. ConnectorWatch 1.5.0 starts with its self-signed
 pin and therefore Windows may display an “Unknown publisher” prompt.
+The self-signed release mode does not depend on an external timestamp service;
+the application-scoped verifier checks the embedded certificate's current
+validity and pinned identity. Future `PublicTrusted` releases may add an
+explicit HTTPS RFC 3161 timestamp service as a separate protected setting.
 
 ## Check contract
 

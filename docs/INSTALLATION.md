@@ -75,14 +75,16 @@ Run `scripts/Build-Installer.ps1` from a Windows release environment. A producti
 - an initial signed driver catalog and its public trust configuration;
 - a separate app-update public trust configuration containing publisher certificate SHA-256 pins;
 - the protected release-trust preparation step;
-- `signtool.exe` at `C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe`, an installed signing certificate selected by SHA-1 thumbprint, and an HTTPS RFC 3161 timestamp service; and
+- `signtool.exe` at `C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe` and an installed signing certificate selected by SHA-1 thumbprint; public-trusted builds additionally require an explicit HTTPS RFC 3161 timestamp service; and
 - `artifacts/build-tools/inno/ISCC.exe` (or an equivalent installed Inno Setup compiler).
 
 The build signs and verifies published binaries, compiles a signed installer
 and signed uninstaller, verifies the final installer, and writes its SHA-256.
 `-SigningMode PublicTrusted` (the default) requires the native Windows
-certificate chain. `-SigningMode SelfSigned` uses the packaged
+certificate chain and an explicitly configured timestamp service.
+`-SigningMode SelfSigned` uses the packaged
 `--verify-release-signature` CLI and the self-signed app-trust pin. Missing
+external timestamping is expected for the initial self-signed release. Missing
 real signing configuration is a hard failure. `-UnsignedFixture` exists only
 to compile isolated installer fixtures and never participates in a release.
 

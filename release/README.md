@@ -22,6 +22,15 @@ Use [protected application releases](../docs/APP-RELEASING.md) with
 `signing_mode: SelfSigned` for the initial installer. The first catalog includes
 the [explicit maintainer attestation](../docs/release/driver-approval-attestation.json)
 for exactly 616.56 and 616.92 on the documented hardware and reader.
+The initial self-signed mode does not use an external timestamp service;
+certificate validity is checked at verification time. Future public-trusted
+releases may configure an explicit HTTPS RFC 3161 service.
+
+`trust/driver-catalog.signed.json` is the byte-identical authenticated envelope
+published as [catalog revision 1](https://github.com/Shaderx/ConnectorWatch/releases/tag/driver-catalog-r1).
+Its approved payload digest is
+`2c007a22f34ace3fcb8a1b46c5140c13d7989e0908a5bccbd1ccc4f7ad61827c`;
+its initial validity ends on 2026-10-10 at 12:54:15 UTC.
 
 Renew signed catalogs and application metadata before their expiry; both have
 a maximum validity of 31 days. Renewal uses the next immutable revision and

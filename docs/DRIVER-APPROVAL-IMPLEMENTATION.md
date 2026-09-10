@@ -85,7 +85,9 @@ and [protected app releases](APP-RELEASING.md).
   trips, including previous-key authentication followed by a new-key signature.
   Native validation rejects dirty source trees before probing so its recorded
   commit identifies the reader being tested. PowerShell syntax checks pass and action pins were verified against their
-  upstream tags. Publication workflows have not run against production secrets.
+  upstream tags. The protected production catalog workflow published and verified
+  [revision 1](https://github.com/Shaderx/ConnectorWatch/releases/tag/driver-catalog-r1)
+  with the explicit bootstrap attestation on 2026-09-10.
 
 No physical driver validation is run by these fixtures. Unsigned installer fixtures
 use a separate test AppId and repository-local application/state paths with no

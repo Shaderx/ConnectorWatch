@@ -21,7 +21,9 @@ the installer digest and Authenticode publisher, and ask before restarting.
 
 The first protected 1.5.0 application release uses the self-signed publisher
 certificate pinned in `self_signed_publisher_certificate_sha256` because the
-public CA identity is not yet provisioned. Windows may display “Unknown
+public CA identity is not yet provisioned. Self-signed mode has no external
+timestamp-service dependency; the verifier checks the certificate's current
+validity and pinned identity. Windows may display “Unknown
 publisher”; the shipped application-scoped verifier checks the signed-file
 digest and certificate pin without requiring a `Root` or `TrustedPublisher`
 import. The release exposes `ConnectorWatch-publisher.cer`, `publisher.json`,

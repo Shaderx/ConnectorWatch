@@ -3,12 +3,16 @@ param(
     [Parameter(Mandatory)][string]$PrivateDirectory,
     [Parameter(Mandatory)][string]$PublicDirectory,
     [string]$Repository = 'Shaderx/ConnectorWatch',
-    [string]$TimestampUrl = 'https://timestamp.digicert.com'
+    [string]$TimestampUrl = ''
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid repository name.' }
-if (-not $TimestampUrl.StartsWith('https://', [StringComparison]::OrdinalIgnoreCase)) { throw 'Timestamp service must use HTTPS.' }
+$timestampUri = $null
+if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) {
+    if (-not [Uri]::TryCreate($TimestampUrl, [UriKind]::Absolute, [ref]$timestampUri) -or
+        $timestampUri.Scheme -ne 'https' -or $timestampUri.UserInfo) { throw 'TimestampUrl must be an HTTPS RFC 3161 service URL.' }
+}
 $private = [IO.Path]::GetFullPath($PrivateDirectory)
 $public = [IO.Path]::GetFullPath($PublicDirectory)
 $catalog = Get-Content -Raw -LiteralPath (Join-Path $public 'driver-catalog-trust.json') | ConvertFrom-Json
@@ -75,6 +79,8 @@ Set-Secret 'app-release-publication' 'APP_AUTHENTICODE_PFX_PASSWORD' ([Net.Netwo
 Set-Secret 'app-release-publication' 'APP_AUTHENTICODE_PFX_BASE64' ([Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $private 'authenticode.pfx'))))
 Set-Variable 'app-release-publication' 'APP_RELEASE_KEY_ID' $app.metadata_keys[0].key_id
 Set-Variable 'app-release-publication' 'APP_RELEASE_PUBLIC_KEY_SPKI_BASE64' $app.metadata_keys[0].subject_public_key_info_base64
-Set-Variable 'app-release-publication' 'APP_AUTHENTICODE_TIMESTAMP_URL' $TimestampUrl
+if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) {
+    Set-Variable 'app-release-publication' 'APP_AUTHENTICODE_TIMESTAMP_URL' $TimestampUrl
+}
 $secrets = $null
 Write-Output "Configured protected release environments for $Repository; reviewer $($account.login); private keys were sent through stdin."

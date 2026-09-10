@@ -23,7 +23,7 @@ if ((Test-Path $output) -and @(Get-ChildItem $output -Force).Count) { throw 'Ins
 New-Item -ItemType Directory -Force $output | Out-Null
 
 if (-not $IsccPath) {
-    $candidates = @(
+    [string[]]$candidates = @(
         (Join-Path $root 'artifacts/build-tools/inno/ISCC.exe'),
         (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 7/ISCC.exe'),
         (Join-Path $env:ProgramFiles 'Inno Setup 7/ISCC.exe'),
@@ -42,7 +42,13 @@ if (-not $UnsignedFixture) {
         if (-not $required -or -not (Test-Path $required)) { throw 'A production installer requires catalog trust, initial signed catalog, app trust, and signtool paths.' }
     }
     if ($SignCertificateThumbprint -notmatch '^[0-9A-Fa-f]{40}$') { throw 'SignCertificateThumbprint must be a SHA-1 certificate thumbprint.' }
-    if (-not [Uri]::IsWellFormedUriString($TimestampUrl, [UriKind]::Absolute) -or -not $TimestampUrl.StartsWith('https://')) { throw 'TimestampUrl must be HTTPS.' }
+    $timestampUri = $null
+    if ($SigningMode -eq 'SelfSigned') {
+        if ($TimestampUrl) { throw 'SelfSigned mode uses no external timestamp service; omit TimestampUrl.' }
+    } elseif (-not [Uri]::TryCreate($TimestampUrl, [UriKind]::Absolute, [ref]$timestampUri) -or
+        $timestampUri.Scheme -ne 'https' -or $timestampUri.UserInfo) {
+        throw 'PublicTrusted mode requires an explicitly configured HTTPS timestamp service.'
+    }
     $signingCertificate = @(Get-ChildItem 'Cert:\CurrentUser\My' | Where-Object Thumbprint -eq $SignCertificateThumbprint)
     if ($signingCertificate.Count -ne 1) { throw 'The selected signing certificate must be present exactly once in CurrentUser\\My.' }
     Export-Certificate -Cert $signingCertificate[0] -FilePath (Join-Path $output 'ConnectorWatch-publisher.cer') -Type CERT | Out-Null
@@ -127,7 +133,10 @@ if (-not $UnsignedFixture) {
     foreach ($name in $ownedBinaries) {
         $binary = Join-Path $stage $name
         if (-not (Test-Path $binary)) { throw "Published binary is missing: $name" }
-        & $SignToolPath sign /sha1 $SignCertificateThumbprint /fd SHA256 /td SHA256 /tr $TimestampUrl /d ConnectorWatch $binary
+        $signingArgs = @('sign', '/sha1', $SignCertificateThumbprint, '/fd', 'SHA256')
+        if ($SigningMode -eq 'PublicTrusted') { $signingArgs += @('/td', 'SHA256', '/tr', $timestampUri.AbsoluteUri) }
+        $signingArgs += @('/d', 'ConnectorWatch', $binary)
+        & $SignToolPath @signingArgs
         if ($LASTEXITCODE -ne 0) { throw "Signing failed: $name" }
         Verify-ProductionSignature $binary $name
     }
@@ -163,7 +172,12 @@ if ($UnsignedFixture) {
     $defines += "--define=FixtureStateRoot=$(Join-Path $output 'fixture-state')"
     & $IsccPath --no-ide-signtools @defines (Join-Path $root 'installer/ConnectorWatch.iss')
 } else {
-    $signCommand = '"' + $SignToolPath + '" sign /sha1 ' + $SignCertificateThumbprint + ' /fd SHA256 /td SHA256 /tr "' + $TimestampUrl + '" /d "ConnectorWatch" $f'
+    # Inno's $q preserves quotes through PowerShell and ISCC argument parsing.
+    $signCommand = '$q' + $SignToolPath.Replace('$','$$') + '$q sign /sha1 ' + $SignCertificateThumbprint + ' /fd SHA256'
+    if ($SigningMode -eq 'PublicTrusted') {
+        $signCommand += ' /td SHA256 /tr $q' + $timestampUri.AbsoluteUri.Replace('$','$$') + '$q'
+    }
+    $signCommand += ' /d $qConnectorWatch$q $f'
     $defines += '--define=OutputName=ConnectorWatch-Setup'
     $defines += '--define=SignedBuild=1'
     & $IsccPath --no-ide-signtools "--signtool=connectorwatch=$signCommand" @defines (Join-Path $root 'installer/ConnectorWatch.iss')

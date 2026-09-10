@@ -168,7 +168,8 @@ jobs:
               Where-Object FullName -like '*\x64\signtool.exe' | Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName
             if (-not $signtool) { throw 'Required x64 SignTool was not found under the installed Windows SDK.' }
             if (-not $env:ISCC_PATH -or -not (Test-Path $env:ISCC_PATH)) { throw 'Required Inno Setup compiler path is missing.' }
-            ./scripts/Build-Installer.ps1 -OutputDirectory artifacts/installer -ExpectedTag "v$env:VERSION" -IsccPath $env:ISCC_PATH -CatalogTrustPath $env:CATALOG_TRUST -InitialCatalogPath $env:INITIAL_CATALOG -AppTrustPath $env:APP_TRUST -SignToolPath $signtool -SignCertificateThumbprint $cert.Thumbprint -TimestampUrl $env:TIMESTAMP_URL -SigningMode $env:SIGNING_MODE
+            $timestampUrl = if ($env:SIGNING_MODE -eq 'PublicTrusted') { $env:TIMESTAMP_URL } else { '' }
+            ./scripts/Build-Installer.ps1 -OutputDirectory artifacts/installer -ExpectedTag "v$env:VERSION" -IsccPath $env:ISCC_PATH -CatalogTrustPath $env:CATALOG_TRUST -InitialCatalogPath $env:INITIAL_CATALOG -AppTrustPath $env:APP_TRUST -SignToolPath $signtool -SignCertificateThumbprint $cert.Thumbprint -TimestampUrl $timestampUrl -SigningMode $env:SIGNING_MODE
           } finally { Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath "Cert:\CurrentUser\My\$($cert.Thumbprint)" -Force -ErrorAction SilentlyContinue }
       - name: Pilot-test exact signed installer
         if: inputs.mode == 'Prepare' && env.TARGET_APP_RELEASE_EXISTS != 'true'
