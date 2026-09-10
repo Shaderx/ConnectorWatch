@@ -14,6 +14,28 @@ public static class DirectNvRailsTests
 {
     public static void Run()
     {
+        // Public identity observation does not grant native-reader approval.
+        // Exact acceptance and developer policy are exercised by DriverApprovalTests.
+        DirectNvRails.ValidateDriverIdentityRead(0, "616.56");
+        DirectNvRails.ValidateDriverIdentityRead(0, "616.92");
+        DirectNvRails.ValidateDriverIdentityRead(0, "999.99");
+        Check(new Config().ValidateDriverVersion, "driver validation defaults on");
+        Check(!JsonSerializer.Deserialize<Config>("{\"ValidateDriverVersion\":false}")!.ValidateDriverVersion,
+            "config supports explicit unvalidated developer mode");
+        var identity = Program.BuildReferenceIdentity(new Config { GpuUuid = "GPU-fixture" }, "direct", "direct NVIDIA rails",
+            AnalysisLoadSource.CONNECTOR_POWER, "616.92");
+        Check(identity.Driver == "616.92", "reference identity records actual driver");
+        bool missingObservedDriver = false;
+        try { Program.BuildReferenceIdentity(new Config { GpuUuid = "GPU-fixture" }, "direct", "direct NVIDIA rails", AnalysisLoadSource.CONNECTOR_POWER); }
+        catch (ArgumentException) { missingObservedDriver = true; }
+        Check(missingObservedDriver, "direct reference cannot silently use a historical default driver");
+        foreach (var (status, version) in new[] { (-1, "616.92"), (0, ""), (0, " ") })
+        {
+            bool rejected = false;
+            try { DirectNvRails.ValidateDriverIdentityRead(status, version); }
+            catch (DirectNvRailsException) { rejected = true; }
+            Check(rejected, "failed identity reads always reject");
+        }
         DirectNvRails.RequireSingleGpu(0, 1, "fixture");
         foreach (var (status, count) in new (int, uint)[] { (0, 0), (0, 2), (0, 64), (-1, 1) })
         {

@@ -31,6 +31,7 @@ public sealed class Config
     // auto prefers a configured external source, then the direct Windows rail
     // provider. Explicit values are direct/nvapi, hwinfo, json, or none.
     public string VoltageSource { get; set; } = "auto";
+    public bool ValidateDriverVersion { get; set; } = true;
     public string HwinfoCsv { get; set; } = "";
     // Newline-delimited JSON from an external, independently validated rail reader.
     // ConnectorWatch does not interpret this as proof of a direct NVIDIA source.
@@ -785,7 +786,7 @@ public static class Program
 
         // Compatibility for configurations written before the explicit field:
         // resolve once from their configured provider, then pin the result.
-        if (voltageSource is DirectNvRails || sourceMode is "direct" or "nvapi")
+        if (voltageSource is DirectNvRails or ApprovalRailSource || sourceMode is "direct" or "nvapi")
             return AnalysisLoadSource.CONNECTOR_POWER;
         if (voltageSource is RailJsonLog || voltageSource is HwinfoLog && c.PowerColumn.Length > 0)
             return AnalysisLoadSource.EXTERNAL_SENSOR_POWER;
@@ -793,10 +794,13 @@ public static class Program
     }
 
     internal static ReferenceIdentity BuildReferenceIdentity(Config c, string sourceMode,
-        string providerIdentity, AnalysisLoadSource analysisLoadSource)
+        string providerIdentity, AnalysisLoadSource analysisLoadSource,
+        string? driverVersion = null)
     {
         bool direct = sourceMode is "direct" or "nvapi" ||
             providerIdentity.StartsWith("direct NVIDIA rails", StringComparison.OrdinalIgnoreCase);
+        if (direct && string.IsNullOrWhiteSpace(driverVersion))
+            throw new ArgumentException("A direct reference requires the observed driver version.", nameof(driverVersion));
         var qualification = new ReferenceQualificationConfig(
             binWatts: c.BinWatts,
             minAnalysisWatts: c.MinAnalysisWatts,
@@ -817,7 +821,7 @@ public static class Program
         return ReferenceIdentity.Create(
             gpuUuid: c.GpuUuid,
             board: direct ? "NVIDIA-target-2B8510DE-89EE1043" : "external-source",
-            driver: direct ? DirectNvRails.ExpectedDriverVersion : "external-source",
+            driver: direct ? driverVersion! : "external-source",
             source: providerIdentity,
             abiProfile: direct ? "A612-A613-v1" : "external-v1",
             analysisLoadSource: analysisLoadSource,
@@ -972,10 +976,23 @@ public static class Program
 
     public static int Main(string[] args)
     {
+        int result;
+        do { result = RunSession(args); } while (result == 42);
+        return result;
+    }
+
+    private static int RunSession(string[] args)
+    {
         CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
         try
         {
             if (args.Contains("--self-test")) { Tests.Run(); return 0; }
+            if (args.Contains("--approval-self-test")) { DriverApprovalTests.Run(); MaintainerValidationTests.Run(); ReleaseTrustPreparationTests.Run(); return 0; }
+            if (args.Contains("--deployment-self-test")) { DeploymentTests.Run(); AppUpdateTests.Run(); return 0; }
+            if (ReleaseSignatureVerificationCommand.TryHandle(args, out var signatureExit)) return signatureExit;
+            if (ReleaseTrustPreparation.TryRun(args, out var trustExit)) return trustExit;
+            if (AppReleasePublication.TryHandle(args, out var appPublicationExit)) return appPublicationExit;
+            if (MaintainerValidationCommand.TryHandle(args, gpuUuid => DirectNvRails.CreateMaintainerProbe(gpuUuid), out var maintainerExit)) return maintainerExit;
             if (args.Contains("--probe-nvapi")) { NvapiProbe.Run(); return 0; }
             if (Option(args, "--characterize") is string characterizationPath)
             {
@@ -986,7 +1003,8 @@ public static class Program
                 Console.WriteLine(report.ToDeterministicJson());
                 return 0;
             }
-            string configPath = Path.GetFullPath(Option(args, "--config") ?? Path.Combine(AppContext.BaseDirectory, "config.json"));
+            if (DeploymentCommands.TryRun(args, out var deploymentExit)) return deploymentExit;
+            string configPath = DeploymentPaths.ResolveConfigPath(Option(args, "--config"));
             var c = JsonSerializer.Deserialize<Config>(File.ReadAllText(configPath))!; c.Validate();
             var root = Path.GetDirectoryName(configPath)!;
             if (c.HwinfoCsv.Length > 0) c.HwinfoCsv = Path.GetFullPath(c.HwinfoCsv, root);
@@ -996,7 +1014,7 @@ public static class Program
                 foreach (var h in Csv.Parse(HwinfoLog.ReadEnds(c.HwinfoCsv).Header, c.Delimiter[0])) Console.WriteLine(h);
                 return 0;
             }
-            string data = Path.GetFullPath(c.DataDirectory, root); Directory.CreateDirectory(data);
+            string data = DeploymentPaths.ResolveDataDirectory(configPath, c.DataDirectory); Directory.CreateDirectory(data);
             string? operatorCommand = args.Contains("--accept-reference") ? "accept-reference" :
                 args.Contains("--migrate-reference") ? "migrate-reference" :
                 args.Contains("--archive-reference") ? "archive-reference" :
@@ -1022,7 +1040,8 @@ public static class Program
                     control.InstanceId, new AnalysisProgress(0, c.BaselineSamples, 0, c.WindowSamples, 0, c.StableSamples));
             }
             var sourceMode = c.VoltageSource.Trim().ToLowerInvariant();
-            DirectNvRails? directSource = null;
+            using var driverApprovals = DriverApprovalService.CreateDefault(data);
+            ApprovalRailSource? directSource = null;
             IVoltageSource? voltageSource = null;
             string? sourceSetupError = null;
             if (sourceMode == "none")
@@ -1031,11 +1050,10 @@ public static class Program
             }
             else if (sourceMode is "direct" or "nvapi")
             {
-                try { directSource = new DirectNvRails(c); voltageSource = directSource; }
+                try { directSource = new ApprovalRailSource(c, driverApprovals); voltageSource = directSource; }
                 catch (Exception ex)
                 {
-                    return WriteStartupFailure(data, "direct NVIDIA rails", "Direct NVIDIA rail source unavailable: " + ex.Message,
-                        control.InstanceId, new AnalysisProgress(0, c.BaselineSamples, 0, c.WindowSamples, 0, c.StableSamples));
+                    sourceSetupError = "Direct NVIDIA rail source unavailable: " + ex.Message;
                 }
             }
             else if (sourceMode == "hwinfo")
@@ -1067,11 +1085,10 @@ public static class Program
                 }
                 else if (OperatingSystem.IsWindows())
                 {
-                    try { directSource = new DirectNvRails(c); voltageSource = directSource; }
+                    try { directSource = new ApprovalRailSource(c, driverApprovals); voltageSource = directSource; }
                     catch (Exception ex)
                     {
-                        return WriteStartupFailure(data, "direct NVIDIA rails", "Direct NVIDIA rail source unavailable: " + ex.Message,
-                            control.InstanceId, new AnalysisProgress(0, c.BaselineSamples, 0, c.WindowSamples, 0, c.StableSamples));
+                        sourceSetupError = "Direct NVIDIA rail source unavailable: " + ex.Message;
                     }
                 }
                 else
@@ -1080,6 +1097,12 @@ public static class Program
                 }
             }
             using var directLifetime = directSource;
+            control.ApprovalRefresh = () =>
+            {
+                if (directSource is null) return new(false, "The direct reader is unavailable for this hardware.");
+                directSource.RequestRefresh(true);
+                return new(true, "Checking driver approvals. The monitoring status will update automatically.");
+            };
             var providerIdentity = voltageSource?.Description ?? (sourceSetupError != null ? "direct NVIDIA rails unavailable" : "none");
             var analysisLoadSource = ResolveAnalysisLoadSource(c, sourceMode, voltageSource);
             var identity = $"v4|{c.GpuUuid}|source={sourceMode}|provider={providerIdentity}|{c.HwinfoCsv}|{c.RailJson}|{c.VoltageColumn}|{c.PowerColumn}|analysis-load={analysisLoadSource.WireName()}|qualification=hysteresis-v1|bin={c.BinWatts}|hysteresis={c.LoadBoundaryHysteresisWatts:R}|stable={c.StableSamples}|baseline={c.BaselineSamples}";
@@ -1091,7 +1114,8 @@ public static class Program
                 try { saved = JsonSerializer.Deserialize<Saved>(File.ReadAllText(baselinePath)); }
                 catch (JsonException) { /* typed reference.json remains authoritative */ }
             }
-            var referenceIdentity = BuildReferenceIdentity(c, sourceMode, providerIdentity, analysisLoadSource);
+            var referenceIdentity = BuildReferenceIdentity(c, sourceMode, providerIdentity, analysisLoadSource,
+                directSource?.DriverVersion ?? "external-source");
             bool hasPersistedReference = File.Exists(referencePath) || File.Exists(baselinePath);
             string? persistedReferenceJson = File.Exists(referencePath)
                 ? File.ReadAllText(referencePath)
@@ -1304,6 +1328,7 @@ public static class Program
             long? priorCompletedPoll = null;
             var storage = new HybridStorage(data, c.FlushSeconds);
             string? latestState = null;
+            bool restartForDriverChange = false;
             Console.WriteLine("ConnectorWatch: read-only telemetry. Ctrl+C/SIGTERM stops. No status certifies connector safety.");
             while (!stop.IsCancellationRequested && (count == 0 || n < count))
             {
@@ -1319,6 +1344,13 @@ public static class Program
                         electrical = voltageSource.ReadElectrical(now, c.MaxAgeSeconds);
                         v = electrical.ToLegacyVoltage();
                         status = "WAITING_FOR_FRESH_VOLTAGE";
+                    }
+                    catch (DriverApprovalPausedException ex)
+                    { status = ex.Status; detail = ex.Message; }
+                    catch (DriverSessionChangedException ex)
+                    {
+                        status = "DRIVER_CHANGED"; detail = ex.Message;
+                        restartForDriverChange = true; stop.Cancel();
                     }
                     catch (Exception ex) when (!voltageSource.TerminalOnFailure &&
                         (ex is IOException or FormatException or JsonException or ArgumentException or UnauthorizedAccessException))
@@ -1528,6 +1560,7 @@ public static class Program
                     gpu = g,
                     voltage = v,
                     voltage_source = voltageSource?.Description,
+                    driver_approval = directSource?.Diagnostics,
                     electrical,
                     analysis_load = load,
                     analysis = result,
@@ -1663,7 +1696,7 @@ public static class Program
                 PersistPowerLimitWatchdogLocked();
             }
             if (stop.IsCancellationRequested) Console.WriteLine("ConnectorWatch: shutdown requested; state saved.");
-            return 0;
+            return restartForDriverChange ? 42 : 0;
         }
         catch (Exception ex)
         {

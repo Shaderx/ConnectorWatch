@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -8,7 +9,7 @@ namespace ConnectorWatch;
 
 /// <summary>
 /// Read-only NVIDIA private power-monitor provider for the ASUS TUF RTX 5090
-/// on the validated 616.56 driver path.
+/// under an authenticated, exact driver approval.
 ///
 /// The private ABI is intentionally kept in this file.  The daemon only needs
 /// the IVoltageSource contract and does not need to know about NVAPI buffers.
@@ -31,7 +32,13 @@ public sealed class DirectNvRails : IElectricalSource, IDisposable
     // installed Windows driver.  These are the exact validated target gates.
     public const uint TargetPciIdentifier = 0x2B8510DE;
     public const uint TargetSubsystemIdentifier = 0x89EE1043;
-    public const string ExpectedDriverVersion = "616.56";
+    public string DriverVersion { get; }
+    public const string ReaderProfile = "A612-A613-v1";
+    public const string ReaderVersion = "1.0.0";
+    public static string AppVersion => typeof(DirectNvRails).Assembly.GetName().Version!.ToString(3);
+    private readonly Func<DriverIdentity, DriverApprovalDecision>? _approval;
+    private readonly bool _maintainerProbe;
+    private MaintainerNativeOperation? _lastOperation;
 
     private const uint NvApiInitializeId = 0x0150E828;
     private const uint NvApiUnloadId = 0xD22BDD7E;
@@ -98,6 +105,7 @@ public sealed class DirectNvRails : IElectricalSource, IDisposable
     private bool _disposed;
     private bool _terminal;
     private bool _timedOut;
+    private readonly DriverApprovalService? _ownedApprovals;
 
     /// <summary>
     /// Initializes the persistent NVAPI session and validates the target.
@@ -110,23 +118,43 @@ public sealed class DirectNvRails : IElectricalSource, IDisposable
     /// calls. NVML identity checks and public NVAPI setup calls are
     /// synchronous setup operations and have no worker watchdog.
     /// </summary>
-    public DirectNvRails(string gpuUuid, int timeoutMilliseconds = DefaultTimeoutMilliseconds)
+    public DirectNvRails(string gpuUuid, int timeoutMilliseconds = DefaultTimeoutMilliseconds,
+        bool validateDriverVersion = true)
+        : this(gpuUuid, DriverApprovalService.CreateDefault(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ConnectorWatch")),
+            validateDriverVersion, timeoutMilliseconds)
     {
-        if (!OperatingSystem.IsWindows())
-            throw new PlatformNotSupportedException("Direct NVAPI rails require Windows x64.");
-        if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
-            throw new PlatformNotSupportedException("Direct NVAPI rails require a Windows x64 process.");
-        if (string.IsNullOrWhiteSpace(gpuUuid))
-            throw new ArgumentException("A configured NVML GPU UUID is required.", nameof(gpuUuid));
-        if (timeoutMilliseconds < 100 || timeoutMilliseconds > 10_000)
-            throw new ArgumentOutOfRangeException(nameof(timeoutMilliseconds),
-                "The native-call watchdog must be between 100 and 10000 milliseconds.");
+    }
 
-        _gpuUuid = gpuUuid.Trim();
-        _timeoutMilliseconds = timeoutMilliseconds;
+    private DirectNvRails(string gpuUuid, DriverApprovalService approvals, bool validate, int timeoutMilliseconds)
+        : this(gpuUuid, identity => approvals.Decide(identity, ReaderProfile, ReaderVersion, AppVersion, !validate),
+            timeoutMilliseconds, false, approvals) { }
+
+    internal DirectNvRails(string gpuUuid, Func<DriverIdentity, DriverApprovalDecision> approval,
+        int timeoutMilliseconds = DefaultTimeoutMilliseconds)
+        : this(gpuUuid, approval, timeoutMilliseconds, false) { }
+
+    private DirectNvRails(string gpuUuid, Func<DriverIdentity, DriverApprovalDecision>? approval,
+        int timeoutMilliseconds, bool maintainerProbe, DriverApprovalService? ownedApprovals = null)
+    {
+        _ownedApprovals = ownedApprovals;
         IntPtr module = IntPtr.Zero;
         try
         {
+            if (!OperatingSystem.IsWindows())
+                throw new PlatformNotSupportedException("Direct NVAPI rails require Windows x64.");
+            if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+                throw new PlatformNotSupportedException("Direct NVAPI rails require a Windows x64 process.");
+            if (string.IsNullOrWhiteSpace(gpuUuid))
+                throw new ArgumentException("A configured NVML GPU UUID is required.", nameof(gpuUuid));
+            if (timeoutMilliseconds < 100 || timeoutMilliseconds > 10_000)
+                throw new ArgumentOutOfRangeException(nameof(timeoutMilliseconds),
+                    "The native-call watchdog must be between 100 and 10000 milliseconds.");
+
+            _gpuUuid = gpuUuid.Trim();
+            _timeoutMilliseconds = timeoutMilliseconds;
+            _approval = approval;
+            _maintainerProbe = maintainerProbe;
             module = LoadSystem32Library("nvapi64.dll");
             _nvApiModule = module;
 
@@ -138,13 +166,15 @@ public sealed class DirectNvRails : IElectricalSource, IDisposable
             _metadataCall = Function<NvApiPrivateCall>(query, MetadataFunctionId);
             _statusCall = Function<NvApiPrivateCall>(query, StatusFunctionId);
 
-            ValidateNvmlIdentity(_gpuUuid);
+            DriverVersion = ReadInstalledDriver(_gpuUuid);
 
             var initStatus = initialize();
             if (initStatus != 0)
                 throw new DirectNvRailsException($"NVAPI initialization failed with status {initStatus}.");
             _nvApiInitialized = true;
             _gpuHandle = SelectUniqueTarget(enumerate, getPci);
+
+            if (maintainerProbe) { _metadata = null!; return; }
 
             var metadataBuffer = CreateMetadataRequest();
             InvokePrivate(_metadataCall, metadataBuffer, "A612 metadata");
@@ -157,18 +187,47 @@ public sealed class DirectNvRails : IElectricalSource, IDisposable
             // stay loaded until process exit.
             if (!_timedOut)
                 CleanupNativeState(module);
+            _ownedApprovals?.Dispose();
             throw;
         }
     }
 
     /// <summary>Convenience overload for the existing ConnectorWatch config.</summary>
     public DirectNvRails(Config config)
-        : this(config?.GpuUuid ?? throw new ArgumentNullException(nameof(config)))
+        : this(config?.GpuUuid ?? throw new ArgumentNullException(nameof(config)),
+            validateDriverVersion: config.ValidateDriverVersion)
     {
     }
 
     public string Description =>
-        $"direct NVIDIA rails (PCIe +12V and 12VHPWR; A612/A613; driver {ExpectedDriverVersion}; UUID {_gpuUuid})";
+        Describe(_gpuUuid, DriverVersion);
+
+    internal static string Describe(string uuid, string driver) =>
+        $"direct NVIDIA rails (PCIe +12V and 12VHPWR; A612/A613; driver {driver}; UUID {uuid})";
+
+    internal static DriverIdentity IdentityForDriver(string driver) =>
+        new("10DE", "2B85", "89EE1043", "windows", "x64", driver);
+
+    /// <summary>Public APIs only. The native constructor repeats the PCI gate before private calls.</summary>
+    internal static DriverIdentity ObserveIdentity(string uuid)
+    {
+        string driver = ReadInstalledDriver(uuid);
+        IntPtr module = LoadSystem32Library("nvapi64.dll");
+        NvApiNoArgs? unload = null;
+        bool initialized = false;
+        try
+        {
+            var query = GetExport(module, "nvapi_QueryInterface");
+            var initialize = Function<NvApiNoArgs>(query, NvApiInitializeId);
+            unload = Function<NvApiNoArgs>(query, NvApiUnloadId);
+            if (initialize() != 0) throw new DirectNvRailsException("Unable to read the public GPU identity.");
+            initialized = true;
+            _ = SelectUniqueTarget(Function<NvApiEnumeratePhysicalGpus>(query, NvApiEnumPhysicalGpusId),
+                Function<NvApiGetPciIdentifiers>(query, NvApiPciIdentifiersId));
+            return IdentityForDriver(driver);
+        }
+        finally { if (initialized) unload!(); NativeLibrary.Free(module); }
+    }
 
     public string GpuUuid => _gpuUuid;
     public DirectRailMetadata Metadata => _metadata;
@@ -193,6 +252,10 @@ public sealed class DirectNvRails : IElectricalSource, IDisposable
                 InvokePrivate(_statusCall, statusBuffer, "A613 status");
                 var sample = DecodeStatus(statusBuffer, _metadata, now);
                 return ToElectricalSample(sample, Description);
+            }
+            catch (Exception ex) when (ex is DriverApprovalException or DriverSessionChangedException)
+            {
+                throw;
             }
             catch (DirectNvRailsException)
             {
@@ -346,9 +409,9 @@ public sealed class DirectNvRails : IElectricalSource, IDisposable
         {
             if (_disposed) return;
             _disposed = true;
-            if (_timedOut) return;
-            CleanupNativeState(_nvApiModule);
+            if (!_timedOut) CleanupNativeState(_nvApiModule);
         }
+        _ownedApprovals?.Dispose();
         GC.SuppressFinalize(this);
     }
 
@@ -361,6 +424,14 @@ public sealed class DirectNvRails : IElectricalSource, IDisposable
 
     private void InvokePrivate(NvApiPrivateCall entry, byte[] managedBuffer, string operation)
     {
+        if (!_maintainerProbe)
+        {
+            var observed = IdentityForDriver(ReadInstalledDriver(_gpuUuid));
+            if (observed.DriverVersion != DriverVersion) throw new DriverSessionChangedException();
+            (_approval ?? throw new InvalidOperationException("A verified driver decision is required."))(observed)
+                .RequireApplicable(observed, ReaderProfile, ReaderVersion, AppVersion);
+        }
+        var started = Stopwatch.StartNew();
         var worker = new NativeWorker(entry, _gpuHandle, managedBuffer);
         worker.Start();
         if (!worker.Join(_timeoutMilliseconds))
@@ -368,9 +439,13 @@ public sealed class DirectNvRails : IElectricalSource, IDisposable
             worker.AbandonAfterTimeout();
             _timedOut = true;
             _terminal = true;
+            _lastOperation = new(operation, Array.Empty<byte>(), int.MinValue, "not-checked-timeout", true, started.ElapsedMilliseconds);
             throw new DirectNvRailsException(
                 $"{operation} exceeded the {_timeoutMilliseconds} ms native-call watchdog; monitoring must terminate and NVAPI remains loaded until process exit.");
         }
+
+        _lastOperation = new(operation, managedBuffer.ToArray(), worker.ReturnCode,
+            worker.GuardStatus, false, started.ElapsedMilliseconds);
 
         if (worker.Error is not null)
         {
@@ -541,7 +616,13 @@ public sealed class DirectNvRails : IElectricalSource, IDisposable
         };
     }
 
-    private static void ValidateNvmlIdentity(string uuid)
+    internal static void ValidateDriverIdentityRead(int status, string version)
+    {
+        if (status != 0 || string.IsNullOrWhiteSpace(version))
+            throw new DirectNvRailsException($"Could not read the installed NVIDIA driver version (status {status}).");
+    }
+
+    internal static string ReadInstalledDriver(string uuid)
     {
         IntPtr module = IntPtr.Zero;
         var initialized = false;
@@ -568,13 +649,11 @@ public sealed class DirectNvRails : IElectricalSource, IDisposable
 
             var version = new StringBuilder(64);
             var driverStatus = getDriver(version, (uint)version.Capacity);
-            if (driverStatus != 0 || !string.Equals(version.ToString(), ExpectedDriverVersion,
-                    StringComparison.OrdinalIgnoreCase))
-                throw new DirectNvRailsException(
-                    $"The installed NVIDIA driver was '{version}' (status {driverStatus}); expected {ExpectedDriverVersion}.");
+            ValidateDriverIdentityRead(driverStatus, version.ToString());
 
             shutdown();
             initialized = false;
+            return version.ToString();
         }
         finally
         {
@@ -598,6 +677,29 @@ public sealed class DirectNvRails : IElectricalSource, IDisposable
             if (module != IntPtr.Zero)
                 NativeLibrary.Free(module);
         }
+    }
+
+    // Only the isolated maintainer command calls this factory. Normal constructors
+    // always need the catalog decision, including the developer escape hatch.
+    internal static IMaintainerNativeProbe CreateMaintainerProbe(string uuid) => new MaintainerProbe(uuid);
+
+    private sealed class MaintainerProbe : IMaintainerNativeProbe
+    {
+        private readonly DirectNvRails source;
+        public MaintainerProbe(string uuid) => source = new(uuid, null, DefaultTimeoutMilliseconds, true);
+        public MaintainerProbeIdentity Identity => new(TargetPciIdentifier, TargetSubsystemIdentifier,
+            source.DriverVersion, "windows", "x64", source.GpuUuid);
+        public MaintainerNativeOperation CaptureMetadata() => Capture(source._metadataCall, CreateMetadataRequest(), "A612 metadata");
+        public MaintainerNativeOperation CaptureStatus(uint mask) => Capture(source._statusCall, CreateStatusRequest(mask), "A613 status");
+        private MaintainerNativeOperation Capture(NvApiPrivateCall call, byte[] request, string operation)
+        {
+            source.EnsureUsable();
+            source._lastOperation = null;
+            try { source.InvokePrivate(call, request, operation); }
+            catch (DirectNvRailsException) when (source._lastOperation is not null) { }
+            return source._lastOperation ?? throw new InvalidOperationException("Native observation missing.");
+        }
+        public void Dispose() => source.Dispose();
     }
 
     private static T GetNvmlExport<T>(IntPtr module, string name) where T : Delegate

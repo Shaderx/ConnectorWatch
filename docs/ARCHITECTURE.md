@@ -44,11 +44,25 @@ The direct reader is a narrow Windows x64 provider for the validated NVIDIA path
 
 - PCI identity `PCI0x2B8510DE`;
 - subsystem identity `0x89EE1043`;
-- NVIDIA driver version `616.56`.
+- an exact observed driver version approved for the embedded `A612-A613-v1` reader
+  in the authenticated catalog.
 
 The public source does not embed a machine-specific GPU UUID. An empty or `auto` UUID in `config.json` asks NVML to enumerate devices and read the UUID only when exactly one NVIDIA GPU exists. An explicit UUID bypasses discovery. The resolved identity is used for logs and baseline identity and exposed as `gpu_uuid` in status.json; the configuration file is never rewritten. NVML initialization is balanced by shutdown even if discovery fails. Before a direct read is allowed, the managed NVML path and the native NVAPI path apply the single-GPU guard and verify that the configured GPU is the device being served. The guard uses NVML's device-count and UUID query surface; see the [official NVML device queries](https://docs.nvidia.com/deploy/nvml-api/group__nvmlDeviceQueries.html). Multiple visible GPUs fail closed, even if one of them has a familiar model name. The identity checks also reject an unsupported board or driver before any rail call.
 
-Native setup is one-shot. If the driver library is missing, the identity gate fails, initialization returns an unsupported result, or a native call cannot complete within the bounded wait, the daemon records `VOLTAGE_UNAVAILABLE` and stops. It does not retry the setup, fall through after a possible native timeout, unload a library while an in-flight call may still own its buffers, or write a hardware setting. This preserves a clear boundary between a verified direct source and an unavailable one.
+`DriverApprovalService` owns verification, bounded refresh and persistent rollback
+state. `ApprovalRailSource` owns one native session; an applicable decision is
+required before construction and before each private call. Missing, expired or
+withdrawn approval pauses private acquisition while public telemetry continues.
+A verified refresh can start or stop that session without reinstalling the app.
+Driver replacement flushes and restarts the monitoring session with its actual
+driver identity; catalog revision changes alone do not change reference identity.
+
+Native setup and integrity failures remain distinct from approval pauses. A
+missing library or failed public identity check leaves private readings unavailable.
+A private call failure or possible native timeout remains terminal: the application
+does not retry that call or unload a library while an in-flight call may own its
+buffers. No path writes a hardware setting. See [driver approvals](DRIVER-CATALOG.md)
+and [implementation evidence](DRIVER-APPROVAL-IMPLEMENTATION.md).
 
 The reader's decoder is guarded by request sizes, canaries, expected metadata, and freshness markers. Native work runs through a bounded worker path. A completed call disposes its task resources; an in-flight timed-out call retains ownership until it completes. This is a safety boundary for the process and does not establish a hardware freshness guarantee.
 

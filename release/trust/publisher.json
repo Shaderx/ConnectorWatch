@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "signing_mode": "SelfSigned",
+  "subject": "CN=ConnectorWatch (Self-Signed), O=ConnectorWatch Project",
+  "certificate_sha256": "2e7c221f2edfb2057140cb67d24a2ca4502e005069c47c232583ff8f10d9552e",
+  "certificate_thumbprint_sha1": "E2703B55BDF19D4E3927A29DD64A32447B40DF7E",
+  "not_before_utc": "2026-09-09T12:33:20.0000000Z",
+  "not_after_utc": "2029-09-10T12:33:20.0000000Z",
+  "certificate_file": "ConnectorWatch-SelfSigned-2026.cer"
+}

@@ -49,6 +49,12 @@ public static class ControlServerTests
 
             server.ReferenceCommand = request => new ControlCommandResult(
                 true, request.Operator ?? request.ClientId, "REFERENCE_ACCEPTED");
+            int refreshes = 0;
+            server.ApprovalRefresh = () => { refreshes++; return new(true, "Checking approvals"); };
+            Check(!SendAsync(server, new ControlRequest("refresh-driver-approvals", "gui-a", "old-instance"))
+                .GetAwaiter().GetResult().Ok && refreshes == 0, "stale instance cannot refresh approvals");
+            Check(SendAsync(server, new ControlRequest("refresh-driver-approvals", "gui-a", hello.InstanceId))
+                .GetAwaiter().GetResult().Ok && refreshes == 1, "approval refresh is identity-bound");
             var accept = SendAsync(server, new ControlRequest("accept-reference", "gui-a",
                 hello.InstanceId, "operator", "reviewed")).GetAwaiter().GetResult();
             Check(accept.Ok && accept.ReferenceState == "REFERENCE_ACCEPTED" &&

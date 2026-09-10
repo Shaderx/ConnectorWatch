@@ -1,0 +1,191 @@
+name: Publish protected driver catalog
+
+on:
+  workflow_dispatch:
+    inputs:
+      catalog_revision:
+        description: Positive revision greater than the last published catalog
+        required: true
+        type: number
+      issued_utc:
+        description: Exact UTC issue timestamp reviewed by the maintainer
+        required: true
+        type: string
+      expires_utc:
+        description: Exact UTC expiry timestamp, no more than 31 days after issue
+        required: true
+        type: string
+      proposal_paths:
+        description: Comma-separated approval/revocation proposal paths; empty performs a renewal
+        required: false
+        type: string
+      bootstrap_attestation_path:
+        description: One-time revision 1 attestation path; only the reviewed repository record is accepted
+        required: false
+        type: string
+      authorized_payload_sha256:
+        description: Exact lowercase payload digest from a prior Prepare run
+        required: true
+        type: string
+      maintainer_authorization:
+        description: Type the exact authorization sentence documented in MAINTAINER-APPROVALS.md
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: driver-catalog-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref_type == 'branch' && github.ref_protected
+    runs-on: windows-latest
+    timeout-minutes: 15
+    environment: driver-catalog-publication
+    permissions:
+      contents: write
+    env:
+      CONNECTORWATCH_CATALOG_PUBLICATION: protected-maintainer-environment
+      DRIVER_CATALOG_PUBLIC_KEY_SPKI_BASE64: ${{ vars.DRIVER_CATALOG_PUBLIC_KEY_SPKI_BASE64 }}
+      DRIVER_CATALOG_KEY_ID: ${{ vars.DRIVER_CATALOG_KEY_ID }}
+      DRIVER_CATALOG_PREVIOUS_KEY_SPKI_BASE64: ${{ vars.DRIVER_CATALOG_PREVIOUS_KEY_SPKI_BASE64 }}
+      DRIVER_CATALOG_PREVIOUS_KEY_ID: ${{ vars.DRIVER_CATALOG_PREVIOUS_KEY_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 8.0.x
+      - name: Validate workflow inputs
+        shell: pwsh
+        env:
+          PROPOSALS: ${{ inputs.proposal_paths }}
+          BOOTSTRAP_ATTESTATION: ${{ inputs.bootstrap_attestation_path }}
+          REVISION: ${{ inputs.catalog_revision }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:PROPOSALS -and $env:PROPOSALS -notmatch '^[A-Za-z0-9_./,-]+$') { throw 'Proposal paths contain unsupported characters.' }
+          if ($env:BOOTSTRAP_ATTESTATION) {
+            if ($env:BOOTSTRAP_ATTESTATION -cne 'docs/release/driver-approval-attestation.json') { throw 'Only the reviewed repository bootstrap attestation path is allowed.' }
+            if ([long]$env:REVISION -ne 1 -or $env:PROPOSALS) { throw 'Bootstrap attestation is allowed only for revision 1 without proposal paths.' }
+            if (-not (Test-Path -LiteralPath $env:BOOTSTRAP_ATTESTATION -PathType Leaf)) { throw 'Bootstrap attestation is missing from the checked-out revision.' }
+          }
+      - name: Restore catalog validator
+        shell: pwsh
+        run: dotnet restore src/ConnectorWatch/ConnectorWatch.csproj
+      - name: Enforce next immutable catalog revision
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REVISION: ${{ inputs.catalog_revision }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $releaseJson = gh release list --limit 1000 --json tagName,isDraft
+          if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate immutable catalog releases.' }
+          $revisions = @($releaseJson | ConvertFrom-Json | Where-Object { -not $_.isDraft -and $_.tagName -match '^driver-catalog-r([0-9]+)$' } | ForEach-Object { [long]$Matches[1] })
+          $expected = if ($revisions.Count -eq 0) { 1 } else { ($revisions | Measure-Object -Maximum).Maximum + 1 }
+          if ([long]$env:REVISION -ne $expected) { throw "Catalog revision must be the next immutable revision $expected." }
+      - name: Download current authenticated catalog state
+        shell: pwsh
+        env:
+          REVISION: ${{ inputs.catalog_revision }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = "https://github.com/$env:GH_REPO/releases/download/driver-catalog/catalog-current.json"
+          try { Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile previous-catalog.envelope.json }
+          catch {
+            $releaseJson = gh release list --limit 1000 --json tagName,isDraft
+            if ($LASTEXITCODE -ne 0) { throw 'Current catalog download and immutable release enumeration both failed.' }
+            $published = @($releaseJson | ConvertFrom-Json | Where-Object { -not $_.isDraft -and $_.tagName -match '^driver-catalog-r[0-9]+$' })
+            if ([long]$env:REVISION -ne 1 -or $published.Count -ne 0) { throw 'Missing current catalog is allowed only for revision 1 with no published immutable catalog releases.' }
+          }
+      - name: Build and verify exact catalog payload
+        shell: pwsh
+        env:
+          REVISION: ${{ inputs.catalog_revision }}
+          ISSUED: ${{ inputs.issued_utc }}
+          EXPIRES: ${{ inputs.expires_utc }}
+          PROPOSALS: ${{ inputs.proposal_paths }}
+          BOOTSTRAP_ATTESTATION: ${{ inputs.bootstrap_attestation_path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $proposalPaths = @($env:PROPOSALS.Split(',', [StringSplitOptions]::RemoveEmptyEntries))
+          $common = @{
+            ProposalPaths = $proposalPaths
+            CatalogRevision = [long]$env:REVISION
+            IssuedUtc = [DateTimeOffset]::Parse($env:ISSUED)
+            ExpiresUtc = [DateTimeOffset]::Parse($env:EXPIRES)
+            OutputDirectory = 'artifacts/driver-catalog'
+          }
+          if (Test-Path -LiteralPath 'previous-catalog.envelope.json') { $common.PreviousEnvelopePath = 'previous-catalog.envelope.json' }
+          if ($env:BOOTSTRAP_ATTESTATION) { $common.BootstrapAttestationPath = $env:BOOTSTRAP_ATTESTATION }
+          ./scripts/Publish-DriverCatalog.ps1 -Mode Prepare @common
+      - name: Authorize and sign exact catalog payload
+        shell: pwsh
+        env:
+          REVISION: ${{ inputs.catalog_revision }}
+          ISSUED: ${{ inputs.issued_utc }}
+          EXPIRES: ${{ inputs.expires_utc }}
+          PROPOSALS: ${{ inputs.proposal_paths }}
+          BOOTSTRAP_ATTESTATION: ${{ inputs.bootstrap_attestation_path }}
+          AUTHORIZED_DIGEST: ${{ inputs.authorized_payload_sha256 }}
+          AUTHORIZATION: ${{ inputs.maintainer_authorization }}
+          DRIVER_CATALOG_SIGNING_KEY_PEM: ${{ secrets.DRIVER_CATALOG_SIGNING_KEY_PEM }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $proposalPaths = @($env:PROPOSALS.Split(',', [StringSplitOptions]::RemoveEmptyEntries))
+          $common = @{
+            ProposalPaths = $proposalPaths
+            CatalogRevision = [long]$env:REVISION
+            IssuedUtc = [DateTimeOffset]::Parse($env:ISSUED)
+            ExpiresUtc = [DateTimeOffset]::Parse($env:EXPIRES)
+            OutputDirectory = 'artifacts/driver-catalog'
+          }
+          if (Test-Path -LiteralPath 'previous-catalog.envelope.json') { $common.PreviousEnvelopePath = 'previous-catalog.envelope.json' }
+          if ($env:BOOTSTRAP_ATTESTATION) { $common.BootstrapAttestationPath = $env:BOOTSTRAP_ATTESTATION }
+          ./scripts/Publish-DriverCatalog.ps1 -Mode Sign @common -AuthorizedPayloadSha256 $env:AUTHORIZED_DIGEST -MaintainerAuthorization $env:AUTHORIZATION
+      - name: Publish immutable catalog release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REVISION: ${{ inputs.catalog_revision }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "driver-catalog-r$env:REVISION"
+          gh release view $tag --json isDraft | Out-File -Encoding utf8 existing-release.json
+          if ($LASTEXITCODE -eq 0) {
+            $existing = Get-Content -Raw existing-release.json | ConvertFrom-Json
+            if (-not $existing.isDraft) { throw "Immutable catalog release already exists: $tag" }
+          } else {
+            gh release create $tag --target $env:GITHUB_SHA --draft --title "ConnectorWatch driver catalog revision $env:REVISION" --notes "Authenticated driver compatibility data. This is separate from application releases." --latest=false
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create the immutable catalog draft.' }
+          }
+          $assets = @('artifacts/driver-catalog/catalog.payload.json', 'artifacts/driver-catalog/catalog.envelope.json')
+          if (Test-Path -LiteralPath 'artifacts/driver-catalog/driver-approval-attestation.json') { $assets += 'artifacts/driver-catalog/driver-approval-attestation.json' }
+          gh release upload $tag @assets --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Could not upload immutable catalog assets; discovery remains unchanged.' }
+          gh release edit $tag --draft=false --latest=false
+          if ($LASTEXITCODE -ne 0) { throw 'Could not publish immutable catalog release; discovery remains unchanged.' }
+      - name: Publish discovery pointer last
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pointerTag = 'driver-catalog'
+          gh release view $pointerTag > $null 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $pointerTag --target $env:GITHUB_SHA --title 'ConnectorWatch driver catalog discovery' --notes 'Mutable discovery pointer. Clients authenticate the referenced immutable envelope and enforce monotonic revisions.' --latest=false
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create catalog discovery release.' }
+          }
+          gh release upload $pointerTag artifacts/driver-catalog/catalog-current.json --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Could not publish the catalog discovery alias.' }

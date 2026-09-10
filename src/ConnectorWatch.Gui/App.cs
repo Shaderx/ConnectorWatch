@@ -118,7 +118,7 @@ public sealed class App : Application
         try
         {
             bool demo = args.Contains("--demo");
-            string configPath = Path.GetFullPath(Option(args, "--config") ?? Path.Combine(AppContext.BaseDirectory, "config.json"));
+            string configPath = DeploymentPaths.ResolveConfigPath(Option(args, "--config"));
             var config = demo ? new GuiConfig { GpuUuid = "Demonstration · synthetic readings" } : JsonSerializer.Deserialize<GuiConfig>(TelemetryStore.ReadShared(configPath)) ?? throw new InvalidDataException("Invalid configuration");
             string data = demo ? Path.Combine(Path.GetTempPath(), "ConnectorWatch-demo") : Path.GetFullPath(config.DataDirectory, Path.GetDirectoryName(configPath)!);
             GuiLog.Current.Write("configuration_loaded", new { configPath, data, config.MaxAgeSeconds, config.SampleSeconds, demo });
@@ -194,7 +194,12 @@ public sealed class App : Application
                 using var server = new NamedPipeServerStream(endpoint, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
                 await server.WaitForConnectionAsync(ending.Token);
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ending.Token); timeout.CancelAfter(1500);
-                var bytes = new byte[1]; if (await server.ReadAsync(bytes, timeout.Token) > 0) await Dispatcher.InvokeAsync(window.Restore);
+                var bytes = new byte[1];
+                if (await server.ReadAsync(bytes, timeout.Token) > 0)
+                {
+                    if (bytes[0] == 2) await (await Dispatcher.InvokeAsync(window.ExitGui));
+                    else if (bytes[0] == 1) await Dispatcher.InvokeAsync(window.Restore);
+                }
             }
             catch (OperationCanceledException) { }
             catch (IOException) { await Task.Delay(500); }

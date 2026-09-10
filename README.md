@@ -1,8 +1,19 @@
 # ConnectorWatch
 
+Private rail monitoring requires an authenticated maintainer approval for the
+exact board, driver, and embedded reader. See [driver approvals](docs/DRIVER-CATALOG.md).
+The first catalog carries maintainer approvals for 616.56 and 616.92 on the
+documented ASUS TUF RTX 5090 identity; [616.92's evidence record](docs/DRIVER-616.92.md)
+distinguishes that approval from the available structural tests.
+
 A Windows-first dashboard for monitoring RTX 5090 input-rail voltage and electrical trends over time.
 
-[Download for Windows](https://github.com/Shaderx/ConnectorWatch/releases/tag/v1.4.0) · [User guide](docs/USER-GUIDE.md) · [Release notes](docs/RELEASE-1.4.0.md)
+[Download for Windows](https://github.com/Shaderx/ConnectorWatch/releases/download/app-stable/ConnectorWatch-Setup.exe) · [User guide](docs/USER-GUIDE.md) · [Release notes](docs/RELEASE-1.5.0.md)
+
+Version 1.5.0 uses the project's **self-signed certificate**. Windows can show an
+unrecognized publisher or SmartScreen prompt. Obtain it from this repository's
+release page and follow the [signature verification instructions](docs/INSTALLATION.md).
+The public CA signing path remains available for a later release.
 
 ![Electrical degradation confidence chart with synthetic demonstration data](docs/confidence-preview.png)
 
@@ -17,9 +28,16 @@ A Windows-first dashboard for monitoring RTX 5090 input-rail voltage and electri
 
 ## Start on Windows
 
-1. Download the **Windows x64 ZIP** and extract the entire folder. The .NET runtime is included.
-2. Run **`ConnectorWatch.Gui.exe`** or **`Start-GUI.cmd`**.
-3. Leave `GpuUuid` blank for automatic detection of one NVIDIA GPU. See the supported setup below before using the direct reader.
+The new installer is built through the protected signed-release process described
+in [installation and migration](docs/INSTALLATION.md). It installs for your Windows
+account, bundles the runtime, and preserves configuration and history on upgrades.
+The installer includes the signed driver catalog and application update trust.
+
+After installation, launch **ConnectorWatch** from the Start menu. Leave `GpuUuid`
+blank to detect one NVIDIA GPU. Version 1.5 checks driver approvals automatically
+and provides a manual refresh.
+If approval is pending, unavailable, or withdrawn, public GPU telemetry can continue
+while private rail readings are paused. Users do not need to validate drivers.
 
 Closing the window keeps monitoring in the system tray. Use **Stop monitoring and exit** to stop both applications, or **Exit GUI — keep monitoring** to close only the dashboard.
 
@@ -45,13 +63,17 @@ The confidence chart reads compressed recordings directly. Compression verifies 
 
 ## Upgrade without losing history
 
-Stop monitoring before replacing a running installation. Extract the new release into a fresh folder, preserve your **`config.json`**, and retain the existing **data directory**, including **`confidence-history.json`** and compressed recordings. If using a new folder, copy the data or point `DataDirectory` at its existing location. Upgrade the GUI and monitor together.
+The dashboard offers app updates with release notes and asks before restarting.
+The installer stops monitoring, backs up the previous application, and preserves
+configuration, references, and history. Its optional import page copies an existing
+portable configuration and recordings while retaining the original directory.
+See [installation and recovery](docs/INSTALLATION.md).
 
-Diagnostic logs remain outside the release folder and survive upgrades. Data is never automatically moved to a different installation.
+Diagnostic logs remain outside the release folder and survive upgrades.
 
 ## Supported setup
 
-**Experimental Windows x64 release.** The direct reader was physically validated on one **ASUS TUF RTX 5090**, NVIDIA driver **616.56**, with one NVIDIA GPU. Other boards and driver versions are unsupported by that reader; multiple GPUs fail closed. See [validation and limits](docs/VALIDATION.md).
+**Experimental Windows x64 release.** The direct reader was physically validated on one **ASUS TUF RTX 5090**, NVIDIA driver **616.56**, with one NVIDIA GPU. The signed catalog controls current acceptance; historical checks alone do not approve a driver. Multiple GPUs fail closed. See [validation and limits](docs/VALIDATION.md).
 
 ConnectorWatch measures voltage trends, not individual contact temperature or connector safety. It cannot guarantee a warning before damage. It does not change GPU settings or power limits.
 
@@ -59,4 +81,5 @@ ConnectorWatch measures voltage trends, not individual contact temperature or co
 
 [Configuration and operation](docs/USER-GUIDE.md) · [Architecture](docs/ARCHITECTURE.md) · [Offline replay](docs/REPLAY.md) · [Build and release](docs/RELEASING.md)
 
-[MIT license](LICENSE). Bundled runtimes retain their own licenses and notices. Windows executables are currently unsigned.
+[MIT license](LICENSE). Bundled runtimes retain their own licenses and notices.
+Published portable releases predate the signed-installer delivery pipeline.

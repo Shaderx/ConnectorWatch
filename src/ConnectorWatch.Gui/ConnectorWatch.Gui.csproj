@@ -1,4 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><OutputType>WinExe</OutputType><TargetFramework>net8.0-windows</TargetFramework><UseWPF>true</UseWPF><UseWindowsForms>true</UseWindowsForms><ImplicitUsings>disable</ImplicitUsings><Nullable>enable</Nullable><AssemblyName>ConnectorWatch.Gui</AssemblyName><ApplicationManifest>app.manifest</ApplicationManifest><ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode></PropertyGroup>
   <ItemGroup><Compile Include="../ConnectorWatch/ControlProtocol.cs" Link="ControlProtocol.cs" /></ItemGroup>
+  <ItemGroup><Compile Include="../ConnectorWatch/DeploymentPaths.cs" Link="DeploymentPaths.cs" /></ItemGroup>
+  <ItemGroup>
+    <Compile Include="../ConnectorWatch/SignedMetadata.cs" Link="SignedMetadata.cs" />
+    <Compile Include="../ConnectorWatch/SignedMetadataVerifier.cs" Link="SignedMetadataVerifier.cs" />
+    <Compile Include="../ConnectorWatch/AuthenticodeVerifier.cs" Link="AuthenticodeVerifier.cs" />
+    <Compile Include="../ConnectorWatch/AppUpdates.cs" Link="AppUpdates.cs" />
+  </ItemGroup>
 </Project>

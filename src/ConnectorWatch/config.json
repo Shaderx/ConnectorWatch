@@ -6,6 +6,7 @@
   "DataDirectory": "data",
   "DesktopAlerts": true,
   "VoltageSource": "direct",
+  "ValidateDriverVersion": true,
   "HwinfoCsv": "",
   "RailJson": "",
   "VoltageColumn": "",

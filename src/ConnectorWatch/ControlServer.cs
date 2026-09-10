@@ -36,6 +36,7 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
     /// <summary>Handles explicit incident lifecycle commands separately from
     /// reference acceptance so acknowledgement cannot alter the reference.</summary>
     public Func<ControlRequest, ControlCommandResult?>? IncidentCommand { get; set; }
+    public Func<ControlCommandResult>? ApprovalRefresh { get; set; }
 
     public ControlServer(string dataDirectory, CancellationTokenSource shutdown,
         string? instanceId = null, int? processId = null)
@@ -141,6 +142,7 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
                     "lease" when identityMatches => GrantLeaseLocked(request.ClientId, now),
                     "release" when identityMatches => ReleaseLeaseLocked(request.ClientId),
                     "stop" when identityMatches => true,
+                    "refresh-driver-approvals" when identityMatches => true,
                     "accept-reference" when identityMatches => true,
                     "migrate-reference" when identityMatches => true,
                     "archive-reference" when identityMatches => true,
@@ -170,6 +172,13 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
                     commandResult = new ControlCommandResult(false, ex.Message);
                     ok = false;
                 }
+            }
+
+            if (identityMatches && command == "refresh-driver-approvals")
+            {
+                try { commandResult = ApprovalRefresh?.Invoke() ?? new(false, "Driver approvals are not ready yet."); }
+                catch (Exception ex) { commandResult = new(false, ex.Message); }
+                ok = commandResult.Ok;
             }
 
             if (incidentCommandRequested)

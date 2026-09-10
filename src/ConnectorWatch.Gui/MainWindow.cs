@@ -15,7 +15,7 @@ using Drawing = System.Drawing;
 
 namespace ConnectorWatch.Gui;
 
-public sealed class MainWindow : Window
+public sealed partial class MainWindow : Window
 {
     public bool QuietTest { get; set; }
     readonly GuiConfig config;
@@ -69,6 +69,8 @@ public sealed class MainWindow : Window
     DateTimeOffset? focusTime;
     DateTimeOffset lastNotification;
     string operation = "";
+    bool awaitingApprovalRefresh;
+    DateTimeOffset? approvalCheckBeforeRefresh;
     public MainWindow(string configPath, GuiConfig config, string data, string settingsPath, bool demo, bool noStart, bool render)
     {
         this.configPath = configPath; this.config = config; this.data = data; this.settingsPath = settingsPath; this.demo = demo; this.noStart = noStart; this.render = render;
@@ -171,13 +173,25 @@ public sealed class MainWindow : Window
         var warningActions = new StackPanel { Orientation = Orientation.Horizontal }; warningActions.Children.Add(more); warningActions.Children.Add(ack);
         var warningPanel = Panel(Vertical(Header("Recent warnings", warningActions), warnings)); content.Children.Add(warningPanel);
         warnings.MouseDoubleClick += (_, _) => FocusWarning(); warnings.KeyDown += (_, e) => { if (e.Key == System.Windows.Input.Key.Enter) FocusWarning(); };
-        var actions = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 16, 0, 12) };
+        var actions = new WrapPanel { Margin = new Thickness(0, 16, 0, 12) };
         var details = Button("Sensor details"); details.Click += (_, _) => ShowDetails();
         var settingsButton = Button("Settings"); settingsButton.Click += (_, _) => ShowSettings();
+        var approvalsButton = Button("Refresh driver approval");
+        approvalsButton.Click += async (_, _) =>
+        {
+            if (demo) return;
+            await client.Send("hello");
+            approvalCheckBeforeRefresh = store.Current?.ApprovalCheckedUtc;
+            var reply = await client.Send("refresh-driver-approvals");
+            awaitingApprovalRefresh = reply is not null;
+            operation = reply?.Detail ?? "Could not contact the monitor. Start monitoring and try again.";
+            UpdateStatus();
+        };
+        updateButton.Click += async (_, _) => await CheckForAppUpdate(true);
         var logs = Button("Open logs"); logs.Click += (_, _) => OpenPath(data);
         var export = Button("Export visible CSV"); export.Click += (_, _) => Export();
         resumeLive.Visibility = Visibility.Collapsed; resumeLive.Click += (_, _) => { focusTime = null; RenderData(); };
-        foreach (var b in new[] { details, settingsButton, logs, export, resumeLive }) actions.Children.Add(b);
+        foreach (var b in new[] { details, settingsButton, approvalsButton, updateButton, logs, export, resumeLive }) actions.Children.Add(b);
         footer.Foreground = Palette.Muted;
         var shell = new DockPanel { Background = Palette.Bg };
         var bottom = new Border { Background = Palette.Bg, Padding = new Thickness(24, 0, 24, 12), Child = Vertical(actions, footer) }; DockPanel.SetDock(bottom, Dock.Bottom); shell.Children.Add(bottom);
@@ -224,6 +238,7 @@ public sealed class MainWindow : Window
             }
         }
         initialized = true; await Refresh(); if (!render) timer.Start();
+        if (!demo && !render && !QuietTest) _ = CheckForAppUpdate(false);
     }
     async Task Refresh()
     {
@@ -238,6 +253,8 @@ public sealed class MainWindow : Window
                 connected = await client.Send("hello") != null;
                 if (connected) await client.Send("lease");
                 await store.RefreshAsync();
+                if (awaitingApprovalRefresh && store.Current?.ApprovalCheckedUtc != approvalCheckBeforeRefresh)
+                { awaitingApprovalRefresh = false; operation = ""; }
                 QueueConfidenceRefresh();
                 if (store.ReadError.Length > 0) GuiLog.Current.Write("telemetry_read_error", new { data, store.ReadError }, throttle: true);
             }
@@ -292,7 +309,10 @@ public sealed class MainWindow : Window
         bannerText.Text = message; bannerText.Foreground = alert ? Palette.Red : !fresh || QualitySummary(s).Length > 0 || store.ReadError.Length > 0 ? Palette.Amber : Palette.Muted;
         banner.Background = Palette.Panel; banner.BorderBrush = alert ? Palette.Red : Palette.Line; banner.BorderThickness = new Thickness(1);
         powerPath.Text = $"Source path  {SourceLabel(s)}\n16-pin  {FormatValue(s?.ConnectorVoltage ?? s?.Voltage, "V", 3)}  ·  {FormatValue(s?.ConnectorCurrent ?? s?.Current, "A", 2)}  ·  {FormatValue(s?.ConnectorPower ?? (s?.ElectricalSource.Length == 0 ? s?.Power : null), "W", 1)}\nPCIe  {FormatValue(s?.PcieVoltage ?? s?.Pcie, "V", 3)}  ·  {FormatValue(s?.PcieCurrent ?? s?.PcieCurrent, "A", 2)}  ·  {FormatValue(s?.PciePower, "W", 1)}\nSelected analysis load  {FormatValue(s?.AnalysisLoadValue, s?.AnalysisLoadUnit, 1)}  ·  {SourceLabel(s?.AnalysisLoadSource)}  ·  {s?.AnalysisLoadStatus ?? "UNAVAILABLE"}";
-        degradation.Text = QualityDetails(s);
+        degradation.Text = QualityDetails(s) + (string.IsNullOrEmpty(s?.ApprovalState) ? "" :
+            $"\nDriver {s.DriverVersion} · catalog {s.CatalogRevision?.ToString() ?? "unavailable"} · {s.ApprovalDetail}" +
+            $"\nLast approval check: {s.ApprovalCheckedUtc?.ToLocalTime().ToString("g") ?? "not checked"}" +
+            (s.DriverUnvalidated ? " · UNVALIDATED DEVELOPER SESSION" : ""));
         if (tray != null)
         {
             tray.Icon = !fresh ? Drawing.SystemIcons.Error : alert ? Drawing.SystemIcons.Warning : Drawing.SystemIcons.Information;
@@ -317,6 +337,8 @@ public sealed class MainWindow : Window
         string alert = s.Status is "SUDDEN_DROOP" or "BASELINE_SHIFT" ? Friendly(s.Status) :
             s.ResidualDetectorAlert ? Friendly(s.ResidualDetectorStatus) : s.ActiveIncidentCount > 0 ? $"{s.ActiveIncidentCount} active incident(s) need attention" : "";
         if (alert.Length > 0) return alert + ". Save your work and reduce GPU load while investigating.";
+        if (s.Status is "DRIVER_AWAITING_APPROVAL" or "DRIVER_REVOKED" or "DRIVER_APPROVAL_UNAVAILABLE" or "APP_UPDATE_REQUIRED")
+            return (s.ApprovalDetail.Length > 0 ? s.ApprovalDetail : Friendly(s.Status)) + " Public GPU telemetry remains available.";
         if (operation.Length > 0) return operation;
         if (readError.Length > 0) return "Data read issue: " + readError;
         string quality = QualitySummary(s);
@@ -602,6 +624,7 @@ public sealed class MainWindow : Window
     public async Task ExitGui()
     {
         if (exiting) return; exiting = true; timer.Stop();
+        updateEnding.Cancel();
         if (!demo) await client.Send("release");
         await FlushConfidenceHistory(TimeSpan.FromSeconds(5));
         SaveSettings(); tray?.Dispose(); trayMenu?.Dispose(); SystemParameters.StaticPropertyChanged -= ThemeChanged; Close(); Application.Current.Shutdown();
@@ -746,6 +769,9 @@ public sealed class MainWindow : Window
     }
     public static string Friendly(string status) => status switch
     {
+        "DRIVER_AWAITING_APPROVAL" => "Awaiting maintainer approval", "DRIVER_REVOKED" => "Driver approval withdrawn",
+        "DRIVER_APPROVAL_UNAVAILABLE" => "Driver approval unavailable", "APP_UPDATE_REQUIRED" => "App update required",
+        "DRIVER_CHANGED" => "Checking the new driver",
         "SUDDEN_DROOP" => "Sudden voltage drop", "BASELINE_SHIFT" => "Sustained voltage shift", "VOLTAGE_UNAVAILABLE" => "Voltage unavailable", "MONITOR_STOPPED" => "Monitoring stopped",
         "LEARNING_REFERENCE" => "Learning reference", "WINDOW_WARMUP" => "Warming up comparison", "LOAD_SETTLING" => "Load settling", "NO_SHIFT_DETECTED" => "No shift detected",
         "OUTSIDE_ANALYSIS_RANGE" => "Waiting for steady load", "POWER_UNAVAILABLE" => "Power unavailable", "WAITING_FOR_FRESH_VOLTAGE" => "Waiting for fresh voltage",

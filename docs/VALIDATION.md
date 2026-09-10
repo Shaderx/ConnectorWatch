@@ -68,11 +68,11 @@ The production limits behind those results include bounded sample and warning in
 
 ## Physical support boundary
 
-The only physically validated native target is one ASUS TUF RTX 5090 configuration on Windows x64 with NVIDIA driver `616.56` and the exact native identity `PCI0x2B8510DE`, subsystem `0x89EE1043`. That scope does not certify every card sold under the same product name. Same-board units are experimental until independently checked. Multiple GPUs fail closed. Other boards and driver versions are unsupported by the direct reader.
+The historical physical validation used one ASUS TUF RTX 5090 configuration on Windows x64 with NVIDIA driver `616.56` and the exact native identity `PCI0x2B8510DE`, subsystem `0x89EE1043`. That scope does not certify every card sold under the same product name. Same-board units are experimental until independently checked. Multiple GPUs fail closed. In 1.5.0, current acceptance requires an authenticated catalog decision for the exact hardware, driver and reader. The maintainer explicitly approved 616.56 and 616.92 on 2026-09-10 for this scope. The [616.92 evidence record](DRIVER-616.92.md) remains a structural check with no independent idle/workload comparison; approval does not expand the measurements performed.
 
 A bounded read-only smoke check of the public source on that original ASUS TUF RTX 5090/driver combination produced three valid native samples and exited cleanly with exit code 0 and `stopped=true`, `stop_reason=sample_limit`. No production monitor remained running afterward. This finite check does not validate other boards, other driver versions, multi-GPU systems, long-duration operation, or every release-package build.
 
-The public configuration defaults to automatic UUID detection and uses the single-GPU guard in both the NVML and NVAPI paths. The source contains no machine-specific UUID allowlist. A direct setup failure, rejected identity, incompatible driver, possible native timeout, or multiple-GPU topology becomes `VOLTAGE_UNAVAILABLE`; setup is not retried and the daemon does not silently continue with a different provider.
+The public configuration defaults to automatic UUID detection and uses the single-GPU guard in both the NVML and NVAPI paths. The source contains no machine-specific UUID allowlist. Missing or revoked driver approval pauses private readings with an explicit approval status while public telemetry remains available. An invalid hardware identity leaves the private source unavailable. Private native integrity failures and possible timeouts remain terminal; the daemon does not silently substitute another voltage provider.
 
 ## What these checks cannot establish
 

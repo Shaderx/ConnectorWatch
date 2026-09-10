@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "keys": [
+    {
+      "key_id": "connectorwatch-catalog-2026-01",
+      "subject_public_key_info_base64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAETsPie7JUwxpSfY9iP2Vr3zNfcWadcN0XIuaV1AXQ+rbPrekzW7OPJThzV7cLltRoQN+b/HOD8Vyj4VTjHzJChA==",
+      "revoked": false
+    }
+  ]
+}

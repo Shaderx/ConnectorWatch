@@ -4,3 +4,7 @@
 *.yml text eol=lf
 *.ps1 text eol=crlf
 *.cmd text eol=crlf
+# Publication hashes bind these exact bytes on Windows and Linux checkouts.
+docs/release/*.json -text
+release/trust/*.json -text
+release/trust/*.cer binary

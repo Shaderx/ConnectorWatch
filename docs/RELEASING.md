@@ -4,6 +4,11 @@ Every branch push, pull request, and manual Actions run builds a fresh Windows p
 
 ## Publish a version
 
+The instructions below describe the legacy portable prerelease track. For 1.5.0
+signed Windows installers, use [protected application releases](APP-RELEASING.md).
+Driver catalogs use [their own protected publication workflow](MAINTAINER-APPROVALS.md).
+Both require explicit maintainer authorization and provisioned signing material.
+
 1. Set the version in `Directory.Build.props`. Both applications inherit it. Update release-facing documentation and commit the changes.
 2. Push the commit and wait for **Build, test and release** to pass.
 3. Tag that commit with the matching version, for example `git tag v1.1.3`, then `git push origin v1.1.3`.
@@ -11,7 +16,7 @@ Every branch push, pull request, and manual Actions run builds a fresh Windows p
 
 All automated releases remain **experimental prereleases**, including plain numeric version tags. Promoting a release to stable requires a deliberate maintainer decision and hardware validation; a green CI run does not expand native-reader support. Branch and manual runs never publish releases. Existing published release assets are never overwritten; use a new patch version to replace a shipped binary. Failed uploads leave a draft that the same tag run can finish on retry.
 
-The public ZIP contains a blank UUID configuration, runtime licenses and documentation. `build-info.json` records the source commit, runtime versions, checksum and GUI test counts. No user installation or local data directory is used as packaging input. Published executables are currently unsigned.
+The portable ZIP contains a blank UUID configuration, runtime licenses and documentation. `build-info.json` records the source commit, runtime versions, checksum and GUI test counts. No user installation or local data directory is used as packaging input. This legacy ZIP track is unsigned; production installer builds require Authenticode signatures and bundled public trust material.
 
 ## Local verification
 
@@ -23,4 +28,4 @@ On Windows with the .NET 8 SDK installed, run:
 
 The output directory must be empty or absent. To test tag validation, also pass `-ExpectedTag v1.1.2`. `scripts/Publish.ps1` remains available for updating a local installation while preserving configuration; `Package.ps1` is the clean release path.
 
-Actions are pinned to commit hashes. Dependabot proposes weekly action updates as pull requests; updates still need passing checks and maintainer review. Build and test jobs have read-only repository access. Only the tag release job can publish. Runtime packages resolve the current .NET 8 servicing version at build time; builds record that version but are not guaranteed to be byte-for-byte reproducible across time.
+Actions are pinned to commit hashes. Dependabot proposes weekly action updates as pull requests; updates still need passing checks and maintainer review. Build and test jobs have read-only repository access. Publication is limited to the legacy tag release job and separately protected catalog/app publication jobs. Runtime packages resolve the current .NET 8 servicing version at build time; builds record that version but are not guaranteed to be byte-for-byte reproducible across time.

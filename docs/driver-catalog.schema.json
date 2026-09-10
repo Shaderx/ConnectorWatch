@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Shaderx/ConnectorWatch/docs/driver-catalog.schema.json",
+  "title": "ConnectorWatch signed driver catalog payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "payload_type",
+    "schema_version",
+    "catalog_revision",
+    "issued_utc",
+    "expires_utc",
+    "entries"
+  ],
+  "properties": {
+    "payload_type": { "const": "connectorwatch-driver-catalog" },
+    "schema_version": { "const": 1 },
+    "catalog_revision": { "type": "integer", "minimum": 1 },
+    "issued_utc": { "$ref": "#/$defs/utcTimestamp" },
+    "expires_utc": { "$ref": "#/$defs/utcTimestamp" },
+    "entries": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/entry" }
+    }
+  },
+  "$defs": {
+    "utcTimestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "semanticVersion": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(\\.(0|[1-9][0-9]*)){0,2}$",
+      "maxLength": 32
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "vendor_id",
+        "device_id",
+        "subsystem_id",
+        "os",
+        "architecture",
+        "driver_version",
+        "reader_profile",
+        "minimum_reader_version",
+        "maximum_reader_version_exclusive",
+        "minimum_app_version",
+        "maximum_app_version_exclusive",
+        "decision",
+        "evidence_sha256",
+        "decision_utc",
+        "rationale"
+      ],
+      "properties": {
+        "vendor_id": { "type": "string", "pattern": "^[0-9A-F]{4}$" },
+        "device_id": { "type": "string", "pattern": "^[0-9A-F]{4}$" },
+        "subsystem_id": { "type": "string", "pattern": "^[0-9A-F]{8}$" },
+        "os": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,39}$" },
+        "architecture": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,39}$" },
+        "driver_version": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "reader_profile": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "minimum_reader_version": { "$ref": "#/$defs/semanticVersion" },
+        "maximum_reader_version_exclusive": { "$ref": "#/$defs/semanticVersion" },
+        "minimum_app_version": { "$ref": "#/$defs/semanticVersion" },
+        "maximum_app_version_exclusive": { "$ref": "#/$defs/semanticVersion" },
+        "decision": { "enum": ["approved", "revoked"] },
+        "evidence_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "decision_utc": { "$ref": "#/$defs/utcTimestamp" },
+        "rationale": { "type": "string", "minLength": 1, "maxLength": 500 }
+      }
+    }
+  }
+}

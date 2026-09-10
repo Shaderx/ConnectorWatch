@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "attestation_type": "connectorwatch-bootstrap-driver-approvals",
+  "policy": "one-time-initial-catalog-known-drivers",
+  "approver": "Shaderx",
+  "approval_utc": "2026-09-10T12:31:59Z",
+  "reason": "The authenticated repository maintainer explicitly approved NVIDIA driver 616.92 and the previously documented supported driver 616.56 for the initial signed catalog.",
+  "approvals": [
+    {
+      "vendor_id": "10DE",
+      "device_id": "2B85",
+      "subsystem_id": "89EE1043",
+      "os": "windows",
+      "architecture": "x64",
+      "driver_version": "616.56",
+      "reader_profile": "A612-A613-v1",
+      "minimum_reader_version": "1.0.0",
+      "maximum_reader_version_exclusive": "1.1.0",
+      "minimum_app_version": "1.5.0",
+      "maximum_app_version_exclusive": "1.6.0",
+      "validation_level": "historical_physical_validation",
+      "validation_record": "docs/VALIDATION.md",
+      "limitations": "Historical validation covered one original ASUS TUF RTX 5090 on Windows x64 and a bounded read-only smoke check. It does not validate other boards, multi-GPU systems, long-duration operation, every package build, or connector safety.",
+      "public_rationale": "Maintainer-approved existing driver based on the documented historical physical validation of the original ASUS TUF RTX 5090; approval remains limited to this exact hardware, platform, reader, and app range."
+    },
+    {
+      "vendor_id": "10DE",
+      "device_id": "2B85",
+      "subsystem_id": "89EE1043",
+      "os": "windows",
+      "architecture": "x64",
+      "driver_version": "616.92",
+      "reader_profile": "A612-A613-v1",
+      "minimum_reader_version": "1.0.0",
+      "maximum_reader_version_exclusive": "1.1.0",
+      "minimum_app_version": "1.5.0",
+      "maximum_app_version_exclusive": "1.6.0",
+      "validation_level": "structural_validation_without_independent_comparison",
+      "validation_record": "docs/DRIVER-616.92.md",
+      "limitations": "A612/A613 structure, guards, decoder behavior, and bounded sample progression passed, but no independent HWiNFO idle/workload voltage/current comparison was performed and native freshness remains unverified by the driver.",
+      "public_rationale": "Maintainer-approved existing driver based on the documented structural 616.92 check; no independent HWiNFO idle/workload comparison was performed, and approval remains limited to this exact hardware, platform, reader, and app range."
+    }
+  ]
+}

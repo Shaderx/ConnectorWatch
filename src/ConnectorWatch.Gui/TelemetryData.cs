@@ -36,6 +36,12 @@ public sealed class Snapshot
     public string Status { get; set; } = "WAITING_FOR_DATA";
     public string Detail { get; set; } = "";
     public string Source { get; set; } = "";
+    public string ApprovalState { get; set; } = "";
+    public string ApprovalDetail { get; set; } = "";
+    public string DriverVersion { get; set; } = "";
+    public long? CatalogRevision { get; set; }
+    public DateTimeOffset? ApprovalCheckedUtc { get; set; }
+    public bool DriverUnvalidated { get; set; }
     public string GpuUuid { get; set; } = "";
     public double? Voltage { get; set; }
     public double? Pcie { get; set; }
@@ -147,6 +153,14 @@ public sealed class Snapshot
             Source = Str(r, "voltage_source"), GpuUuid = Str(r, "gpu_uuid"),
             Schema = (int)(Num(r, "schema_version") ?? 0) };
         s.ElectricalSource = s.Source;
+        if (TryObject(r, "driver_approval", out var approval))
+        {
+            s.ApprovalState = Str(approval, "state"); s.ApprovalDetail = Str(approval, "detail");
+            s.DriverVersion = Str(approval, "driver_version");
+            s.CatalogRevision = (long?)Num(approval, "catalog_revision");
+            s.ApprovalCheckedUtc = Date(approval, "last_checked_utc");
+            s.DriverUnvalidated = Bool(approval, "unvalidated");
+        }
         if (TryObject(r, "voltage", out var v))
         {
             s.Voltage = Num(v, "Volts"); s.Power = Num(v, "Power");

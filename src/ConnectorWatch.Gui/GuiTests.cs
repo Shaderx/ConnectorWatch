@@ -14,6 +14,17 @@ public static class GuiTests
         DegradationConfidenceTests.Run(Check);
         ConfidenceHistoryTests.Run(Check);
         var now = DateTimeOffset.UtcNow;
+        var approvedDriver = Snapshot.Parse("""
+            {"driver_approval":{"state":"Revoked","detail":"Fixture revoked","driver_version":"999.99","catalog_revision":12,"unvalidated":false,"last_checked_utc":"2026-09-10T00:00:00Z"}}
+            """);
+        Check(approvedDriver.ApprovalState == "Revoked" && approvedDriver.CatalogRevision == 12 &&
+            approvedDriver.DriverVersion == "999.99" && approvedDriver.ApprovalCheckedUtc.HasValue,
+            "Driver approval diagnostics survive daemon-to-dashboard parsing");
+        approvedDriver.Status = "DRIVER_AWAITING_APPROVAL";
+        approvedDriver.ApprovalDetail = "This driver is awaiting maintainer approval.";
+        Check(MainWindow.StatusMessage(approvedDriver, true, 100).Contains("awaiting maintainer approval") &&
+            MainWindow.StatusMessage(approvedDriver, true, 100).Contains("Public GPU telemetry remains available"),
+            "Unknown approval is explained without labeling the driver defective");
         var collecting = Snapshot.Parse("""
             {"electrical":{"Connector":{"Voltage":{"Value":12.08},"Power":{"Value":34.5}},"Freshness":{"IsFresh":true,"Kind":"HostPollTimestampUnverified"}},
              "analysis_load":{"Value":34.5,"IsAvailable":true,"Freshness":{"IsFresh":true,"Kind":"HostPollTimestampUnverified"}},

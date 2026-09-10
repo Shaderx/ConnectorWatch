@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "metadata_url": "https://github.com/Shaderx/ConnectorWatch/releases/download/app-stable/app-current.json",
+  "metadata_keys": [
+    {
+      "key_id": "connectorwatch-app-metadata-2026-01",
+      "subject_public_key_info_base64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEt8/HrfTIj/Io1whA+KhRx9nmmdlT/UE2G+mnScJ54Qr1UvlLW05TKkvJZCnr/+WRzbundzhAS+J/WxaRHOkiGA==",
+      "revoked": false
+    }
+  ],
+  "publisher_certificate_sha256": [],
+  "self_signed_publisher_certificate_sha256": [
+    "2e7c221f2edfb2057140cb67d24a2ca4502e005069c47c232583ff8f10d9552e"
+  ]
+}

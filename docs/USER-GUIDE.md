@@ -2,7 +2,7 @@
 
 ConnectorWatch is an experimental Windows monitor for the 16-pin input-voltage trend of a supported RTX 5090 setup. It consists of a Windows WPF dashboard and a headless .NET 8 daemon. The daemon owns all GPU access, records timestamped telemetry, and evaluates voltage changes within comparable load bands. The dashboard reads the daemon's files and control endpoint.
 
-Release **v1.4.0** is experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Other units of the same board family are experimental, multi-GPU systems fail closed, and other boards or driver versions are unsupported by the direct reader.
+Version **1.5.0** remains experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Private readings require a signed maintainer decision for the exact board, driver and embedded reader. Multiple GPUs fail closed. The [physical validation record](VALIDATION.md) and [driver catalog](DRIVER-CATALOG.md) describe those separate boundaries.
 
 ![Synthetic dashboard preview](dashboard.png)
 
@@ -14,7 +14,9 @@ Licensed under [MIT](../LICENSE). Bundled Microsoft .NET runtimes retain their o
 
 ## Download and first run
 
-Download the Windows archive from [GitHub Releases](https://github.com/Shaderx/ConnectorWatch/releases). Extract the complete archive to a directory you control; the package is portable and includes the .NET 8 runtime. A compatible NVIDIA Windows driver is still required for NVML and the direct reader.
+Install the Windows package linked from the [project home page](../README.md), then launch ConnectorWatch from the Start menu. It bundles the runtime and installs for your Windows account. Configuration and history live under `%LOCALAPPDATA%\ConnectorWatch`. The installer can import an older portable installation; see [installation and migration](INSTALLATION.md). The first signed installer release still requires the maintainer prerequisites recorded there.
+
+The dashboard checks approvals automatically. If your driver is awaiting approval, approval has expired, or approval was withdrawn, private readings pause while public GPU telemetry continues. Use **Refresh driver approval** to check again; Sensor details shows the driver, catalog revision and last check. **Check for app updates** offers release notes and asks before downloading and restarting. Users do not need to run driver-validation tools.
 
 For a single NVIDIA GPU, leave `GpuUuid` blank (the default) or set it to `"auto"`, then launch the GUI. The daemon detects the UUID using NVML; no manual configuration or nvidia-smi command is needed. Sensor details shows the resolved UUID. Detection does not modify config.json, and all native board/driver restrictions still apply. Zero or multiple NVIDIA GPUs fail closed in automatic mode.
 
@@ -196,7 +198,7 @@ Telemetry-loss entries include the last snapshot time, sample age, freshness thr
 
 ## Support boundary
 
-The direct native path is intended for Windows x64 and retains the validated hardware identity `PCI0x2B8510DE`, subsystem `0x89EE1043`, with NVIDIA driver `616.56`. The physically validated scope is one ASUS TUF RTX 5090 configuration. Same-board units are experimental until independently checked. Multiple GPUs fail closed. Other boards and other driver versions are unsupported by the direct path and must not be treated as compatible because the card name looks similar.
+The direct native path is intended for Windows x64 and retains the hardware identity `PCI0x2B8510DE`, subsystem `0x89EE1043`. Historical physical validation used driver `616.56`; `616.92` has structural test evidence. The maintainer approved both versions for the initial catalog on 2026-09-10, with those evidence limits recorded. Current acceptance comes from an authenticated exact-scope catalog entry. Same-board units remain experimental, multiple GPUs fail closed, and a similar card name never establishes compatibility.
 
 The daemon's managed NVML telemetry core is portable in principle and can be built for other platforms, but this release supplies the Windows WPF GUI and the Windows direct rail reader. A Linux build may retain ordinary NVML logging where the driver provides `libnvidia-ml.so.1`; it does not provide the Windows native rail path or a Linux GUI.
 
@@ -204,6 +206,4 @@ HWiNFO CSV and newline-delimited JSON are optional source adapters in the daemon
 
 ## Automated releases
 
-Pushes and pull requests run Windows and Linux-core checks. Matching version tags publish tested Windows prereleases with checksums and build metadata. See [the release guide](RELEASING.md).
-
-
+Pushes and pull requests run Windows and Linux-core checks. Legacy version tags publish portable prereleases. Signed installers and driver catalogs have separate protected publication workflows with explicit maintainer authorization. See [the release guide](RELEASING.md).

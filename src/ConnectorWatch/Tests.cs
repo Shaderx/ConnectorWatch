@@ -146,6 +146,11 @@ public static class Tests
         HybridStorageTests.Run();
         TelemetryCompressionTests.Run();
         DirectNvRailsTests.Run();
+        DriverApprovalTests.Run();
+        MaintainerValidationTests.Run();
+        ReleaseTrustPreparationTests.Run();
+        DeploymentTests.Run();
+        AppUpdateTests.Run();
         ElectricalSamplesTests.Run();
         RailJsonTailTests.Run();
         CoarseRailGuardTests.Run();

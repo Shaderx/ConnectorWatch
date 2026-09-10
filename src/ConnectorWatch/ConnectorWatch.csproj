@@ -7,4 +7,7 @@
     <AssemblyName>ConnectorWatch</AssemblyName>
     <RootNamespace>ConnectorWatch</RootNamespace>
   </PropertyGroup>
+  <ItemGroup Condition="'$(DriverCatalogTrustSource)' != ''">
+    <Compile Include="$(DriverCatalogTrustSource)" Link="DriverCatalogReleaseTrust.Generated.cs" />
+  </ItemGroup>
 </Project>

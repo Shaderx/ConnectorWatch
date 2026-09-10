@@ -1,0 +1,379 @@
+name: Prepare or publish protected application release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode: { description: Prepare creates review artifact; Publish uses its exact installer, required: true, type: choice, options: [Prepare, Publish] }
+      signing_mode: { description: Authenticode trust policy for this release, required: true, type: choice, options: [PublicTrusted, SelfSigned], default: PublicTrusted }
+      prepared_run_id: { description: Prepare workflow run id required for Publish, required: false, type: string }
+      version: { description: Exact stable X.Y.Z version, required: true, type: string }
+      revision: { description: Next app metadata revision, required: true, type: number }
+      issued_utc: { description: Whole-second UTC issue time, required: true, type: string }
+      expires_utc: { description: Whole-second UTC expiry time, required: true, type: string }
+      release_notes_path: { description: Release notes path in protected ref, required: true, type: string }
+      catalog_trust_path: { description: Catalog public trust JSON path, required: true, type: string }
+      initial_catalog_path: { description: Initial signed catalog path, required: true, type: string }
+      app_trust_path: { description: App update public trust JSON path, required: true, type: string }
+      rollback_policy_path: { description: Optional bounded rollback policy JSON path, required: false, type: string }
+      authorized_installer_sha256: { description: Publish only; exact digest from Prepare artifact, required: false, type: string }
+      authorized_payload_sha256: { description: Publish only; exact digest from Prepare artifact, required: false, type: string }
+      maintainer_authorization: { description: Publish only; exact sentence from APP-RELEASING.md, required: false, type: string }
+
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: app-release-publication
+  cancel-in-progress: false
+
+jobs:
+  app-release:
+    if: github.ref_type == 'branch' && github.ref_protected
+    runs-on: windows-latest
+    timeout-minutes: 35
+    environment: app-release-publication
+    permissions:
+      contents: write
+      actions: read
+    env:
+      CONNECTORWATCH_APP_PUBLICATION: protected-app-release-environment
+      SIGNING_MODE: ${{ inputs.signing_mode }}
+      APP_RELEASE_PUBLIC_KEY_SPKI_BASE64: ${{ vars.APP_RELEASE_PUBLIC_KEY_SPKI_BASE64 }}
+      APP_RELEASE_KEY_ID: ${{ vars.APP_RELEASE_KEY_ID }}
+      APP_RELEASE_PREVIOUS_KEY_SPKI_BASE64: ${{ vars.APP_RELEASE_PREVIOUS_KEY_SPKI_BASE64 }}
+      APP_RELEASE_PREVIOUS_KEY_ID: ${{ vars.APP_RELEASE_PREVIOUS_KEY_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with: { dotnet-version: 8.0.x }
+      - name: Validate protected inputs and current app state
+        shell: pwsh
+        env:
+          MODE: ${{ inputs.mode }}
+          SIGNING_MODE: ${{ inputs.signing_mode }}
+          VERSION: ${{ inputs.version }}
+          REVISION: ${{ inputs.revision }}
+          PREPARED_RUN: ${{ inputs.prepared_run_id }}
+          NOTES: ${{ inputs.release_notes_path }}
+          CATALOG_TRUST: ${{ inputs.catalog_trust_path }}
+          INITIAL_CATALOG: ${{ inputs.initial_catalog_path }}
+          APP_TRUST: ${{ inputs.app_trust_path }}
+          ROLLBACK_POLICY: ${{ inputs.rollback_policy_path }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:VERSION -notmatch '^\d+\.\d+\.\d+$') { throw 'Version must be stable X.Y.Z.' }
+          if ($env:SIGNING_MODE -notin @('PublicTrusted','SelfSigned')) { throw 'Signing mode must be PublicTrusted or SelfSigned.' }
+          if ($env:MODE -eq 'Publish' -and $env:PREPARED_RUN -notmatch '^[0-9]+$') { throw 'Publish requires a numeric Prepare run id.' }
+          foreach ($path in @($env:NOTES,$env:CATALOG_TRUST,$env:INITIAL_CATALOG,$env:APP_TRUST)) { if ($path -notmatch '^[A-Za-z0-9_./-]+$') { throw 'Repository input paths contain unsupported characters.' } }
+          if ($env:ROLLBACK_POLICY -and $env:ROLLBACK_POLICY -notmatch '^[A-Za-z0-9_./-]+$') { throw 'Rollback policy path contains unsupported characters.' }
+          $json = gh release list --limit 1000 --json tagName,isDraft
+          if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate immutable app releases.' }
+          $metadataRevisions = @($json | ConvertFrom-Json | Where-Object { -not $_.isDraft } | ForEach-Object {
+            $match = [regex]::Match($_.tagName, '^app-metadata-r([0-9]+)$')
+            if ($match.Success) { [long]$match.Groups[1].Value }
+          })
+          $expectedRevision = if ($metadataRevisions.Count -eq 0) { 1 } else { ($metadataRevisions | Measure-Object -Maximum).Maximum + 1 }
+          if ([long]$env:REVISION -ne $expectedRevision) { throw "App metadata revision must be the next immutable revision $expectedRevision." }
+          if ($env:MODE -eq 'Publish') {
+            $preparedJson = gh api "repos/$env:GH_REPO/actions/runs/$env:PREPARED_RUN"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not authenticate the Prepare workflow run.' }
+            $prepared = $preparedJson | ConvertFrom-Json
+            if ($prepared.head_sha -cne $env:GITHUB_SHA -or $prepared.repository.full_name -cne $env:GH_REPO -or
+                $prepared.path -cne '.github/workflows/publish-app-release.yml' -or
+                $prepared.name -cne 'Prepare or publish protected application release' -or
+                $prepared.event -cne 'workflow_dispatch' -or $prepared.conclusion -cne 'success') {
+              throw 'Prepare artifact must come from a successful run of this workflow on this exact protected source commit.'
+            }
+          }
+          if ($env:MODE -eq 'Prepare') {
+            $targetJson = gh release view "app-v$env:VERSION" --json isDraft
+            if ($LASTEXITCODE -eq 0) {
+              if (($targetJson | ConvertFrom-Json).isDraft) { throw 'Target app release exists only as a draft; complete or remove that failed draft before Prepare.' }
+              Add-Content -LiteralPath $env:GITHUB_ENV -Value 'TARGET_APP_RELEASE_EXISTS=true'
+            } else { Add-Content -LiteralPath $env:GITHUB_ENV -Value 'TARGET_APP_RELEASE_EXISTS=false' }
+          }
+      - name: Restore
+        run: dotnet restore src/ConnectorWatch/ConnectorWatch.csproj
+      - name: Build release signature verifier from source
+        run: dotnet build src/ConnectorWatch/ConnectorWatch.csproj -c Release --no-restore
+      - name: Download current authenticated app metadata
+        shell: pwsh
+        env:
+          REVISION: ${{ inputs.revision }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $url = "https://github.com/$env:GH_REPO/releases/download/app-stable/app-current.json"
+          try { Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile previous-app.envelope.json }
+          catch {
+            $releaseJson = gh release list --limit 1000 --json tagName,isDraft
+            if ($LASTEXITCODE -ne 0) { throw 'Current metadata download and immutable release enumeration both failed.' }
+            $published = @($releaseJson | ConvertFrom-Json | Where-Object { -not $_.isDraft -and $_.tagName -match '^app-metadata-r[0-9]+$' })
+            if ([long]$env:REVISION -ne 1 -or $published.Count -ne 0) { throw 'Missing current metadata is allowed only for revision 1 with no published immutable app metadata releases.' }
+          }
+      - name: Install Inno Setup for Prepare
+        if: inputs.mode == 'Prepare' && env.TARGET_APP_RELEASE_EXISTS != 'true'
+        shell: pwsh
+        run: |
+          $bundled = Join-Path $env:GITHUB_WORKSPACE 'artifacts/build-tools/inno/ISCC.exe'
+          if (Test-Path $bundled) { Add-Content -LiteralPath $env:GITHUB_ENV -Value "ISCC_PATH=$bundled"; exit 0 }
+          $download = Join-Path $env:RUNNER_TEMP 'innosetup-7.1.0-x64.exe'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe' -OutFile $download
+          $hash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash
+          if ($hash -cne '0362A383ED217D4C4239B5933866DD96D3EB2102737DA92F80F6057A4B40DF2F') { throw 'Downloaded Inno Setup 7.1.0 hash does not match the pinned release asset.' }
+          $signature = Get-AuthenticodeSignature -LiteralPath $download
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'CN=Pyrsys B\.V\.') { throw 'Downloaded Inno Setup 7.1.0 publisher signature is not valid.' }
+          $install = Join-Path $env:RUNNER_TEMP 'inno-7.1.0'
+          Start-Process -FilePath $download -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/DIR=$install") -Wait -WindowStyle Hidden
+          $installed = Join-Path $install 'ISCC.exe'
+          if (-not (Test-Path $installed)) { throw 'Pinned Inno Setup 7.1.0 installation did not produce ISCC.exe.' }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "ISCC_PATH=$installed"
+      - name: Verify app metadata trust binding for Prepare
+        if: inputs.mode == 'Prepare'
+        shell: pwsh
+        env:
+          APP_TRUST: ${{ inputs.app_trust_path }}
+          SIGNING_MODE: ${{ inputs.signing_mode }}
+          APP_METADATA_KEY_ID: ${{ vars.APP_RELEASE_KEY_ID }}
+          APP_METADATA_PUBLIC_KEY: ${{ vars.APP_RELEASE_PUBLIC_KEY_SPKI_BASE64 }}
+        run: |
+          $appTrust = Get-Content -Raw -LiteralPath $env:APP_TRUST | ConvertFrom-Json -Depth 20
+          $trustedMetadataKey = @($appTrust.metadata_keys | Where-Object {
+            $_.key_id -ceq $env:APP_METADATA_KEY_ID -and $_.subject_public_key_info_base64 -ceq $env:APP_METADATA_PUBLIC_KEY -and -not $_.revoked
+          })
+          if ($trustedMetadataKey.Count -ne 1) { throw 'App trust input does not contain the protected non-revoked app metadata publication key.' }
+      - name: Build and Authenticode-sign installer for Prepare
+        if: inputs.mode == 'Prepare' && env.TARGET_APP_RELEASE_EXISTS != 'true'
+        shell: pwsh
+        env:
+          SIGNING_PFX_BASE64: ${{ secrets.APP_AUTHENTICODE_PFX_BASE64 }}
+          SIGNING_PFX_PASSWORD: ${{ secrets.APP_AUTHENTICODE_PFX_PASSWORD }}
+          TIMESTAMP_URL: ${{ vars.APP_AUTHENTICODE_TIMESTAMP_URL }}
+          VERSION: ${{ inputs.version }}
+          CATALOG_TRUST: ${{ inputs.catalog_trust_path }}
+          INITIAL_CATALOG: ${{ inputs.initial_catalog_path }}
+          APP_TRUST: ${{ inputs.app_trust_path }}
+          SIGNING_MODE: ${{ inputs.signing_mode }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (([xml](Get-Content Directory.Build.props -Raw)).Project.PropertyGroup.Version -cne $env:VERSION) { throw 'Version does not match source.' }
+          $pfx = Join-Path $env:RUNNER_TEMP 'app-signing.pfx'; [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_PFX_BASE64))
+          $password = ConvertTo-SecureString $env:SIGNING_PFX_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          try {
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse |
+              Where-Object FullName -like '*\x64\signtool.exe' | Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName
+            if (-not $signtool) { throw 'Required x64 SignTool was not found under the installed Windows SDK.' }
+            if (-not $env:ISCC_PATH -or -not (Test-Path $env:ISCC_PATH)) { throw 'Required Inno Setup compiler path is missing.' }
+            ./scripts/Build-Installer.ps1 -OutputDirectory artifacts/installer -ExpectedTag "v$env:VERSION" -IsccPath $env:ISCC_PATH -CatalogTrustPath $env:CATALOG_TRUST -InitialCatalogPath $env:INITIAL_CATALOG -AppTrustPath $env:APP_TRUST -SignToolPath $signtool -SignCertificateThumbprint $cert.Thumbprint -TimestampUrl $env:TIMESTAMP_URL -SigningMode $env:SIGNING_MODE
+          } finally { Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath "Cert:\CurrentUser\My\$($cert.Thumbprint)" -Force -ErrorAction SilentlyContinue }
+      - name: Pilot-test exact signed installer
+        if: inputs.mode == 'Prepare' && env.TARGET_APP_RELEASE_EXISTS != 'true'
+        shell: pwsh
+        env:
+          APP_TRUST: ${{ inputs.app_trust_path }}
+          SIGNING_MODE: ${{ inputs.signing_mode }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/Test-SignedInstaller.ps1 -InstallerPath artifacts/installer/ConnectorWatch-Setup.exe -VerifierPath artifacts/installer/stage/ConnectorWatch.exe -AppTrustPath $env:APP_TRUST -SigningMode $env:SIGNING_MODE -WorkDirectory artifacts/installer-pilot
+      - name: Reuse and verify existing immutable installer for Prepare
+        if: inputs.mode == 'Prepare' && env.TARGET_APP_RELEASE_EXISTS == 'true'
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_REPO: ${{ github.repository }}
+          APP_TRUST: ${{ inputs.app_trust_path }}
+          SIGNING_MODE: ${{ inputs.signing_mode }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/installer | Out-Null
+          $installer = [IO.Path]::GetFullPath('artifacts/installer/ConnectorWatch-Setup.exe')
+          Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/$env:GH_REPO/releases/download/app-v$env:VERSION/ConnectorWatch-Setup.exe" -OutFile $installer
+          $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($installer)
+          $embeddedVersion = "$($versionInfo.FileMajorPart).$($versionInfo.FileMinorPart).$($versionInfo.FileBuildPart)"
+          if ($embeddedVersion -cne $env:VERSION) { throw "Existing immutable installer embeds version $embeddedVersion instead of $env:VERSION." }
+          if ($env:SIGNING_MODE -eq 'SelfSigned') {
+            dotnet run --project src/ConnectorWatch/ConnectorWatch.csproj -c Release --no-build --no-restore -- --verify-release-signature --file $installer --app-trust $env:APP_TRUST
+            if ($LASTEXITCODE -ne 0) { throw 'Existing immutable installer self-signed verification failed.' }
+          } else {
+            $signature = Get-AuthenticodeSignature -LiteralPath $installer
+            if ($signature.Status -ne 'Valid') { throw 'Existing immutable installer Authenticode chain is not valid.' }
+            $certificate = $signature.SignerCertificate
+          }
+          if ($env:SIGNING_MODE -eq 'SelfSigned') {
+            $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+              [Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($installer))
+          }
+          if ($null -eq $certificate) { throw 'Existing immutable installer has no signer certificate.' }
+          $pin = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($certificate.RawData))
+          $trust = Get-Content -Raw -LiteralPath $env:APP_TRUST | ConvertFrom-Json -Depth 20
+          $allowedPins = if ($env:SIGNING_MODE -eq 'SelfSigned') { @($trust.self_signed_publisher_certificate_sha256) } else { @($trust.publisher_certificate_sha256) }
+          $allowedPins = @($allowedPins | ForEach-Object { $_.ToUpperInvariant() })
+          if ($pin -cnotin $allowedPins) { throw "Existing immutable installer signer is absent from $env:SIGNING_MODE app trust." }
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText([IO.Path]::GetFullPath('artifacts/installer/SHA256SUMS.txt'), "$hash  ConnectorWatch-Setup.exe`n")
+          foreach ($name in @('ConnectorWatch-publisher.cer','publisher.json')) {
+            try { Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/$env:GH_REPO/releases/download/app-v$env:VERSION/$name" -OutFile (Join-Path 'artifacts/installer' $name) }
+            catch { Write-Host "Optional immutable release asset is unavailable: $name" }
+          }
+          @{ version=$env:VERSION; sha256=$hash; signing_mode=$env:SIGNING_MODE; reused_immutable_release=$true } | ConvertTo-Json | Set-Content artifacts/installer/installer-build-info.json -Encoding utf8
+      - name: Prepare exact app metadata for maintainer review
+        if: inputs.mode == 'Prepare'
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          REVISION: ${{ inputs.revision }}
+          ISSUED: ${{ inputs.issued_utc }}
+          EXPIRES: ${{ inputs.expires_utc }}
+          NOTES: ${{ inputs.release_notes_path }}
+          ROLLBACK_POLICY: ${{ inputs.rollback_policy_path }}
+        run: |
+          $args = @{ Mode='Prepare'; InstallerPath='artifacts/installer/ConnectorWatch-Setup.exe'; ReleaseNotesPath=$env:NOTES; Version=$env:VERSION; Revision=[long]$env:REVISION; IssuedUtc=[DateTimeOffset]::Parse($env:ISSUED); ExpiresUtc=[DateTimeOffset]::Parse($env:EXPIRES); OutputDirectory='artifacts/app-release' }
+          if (Test-Path previous-app.envelope.json) { $args.PreviousEnvelopePath='previous-app.envelope.json' }
+          if ($env:ROLLBACK_POLICY) { $args.RollbackPolicyPath=$env:ROLLBACK_POLICY }
+          ./scripts/Publish-AppRelease.ps1 @args
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: inputs.mode == 'Prepare'
+        with:
+          name: prepared-app-release
+          path: |
+            artifacts/installer/ConnectorWatch-Setup.exe
+            artifacts/installer/SHA256SUMS.txt
+            artifacts/installer/installer-build-info.json
+            artifacts/installer/ConnectorWatch-publisher.cer
+            artifacts/installer/publisher.json
+            artifacts/installer-pilot/signed-installer-pilot.json
+            artifacts/installer-pilot/*.log
+            artifacts/app-release/app-release.payload.json
+            artifacts/app-release/authorization-request.json
+          retention-days: 14
+          if-no-files-found: error
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        if: inputs.mode == 'Publish'
+        with:
+          name: prepared-app-release
+          run-id: ${{ inputs.prepared_run_id }}
+          github-token: ${{ github.token }}
+          path: prepared
+      - name: Bind Publish to existing immutable target when present
+        if: inputs.mode == 'Publish'
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_REPO: ${{ github.repository }}
+          APP_TRUST: ${{ inputs.app_trust_path }}
+          SIGNING_MODE: ${{ inputs.signing_mode }}
+        run: |
+          $targetJson = gh release view "app-v$env:VERSION" --json isDraft
+          if ($LASTEXITCODE -ne 0) { Add-Content -LiteralPath $env:GITHUB_ENV -Value 'TARGET_APP_RELEASE_EXISTS=false'; return }
+          if (($targetJson | ConvertFrom-Json).isDraft) { throw 'Target app release is an incomplete draft.' }
+          $preparedInstallers = @(Get-ChildItem prepared -Filter ConnectorWatch-Setup.exe -Recurse -File)
+          if ($preparedInstallers.Count -ne 1) { throw 'Prepared artifact must contain exactly one installer.' }
+          $remote = Join-Path $env:RUNNER_TEMP 'immutable-target-installer.exe'
+          Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/$env:GH_REPO/releases/download/app-v$env:VERSION/ConnectorWatch-Setup.exe" -OutFile $remote
+          if ($env:SIGNING_MODE -eq 'SelfSigned') {
+            dotnet run --project src/ConnectorWatch/ConnectorWatch.csproj -c Release --no-build --no-restore -- --verify-release-signature --file $remote --app-trust $env:APP_TRUST
+            if ($LASTEXITCODE -ne 0) { throw 'Downloaded immutable installer self-signed verification failed.' }
+          } else {
+            $signature = Get-AuthenticodeSignature -LiteralPath $remote
+            if ($signature.Status -ne 'Valid') { throw 'Downloaded immutable installer Authenticode chain is not valid.' }
+          }
+          if ((Get-FileHash $remote -Algorithm SHA256).Hash -cne (Get-FileHash $preparedInstallers[0].FullName -Algorithm SHA256).Hash) { throw 'Prepared installer differs from the published immutable target installer.' }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'TARGET_APP_RELEASE_EXISTS=true'
+      - name: Rebuild metadata from prepared installer and sign
+        if: inputs.mode == 'Publish'
+        shell: pwsh
+        env:
+          APP_RELEASE_SIGNING_KEY_PEM: ${{ secrets.APP_RELEASE_SIGNING_KEY_PEM }}
+          VERSION: ${{ inputs.version }}
+          REVISION: ${{ inputs.revision }}
+          ISSUED: ${{ inputs.issued_utc }}
+          EXPIRES: ${{ inputs.expires_utc }}
+          NOTES: ${{ inputs.release_notes_path }}
+          INSTALLER_DIGEST: ${{ inputs.authorized_installer_sha256 }}
+          PAYLOAD_DIGEST: ${{ inputs.authorized_payload_sha256 }}
+          AUTHORIZATION: ${{ inputs.maintainer_authorization }}
+          APP_TRUST: ${{ inputs.app_trust_path }}
+          SIGNING_MODE: ${{ inputs.signing_mode }}
+          ROLLBACK_POLICY: ${{ inputs.rollback_policy_path }}
+        run: |
+          $installers = @(Get-ChildItem prepared -Filter ConnectorWatch-Setup.exe -Recurse -File)
+          if ($installers.Count -ne 1) { throw "Expected exactly one prepared ConnectorWatch-Setup.exe; found $($installers.Count)." }
+          $installer = $installers[0].FullName
+          $buildInfos = @(Get-ChildItem prepared -Filter installer-build-info.json -Recurse -File)
+          if ($buildInfos.Count -ne 1) { throw 'Prepared artifact must contain exactly one installer-build-info.json.' }
+          $buildInfo = Get-Content -Raw -LiteralPath $buildInfos[0].FullName | ConvertFrom-Json
+          if ($buildInfo.signing_mode -cne $env:SIGNING_MODE) { throw "Prepared installer signing mode $($buildInfo.signing_mode) does not match Publish signing mode $env:SIGNING_MODE." }
+          $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($installer)
+          $embeddedVersion = "$($versionInfo.FileMajorPart).$($versionInfo.FileMinorPart).$($versionInfo.FileBuildPart)"
+          if ($embeddedVersion -cne $env:VERSION) { throw "Prepared installer embeds version $embeddedVersion instead of $env:VERSION." }
+          if ($env:SIGNING_MODE -eq 'SelfSigned') {
+            dotnet run --project src/ConnectorWatch/ConnectorWatch.csproj -c Release --no-build --no-restore -- --verify-release-signature --file $installer --app-trust $env:APP_TRUST
+            if ($LASTEXITCODE -ne 0) { throw 'Prepared installer self-signed verification failed.' }
+          } else {
+            $signature = Get-AuthenticodeSignature -LiteralPath $installer
+            if ($signature.Status -ne 'Valid') { throw 'Prepared installer Authenticode chain is not valid.' }
+            $certificate = $signature.SignerCertificate
+          }
+          if ($env:SIGNING_MODE -eq 'SelfSigned') {
+            $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+              [Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($installer))
+          }
+          if ($null -eq $certificate) { throw 'Prepared installer has no signer certificate.' }
+          $publisherPin = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($certificate.RawData))
+          $appTrust = Get-Content -Raw -LiteralPath $env:APP_TRUST | ConvertFrom-Json -Depth 20
+          $allowedPins = if ($env:SIGNING_MODE -eq 'SelfSigned') { @($appTrust.self_signed_publisher_certificate_sha256) } else { @($appTrust.publisher_certificate_sha256) }
+          $allowedPins = @($allowedPins | ForEach-Object { $_.ToUpperInvariant() })
+          if ($publisherPin -cnotin $allowedPins) { throw 'Prepared installer signer is absent from the protected app trust publisher pins.' }
+          $args = @{ Mode='Sign'; InstallerPath=$installer; ReleaseNotesPath=$env:NOTES; Version=$env:VERSION; Revision=[long]$env:REVISION; IssuedUtc=[DateTimeOffset]::Parse($env:ISSUED); ExpiresUtc=[DateTimeOffset]::Parse($env:EXPIRES); OutputDirectory='artifacts/app-release'; AuthorizedInstallerSha256=$env:INSTALLER_DIGEST; AuthorizedPayloadSha256=$env:PAYLOAD_DIGEST; MaintainerAuthorization=$env:AUTHORIZATION }
+          if (Test-Path previous-app.envelope.json) { $args.PreviousEnvelopePath='previous-app.envelope.json' }
+          if ($env:ROLLBACK_POLICY) { $args.RollbackPolicyPath=$env:ROLLBACK_POLICY }
+          ./scripts/Publish-AppRelease.ps1 @args
+          Copy-Item $installer artifacts/app-release/ConnectorWatch-Setup.exe
+          foreach ($name in @('SHA256SUMS.txt','ConnectorWatch-publisher.cer','publisher.json','installer-build-info.json')) {
+            $candidate = Get-ChildItem prepared -Filter $name -Recurse -File | Select-Object -First 1
+            if ($candidate) { Copy-Item $candidate.FullName (Join-Path 'artifacts/app-release' $name) }
+          }
+      - name: Publish immutable app release before discovery
+        if: inputs.mode == 'Publish' && env.TARGET_APP_RELEASE_EXISTS != 'true'
+        shell: pwsh
+        env: { GH_TOKEN: '${{ github.token }}', GH_REPO: '${{ github.repository }}', VERSION: '${{ inputs.version }}', NOTES: '${{ inputs.release_notes_path }}', SIGNING_MODE: '${{ inputs.signing_mode }}' }
+        run: |
+          $tag="app-v$env:VERSION"; gh release view $tag --json isDraft | Out-File existing.json
+          if ($LASTEXITCODE -eq 0) { if (-not (Get-Content -Raw existing.json | ConvertFrom-Json).isDraft) { throw 'Immutable app release exists.' } }
+          else {
+            $title = if ($env:SIGNING_MODE -eq 'SelfSigned') { "ConnectorWatch $env:VERSION (self-signed)" } else { "ConnectorWatch $env:VERSION" }
+            gh release create $tag --target $env:GITHUB_SHA --draft --title $title --notes-file $env:NOTES --latest=false
+            if ($LASTEXITCODE -ne 0) { throw 'Draft creation failed.' }
+          }
+          $assets = @('artifacts/app-release/ConnectorWatch-Setup.exe','artifacts/app-release/app-release.payload.json','artifacts/app-release/app-release.envelope.json','artifacts/app-release/SHA256SUMS.txt','artifacts/app-release/ConnectorWatch-publisher.cer','artifacts/app-release/publisher.json') | Where-Object { Test-Path $_ }
+          gh release upload $tag @assets --clobber; if ($LASTEXITCODE -ne 0) { throw 'Immutable upload failed.' }
+          gh release edit $tag --draft=false --latest; if ($LASTEXITCODE -ne 0) { throw 'Immutable publish failed.' }
+      - name: Publish immutable app metadata revision
+        if: inputs.mode == 'Publish'
+        shell: pwsh
+        env: { GH_TOKEN: '${{ github.token }}', GH_REPO: '${{ github.repository }}', REVISION: '${{ inputs.revision }}' }
+        run: |
+          $tag="app-metadata-r$env:REVISION"; gh release view $tag --json isDraft | Out-File existing-metadata.json
+          if ($LASTEXITCODE -eq 0) { if (-not (Get-Content -Raw existing-metadata.json | ConvertFrom-Json).isDraft) { throw 'Immutable app metadata revision exists.' } }
+          else { gh release create $tag --target $env:GITHUB_SHA --draft --title "ConnectorWatch app metadata revision $env:REVISION" --notes 'Immutable authenticated application update metadata.' --latest=false; if ($LASTEXITCODE -ne 0) { throw 'Metadata draft creation failed.' } }
+          gh release upload $tag artifacts/app-release/app-release.payload.json artifacts/app-release/app-release.envelope.json --clobber; if ($LASTEXITCODE -ne 0) { throw 'Immutable metadata upload failed; discovery unchanged.' }
+          gh release edit $tag --draft=false --latest=false; if ($LASTEXITCODE -ne 0) { throw 'Immutable metadata publish failed; discovery unchanged.' }
+      - name: Publish stable installer and signed discovery last
+        if: inputs.mode == 'Publish'
+        shell: pwsh
+        env: { GH_TOKEN: '${{ github.token }}', GH_REPO: '${{ github.repository }}', SIGNING_MODE: '${{ inputs.signing_mode }}' }
+        run: |
+          $tag='app-stable'; gh release view $tag >$null 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            $title = if ($env:SIGNING_MODE -eq 'SelfSigned') { 'ConnectorWatch stable application (self-signed)' } else { 'ConnectorWatch stable application' }
+            gh release create $tag --target $env:GITHUB_SHA --title $title --notes 'Stable signed installer and authenticated app metadata.' --latest=false
+            if ($LASTEXITCODE -ne 0) { throw 'Stable release creation failed.' }
+          }
+          $assets = @('artifacts/app-release/ConnectorWatch-Setup.exe','artifacts/app-release/SHA256SUMS.txt','artifacts/app-release/ConnectorWatch-publisher.cer','artifacts/app-release/publisher.json') | Where-Object { Test-Path $_ }
+          gh release upload $tag @assets --clobber; if ($LASTEXITCODE -ne 0) { throw 'Stable installer upload failed; discovery unchanged.' }
+          gh release upload $tag artifacts/app-release/app-current.json --clobber; if ($LASTEXITCODE -ne 0) { throw 'App discovery upload failed.' }
