@@ -28,9 +28,10 @@ public sealed class Config
     public int FlushSeconds { get; set; } = 30;
     public string DataDirectory { get; set; } = "data";
     public bool DesktopAlerts { get; set; } = true;
-    // Automatic promotion is opt-in and is persisted by the daemon when the
-    // GUI changes it through the identity-bound control endpoint.
-    public bool AutoAcceptReference { get; set; }
+    // Automatic promotion is enabled for new and pre-1.5.1 configurations by
+    // default. An explicitly persisted false remains the operator opt-out;
+    // the daemon persists changes through the identity-bound control endpoint.
+    public bool AutoAcceptReference { get; set; } = true;
     // auto prefers a configured external source, then the direct Windows rail
     // provider. Explicit values are direct/nvapi, hwinfo, json, or none.
     public string VoltageSource { get; set; } = "auto";

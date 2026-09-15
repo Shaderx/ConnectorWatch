@@ -4,7 +4,7 @@ Application releases use two distinct signatures: Authenticode signs the
 Windows binaries and installer, while the app metadata key signs the exact
 installer digest and update policy. Neither key is a driver-catalog key.
 The workflow's `signing_mode` input is `PublicTrusted` by default. The first
-1.5.0 protected release and the 1.5.1 patch use `SelfSigned` while the public CA
+1.5.0 protected release and the 1.5.x patches use `SelfSigned` while the public CA
 identity is being provisioned. Continue using the existing self-signed identity
 until the bridge rotation described below has been prepared and reviewed.
 
@@ -30,7 +30,7 @@ previous-key variables after the transition. Publication never accepts a trust
 key fetched from the envelope it is trying to verify.
 
 First dispatch `mode: Prepare` and select `signing_mode: SelfSigned` for the
-1.5.0 and 1.5.1 releases. Select `PublicTrusted` only after the reviewed bridge
+1.5.x releases. Select `PublicTrusted` only after the reviewed bridge
 rotation has delivered the new signer pin to existing clients. Supply the catalog trust, initial signed
 catalog, and app trust files embedded by `Build-Installer.ps1`, plus exact
 version, metadata revision, whole-second UTC issue/expiry times, and release
@@ -43,6 +43,14 @@ contain the protected app metadata public key as one non-revoked key. Its
 be empty only when `self_signed_publisher_certificate_sha256` contains a pin.
 A bridge release may contain both arrays; the selected `signing_mode`
 determines which array the build and publication checks use.
+
+Starting with 1.5.2, publication copies the exact signed installer to
+`ConnectorWatch-Setup-<version>.exe`, which is the filename in signed update
+metadata and the primary download link. The canonical build filename remains
+`ConnectorWatch-Setup.exe`; publication also retains that compatibility alias.
+Both names have identical signed bytes and entries in `SHA256SUMS.txt`.
+Metadata renewal for the immutable 1.5.0 and 1.5.1 releases retains their
+original unversioned installer URLs.
 
 `SelfSigned` builds do not require an external timestamp service and omit
 timestamping. Their certificate validity is checked at verification time; they
@@ -100,13 +108,13 @@ that release; self-signed releases are titled with `(self-signed)`. Existing ver
 payload/envelope is separately preserved under immutable
 `app-metadata-r<revision>`. Only after the target binary and metadata revision
 are both immutable does the workflow update the `app-stable` release:
-the stable `ConnectorWatch-Setup.exe` first and the signed `app-current.json`
+the versioned stable installer and compatibility `ConnectorWatch-Setup.exe` alias first, and the signed `app-current.json`
 discovery alias last. Existing immutable releases are refused and public `v*`
 portable releases are untouched.
 
 Prepare artifacts expire after 14 days. If inputs, installer bytes, notes, or
 trust material change, run Prepare again and review the new digests. Failed
-draft upload or publication leaves stable discovery unchanged. For 1.5.0 and 1.5.1,
+draft upload or publication leaves stable discovery unchanged. For 1.5.x,
 Windows can display an “Unknown publisher” warning because the release uses a
 self-signed certificate. Users should inspect the
 `ConnectorWatch-publisher.cer` SHA-256 fingerprint and the matching

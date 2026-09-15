@@ -12,8 +12,14 @@ public static class AutoAcceptReferenceTests
         var qualified = Candidate(identity, now, isQualified: true);
         var incomplete = Candidate(identity, now, isQualified: false);
 
-        Check(!new Config().AutoAcceptReference,
-            "automatic reference acceptance is opt-in by default");
+        Check(new Config().AutoAcceptReference,
+            "automatic reference acceptance defaults on for new configurations");
+        Check(JsonSerializer.Deserialize<Config>("{}")!.AutoAcceptReference,
+            "missing policy field upgrades a pre-1.5.1 configuration to enabled");
+        Check(JsonSerializer.Deserialize<Config>("{\"AutoAcceptReference\":true}")!.AutoAcceptReference,
+            "explicitly enabled policy survives deserialization");
+        Check(!JsonSerializer.Deserialize<Config>("{\"AutoAcceptReference\":false}")!.AutoAcceptReference,
+            "explicitly disabled policy survives deserialization");
         var configPath = Path.Combine(Path.GetTempPath(),
             "ConnectorWatch-auto-config-" + Guid.NewGuid().ToString("N") + ".json");
         try

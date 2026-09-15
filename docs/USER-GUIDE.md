@@ -2,7 +2,7 @@
 
 ConnectorWatch is an experimental Windows monitor for the 16-pin input-voltage trend of a supported RTX 5090 setup. It consists of a Windows WPF dashboard and a headless .NET 8 daemon. The daemon owns all GPU access, records timestamped telemetry, and evaluates voltage changes within comparable load bands. The dashboard reads the daemon's files and control endpoint.
 
-Version **1.5.1** remains experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Private readings require a signed maintainer decision for the exact board, driver and embedded reader. Multiple GPUs fail closed. The [physical validation record](VALIDATION.md) and [driver catalog](DRIVER-CATALOG.md) describe those separate boundaries.
+Version **1.5.2** remains experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Private readings require a signed maintainer decision for the exact board, driver and embedded reader. Multiple GPUs fail closed. The [physical validation record](VALIDATION.md) and [driver catalog](DRIVER-CATALOG.md) describe those separate boundaries.
 
 ![Synthetic dashboard preview](dashboard.png)
 
@@ -49,10 +49,11 @@ accept the learned reference. In the dashboard, **Accept reference** becomes
 available when the candidate is ready. Acceptance freezes the baseline used
 for future comparisons.
 
-Enable **Automatically accept qualified reference** to let the monitor perform
-that step once enough qualified samples have been collected. The setting is
+**Automatically accept qualified reference** is enabled by default, letting the
+monitor perform that step once enough qualified samples have been collected. The setting is
 saved as `AutoAcceptReference` in `config.json`, applies without a restart, and
-continues working when the GUI is closed. It is off by default. Automatic
+continues working when the GUI is closed. An explicitly saved `false` remains
+off after an upgrade; configurations without the setting use the new default. Automatic
 acceptance never replaces an accepted baseline or migrates a legacy reference;
 identity and source checks still apply. Turning it off stops future automatic
 acceptance but does not undo an already accepted reference.

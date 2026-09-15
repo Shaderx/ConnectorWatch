@@ -85,12 +85,17 @@ if ($null -ne $previous) {
         }
     }
 }
+# The first two immutable installer releases predate versioned asset names.
+# Keep their URLs valid when renewing metadata or preparing a reviewed rollback.
+$installerAssetName = if ([version]$Version -lt [version]'1.5.2') {
+    'ConnectorWatch-Setup.exe'
+} else { "ConnectorWatch-Setup-$Version.exe" }
 $payload = [ordered]@{
     payload_type = 'app-release'; schema_version = 1; revision = $Revision
     issued_utc = $IssuedUtc.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     expires_utc = $ExpiresUtc.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     version = $Version
-    installer_url = "https://github.com/$Repository/releases/download/app-v$Version/ConnectorWatch-Setup.exe"
+    installer_url = "https://github.com/$Repository/releases/download/app-v$Version/$installerAssetName"
     installer_sha256 = $installerHash; installer_size = $installer.Length; release_notes = $notes
     minimum_data_schema = 3; maximum_data_schema = 3; rollback = $rollback
 }
