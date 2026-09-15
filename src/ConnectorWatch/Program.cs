@@ -28,6 +28,9 @@ public sealed class Config
     public int FlushSeconds { get; set; } = 30;
     public string DataDirectory { get; set; } = "data";
     public bool DesktopAlerts { get; set; } = true;
+    // Automatic promotion is opt-in and is persisted by the daemon when the
+    // GUI changes it through the identity-bound control endpoint.
+    public bool AutoAcceptReference { get; set; }
     // auto prefers a configured external source, then the direct Windows rail
     // provider. Explicit values are direct/nvapi, hwinfo, json, or none.
     public string VoltageSource { get; set; } = "auto";
@@ -655,6 +658,10 @@ internal sealed class DifferentialModelRuntime
 
     public DifferentialModelArtifact? Artifact { get; private set; }
     public int LearningSampleCount => learningSamples.Count;
+    // Monotonic admitted-evidence count. Unlike LearningSampleCount, this
+    // continues advancing when the bounded in-memory window evicts its oldest
+    // sample, so automatic fit retries cannot stop at the cap.
+    public long LearningSampleGeneration { get; private set; }
     public CompositeResidualDetectorResult? LastDetector { get; private set; }
     public DifferentialPrediction? LastPrediction { get; private set; }
     public DifferentialModelOptions Options => options;
@@ -665,6 +672,7 @@ internal sealed class DifferentialModelRuntime
         if (!artifact.Identity.Matches(options.Identity) || artifact.LoadProxy != options.LoadProxy)
             throw new InvalidDataException("Differential artifact identity does not match the current monitor.");
         Artifact = artifact;
+        LearningSampleGeneration = 0;
         detector.Reset();
         LastPrediction = null;
         LastDetector = null;
@@ -676,16 +684,28 @@ internal sealed class DifferentialModelRuntime
         var result = DifferentialModelTrainer.Fit(learningSamples, fitOptions);
         Artifact = result.Artifact;
         learningSamples.Clear();
+        LearningSampleGeneration = 0;
         detector.Reset();
         LastPrediction = null;
         LastDetector = null;
         return result;
     }
 
+    /// <summary>Checks whether the evidence collected so far can produce a
+    /// usable frozen model without changing runtime state. Automatic reference
+    /// acceptance uses this gate before applying the normal fit-and-freeze
+    /// pipeline.</summary>
+    public DifferentialModelFitResult PreviewFit(DateTimeOffset atUtc)
+    {
+        var fitOptions = options with { ArtifactCreatedAtUtc = atUtc.ToUniversalTime() };
+        return DifferentialModelTrainer.Fit(learningSamples, fitOptions);
+    }
+
     public void Archive()
     {
         Artifact = null;
         learningSamples.Clear();
+        LearningSampleGeneration = 0;
         detector.Reset();
         LastPrediction = null;
         LastDetector = null;
@@ -699,6 +719,7 @@ internal sealed class DifferentialModelRuntime
         if (admitted)
         {
             learningSamples.Add(sample);
+            LearningSampleGeneration++;
             while (learningSamples.Count > maximumLearningSamples)
                 learningSamples.RemoveAt(0);
         }
@@ -1037,7 +1058,8 @@ public static class Program
             catch (Exception ex)
             {
                 return WriteStartupFailure(data, "GPU auto-detection", "GPU selection failed: " + ex.Message,
-                    control.InstanceId, new AnalysisProgress(0, c.BaselineSamples, 0, c.WindowSamples, 0, c.StableSamples));
+                    control.InstanceId, new AnalysisProgress(0, c.BaselineSamples, 0, c.WindowSamples, 0, c.StableSamples),
+                    autoAcceptReference: c.AutoAcceptReference);
             }
             var sourceMode = c.VoltageSource.Trim().ToLowerInvariant();
             using var driverApprovals = DriverApprovalService.CreateDefault(data);
@@ -1135,6 +1157,10 @@ public static class Program
                 BuildResidualDetectorOptions(c, differentialIdentity));
             string differentialModelPath = Path.Combine(data, "differential-model.json");
             string? differentialModelDetail = null;
+            string autoAcceptReferenceDetail = c.AutoAcceptReference
+                ? "Waiting for a qualified learned reference candidate."
+                : "Automatic acceptance is disabled.";
+            long autoPreviewLearningGeneration = -1;
             if (lifecycle.Snapshot().CanAnalyze && File.Exists(differentialModelPath))
             {
                 try
@@ -1225,6 +1251,40 @@ public static class Program
                 Atomic(incidentsPath, incidentLedger.ToJson());
             void PersistPowerLimitWatchdogLocked() =>
                 Atomic(powerLimitWatchdogPath, powerLimitWatchdog.SerializeState());
+            ReferenceOperationResult ApplyAcceptedLocked(DateTimeOffset acceptedAtUtc,
+                string actor, string note, bool explicitLegacyMigration)
+            {
+                var operation = lifecycle.AcceptCandidate(acceptedAtUtc, actor, note,
+                    explicitLegacyMigration);
+                if (operation.Succeeded && lifecycle.Accepted is not null)
+                {
+                    analysis.ApplyAccepted(lifecycle.Accepted);
+                    // Acceptance is the only operation that may fit and
+                    // replace the immutable differential artifact.
+                    var fit = differentialRuntime.FitAndFreeze(acceptedAtUtc);
+                    differentialModelDetail = fit.Detail;
+                    PersistDifferentialModelLocked();
+                    PersistReferenceLocked();
+                }
+                return operation;
+            }
+            bool TryAutomaticallyAcceptLocked(DateTimeOffset now,
+                ElectricalSample? electrical, Voltage? voltage)
+            {
+                bool sourceHealthy = !IsSourceDegraded(electrical, voltage, sourceSetupError);
+                bool accepted = ReferenceAutoAcceptance.TryAccept(lifecycle,
+                    c.AutoAcceptReference, sourceHealthy,
+                    differentialRuntime.LearningSampleGeneration,
+                    ref autoPreviewLearningGeneration,
+                    differentialOptions.MinimumSamples,
+                    () => differentialRuntime.PreviewFit(now),
+                    () => ApplyAcceptedLocked(now, "auto",
+                        "Automatic acceptance enabled.", explicitLegacyMigration: false),
+                    out var attemptDetail);
+                if (!string.IsNullOrWhiteSpace(attemptDetail))
+                    autoAcceptReferenceDetail = attemptDetail;
+                return accepted;
+            }
             ControlCommandResult? HandleReferenceCommand(ControlRequest request)
             {
                 lock (referenceGate)
@@ -1234,24 +1294,36 @@ public static class Program
                         ? request.ClientId : request.Operator.Trim();
                     string note = request.Note?.Trim() ?? "";
                     DateTimeOffset now = DateTimeOffset.UtcNow;
+                    if (command == "set-auto-accept-reference")
+                    {
+                        if (!request.AutoAcceptReference.HasValue)
+                            return new(false, "auto_accept_reference is required.",
+                                lifecycle.State.WireName(),
+                                AutoAcceptReference: c.AutoAcceptReference);
+
+                        bool enabled = request.AutoAcceptReference.Value;
+                        ConfigPersistence.SetAutoAcceptReference(configPath, enabled);
+                        c.AutoAcceptReference = enabled;
+                        autoPreviewLearningGeneration = -1;
+                        autoAcceptReferenceDetail = enabled
+                            ? "Waiting for a qualified learned reference candidate."
+                            : "Automatic acceptance is disabled.";
+                        return new(true,
+                            enabled ? "Automatic acceptance enabled."
+                                : "Automatic acceptance disabled.",
+                            lifecycle.State.WireName(),
+                            AutoAcceptReference: enabled);
+                    }
+
                     ReferenceOperationResult operation;
                     if (command is "accept-reference" or "migrate-reference")
                     {
-                        operation = lifecycle.AcceptCandidate(now, actor, note,
+                        operation = ApplyAcceptedLocked(now, actor, note,
                             explicitLegacyMigration: command == "migrate-reference" ||
                                 request.ExplicitLegacyMigration);
-                        if (operation.Succeeded && lifecycle.Accepted is not null)
-                        {
-                            analysis.ApplyAccepted(lifecycle.Accepted);
-                            // Acceptance is the only operation that may fit
-                            // and replace the immutable differential artifact.
-                            var fit = differentialRuntime.FitAndFreeze(now);
-                            differentialModelDetail = fit.Detail;
-                            PersistDifferentialModelLocked();
-                            PersistReferenceLocked();
-                        }
                         return new(operation.Succeeded, operation.Detail,
-                            lifecycle.State.WireName());
+                            lifecycle.State.WireName(),
+                            AutoAcceptReference: c.AutoAcceptReference);
                     }
 
                     try
@@ -1262,11 +1334,17 @@ public static class Program
                         differentialRuntime.Archive();
                         differentialModelDetail = "Differential artifact is inactive until the next explicit reference acceptance.";
                         PersistReferenceLocked();
-                        return new(true, lifecycle.Detail, lifecycle.State.WireName());
+                        autoPreviewLearningGeneration = -1;
+                        autoAcceptReferenceDetail = c.AutoAcceptReference
+                            ? "Waiting for a qualified learned reference candidate."
+                            : "Automatic acceptance is disabled.";
+                        return new(true, lifecycle.Detail, lifecycle.State.WireName(),
+                            AutoAcceptReference: c.AutoAcceptReference);
                     }
                     catch (InvalidOperationException ex)
                     {
-                        return new(false, ex.Message, lifecycle.State.WireName());
+                        return new(false, ex.Message, lifecycle.State.WireName(),
+                            AutoAcceptReference: c.AutoAcceptReference);
                     }
                 }
             }
@@ -1311,7 +1389,7 @@ public static class Program
             catch (Exception ex)
             {
                 return WriteStartupFailure(data, "NVML", "NVML initialization failed: " + ex.Message,
-                    control.InstanceId, analysis.Progress, lifecycle.Snapshot());
+                    control.InstanceId, analysis.Progress, lifecycle.Snapshot(), c.AutoAcceptReference);
             }
             using var nvmlLifetime = nvml;
             int count = int.Parse(Option(args, "--samples") ?? "0"); int n = 0;
@@ -1422,9 +1500,7 @@ public static class Program
                     {
                         PersistReferenceLocked();
                     }
-                    referenceStatus = lifecycle.Snapshot();
-                    referenceChanged = beforeState != referenceStatus.State ||
-                        beforeCandidateQualified != (referenceStatus.Candidate?.IsQualified == true);
+                    var lifecycleBeforeAuto = lifecycle.Snapshot();
 
                     if (newSensor && electrical is not null && v is not null)
                     {
@@ -1434,12 +1510,18 @@ public static class Program
                             temperatureC: g.Temperature,
                             isSettled: result.LoadQualification?.IsQualified == true,
                             identity: differentialIdentity.CanonicalKey);
-                        bool candidateLearning = referenceStatus.State ==
+                        bool candidateLearning = lifecycleBeforeAuto.State ==
                                 ReferenceLifecycleState.REFERENCE_UNVERIFIED &&
-                            referenceStatus.Compatibility is ReferenceCompatibility.COMPATIBLE or
+                            lifecycleBeforeAuto.Compatibility is ReferenceCompatibility.COMPATIBLE or
                                 ReferenceCompatibility.RESTART or ReferenceCompatibility.LEGACY;
                         differentialObservation = differentialRuntime.Observe(differentialSample,
                             candidateLearning);
+
+                        // Run the preview after admitting this sample so a
+                        // restarted daemon can qualify a persisted candidate
+                        // from fresh evidence. The helper still rejects stale,
+                        // mismatched, legacy, or already-accepted lifecycles.
+                        _ = TryAutomaticallyAcceptLocked(now, electrical, v);
 
                         bool residualAlert = differentialObservation.Detector.IsAlert;
                         bool legacyAlert = result.Status is "SUDDEN_DROOP" or "BASELINE_SHIFT" or
@@ -1473,6 +1555,15 @@ public static class Program
                             incidentObservation = incidentLedger.Observe(observation);
                         }
                     }
+                    else
+                    {
+                        // Keep the live policy detail actionable while a
+                        // persisted candidate waits for a healthy source.
+                        _ = TryAutomaticallyAcceptLocked(now, electrical, v);
+                    }
+                    referenceStatus = lifecycle.Snapshot();
+                    referenceChanged = beforeState != referenceStatus.State ||
+                        beforeCandidateQualified != (referenceStatus.Candidate?.IsQualified == true);
                     if (powerLimitResult.IncidentLatched)
                     {
                         var powerObservation = new IncidentObservation(now,
@@ -1559,6 +1650,8 @@ public static class Program
                     timestamp_utc = now,
                     gpu = g,
                     voltage = v,
+                    auto_accept_reference = c.AutoAcceptReference,
+                    auto_accept_reference_detail = autoAcceptReferenceDetail,
                     voltage_source = voltageSource?.Description,
                     driver_approval = directSource?.Diagnostics,
                     electrical,
@@ -1687,7 +1780,8 @@ public static class Program
             }
             samplingProgress.MarkStopped(control.StopRequested ? "control" : stop.IsCancellationRequested ? "signal" : "sample_limit");
             MarkStopped(Path.Combine(data, "status.json"), control.StopRequested ? "control" : stop.IsCancellationRequested ? "signal" : "sample_limit",
-                control, analysis.Progress, samplingProgress.Snapshot(Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow));
+                control, analysis.Progress, samplingProgress.Snapshot(Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow),
+                c.AutoAcceptReference);
             lock (referenceGate)
             {
                 PersistReferenceLocked();
@@ -1767,7 +1861,8 @@ public static class Program
     static void Atomic(string path, string value) => HybridStorage.Atomic(path, value);
 
     static void MarkStopped(string path, string reason, ControlServer? control = null,
-        AnalysisProgress? progress = null, SamplingProgressContract? samplingProgress = null)
+        AnalysisProgress? progress = null, SamplingProgressContract? samplingProgress = null,
+        bool? autoAcceptReference = null)
     {
         try
         {
@@ -1788,6 +1883,8 @@ public static class Program
             state["schema_version"] = 3;
             state["process_id"] = control?.ProcessId ?? Environment.ProcessId;
             state["instance_id"] = control?.InstanceId ?? Guid.NewGuid().ToString("N");
+            if (autoAcceptReference.HasValue)
+                state["auto_accept_reference"] = autoAcceptReference.Value;
             if (progress is not null)
             {
                 state["progress"] = new JsonObject
@@ -1814,7 +1911,8 @@ public static class Program
     }
 
     static int WriteStartupFailure(string data, string source, string detail, string? instanceId = null,
-        AnalysisProgress? progress = null, ReferenceStatusSnapshot? referenceLifecycle = null)
+        AnalysisProgress? progress = null, ReferenceStatusSnapshot? referenceLifecycle = null,
+        bool? autoAcceptReference = null)
     {
         var now = DateTimeOffset.UtcNow;
         var result = new Result("VOLTAGE_UNAVAILABLE", null, null, null, null, null);
@@ -1829,6 +1927,7 @@ public static class Program
                 timestamp_utc = now,
                 gpu = new Gpu(null, null, null, null),
                 voltage = (Voltage?)null,
+                auto_accept_reference = autoAcceptReference,
                 voltage_source = source,
                 electrical = (ElectricalSample?)null,
                 analysis_load = (AnalysisLoadSelection?)null,

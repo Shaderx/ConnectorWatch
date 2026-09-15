@@ -4,8 +4,9 @@ Application releases use two distinct signatures: Authenticode signs the
 Windows binaries and installer, while the app metadata key signs the exact
 installer digest and update policy. Neither key is a driver-catalog key.
 The workflow's `signing_mode` input is `PublicTrusted` by default. The first
-1.5.0 protected release uses `SelfSigned` while the public CA identity is being
-provisioned.
+1.5.0 protected release and the 1.5.1 patch use `SelfSigned` while the public CA
+identity is being provisioned. Continue using the existing self-signed identity
+until the bridge rotation described below has been prepared and reviewed.
 
 Use the `Prepare or publish protected application release` workflow from a
 protected branch. Configure required reviewers on the `app-release-publication`
@@ -29,8 +30,8 @@ previous-key variables after the transition. Publication never accepts a trust
 key fetched from the envelope it is trying to verify.
 
 First dispatch `mode: Prepare` and select `signing_mode: SelfSigned` for the
-1.5.0 release. Future releases select `PublicTrusted` unless a reviewed bridge
-rotation requires both signer pins. Supply the catalog trust, initial signed
+1.5.0 and 1.5.1 releases. Select `PublicTrusted` only after the reviewed bridge
+rotation has delivered the new signer pin to existing clients. Supply the catalog trust, initial signed
 catalog, and app trust files embedded by `Build-Installer.ps1`, plus exact
 version, metadata revision, whole-second UTC issue/expiry times, and release
 notes. The protected job builds and Authenticode-signs
@@ -105,7 +106,7 @@ portable releases are untouched.
 
 Prepare artifacts expire after 14 days. If inputs, installer bytes, notes, or
 trust material change, run Prepare again and review the new digests. Failed
-draft upload or publication leaves stable discovery unchanged. For 1.5.0,
+draft upload or publication leaves stable discovery unchanged. For 1.5.0 and 1.5.1,
 Windows can display an “Unknown publisher” warning because the release uses a
 self-signed certificate. Users should inspect the
 `ConnectorWatch-publisher.cer` SHA-256 fingerprint and the matching

@@ -29,6 +29,9 @@ public sealed partial class MainWindow : Window
     Forms.ContextMenuStrip? trayMenu;
     readonly TextBlock connection = Text("Connecting…", 12), voltage = Text("—", 30), power = Text("—", 30), pcie = Text("—", 30), change = Text("—", 30);
     readonly TextBlock voltageNote = Text("16-pin input", 11), powerNote = Text("Measured rail V × A", 11), referenceNote = Text("Waiting for a reference", 11);
+    readonly TextBlock referenceLifecycle = Text("Awaiting steady load to learn a reference.", 11);
+    readonly Button acceptReference = Button("Accept reference");
+    readonly CheckBox autoAcceptReference = new() { Content = "Automatically accept qualified reference", Foreground = Palette.Muted, VerticalAlignment = VerticalAlignment.Center };
     readonly TextBlock powerLabel = Text("CONNECTOR POWER", 10);
     readonly TextBlock powerPath = Text("", 11), degradation = Text("", 11);
     readonly TextBlock bannerText = Text("", 13), analysisTitle = Text("Waiting for data", 19), analysisBody = Text("", 12), histogramStats = Text("", 11), footer = Text("", 11);
@@ -45,8 +48,9 @@ public sealed partial class MainWindow : Window
     DateTimeOffset confidenceLastRead;
     bool renderingConfidence;
     IReadOnlyList<ConfidenceDay>? confidenceRenderedDays;
-    (string Cohort, int Range, DateTime Day, bool Reading, double ShiftVolts) confidenceRenderedSelection;
+    (string Cohort, int Range, DateTime Day, bool Reading, double ShiftVolts, string ReferenceState) confidenceRenderedSelection;
     internal FrameworkElement? ConfidencePreview { get; private set; }
+    internal FrameworkElement? ReferencePreview { get; private set; }
     readonly TextBlock electricalTrendSummary = Text("", 11);
     readonly ComboBox electricalTrendBin = new() { MinWidth = 150 }, electricalTrendMode = new() { MinWidth = 155 };
     internal FrameworkElement? ElectricalTrendPreview { get; private set; }
@@ -65,6 +69,8 @@ public sealed partial class MainWindow : Window
     List<PointSample> visiblePoints = new();
     List<PointSample> distributionPoints = new();
     bool exiting, busy, initialized, connected, hadFresh, firstPoll = true, lossNotified, allWarnings;
+    bool referenceOperationBusy, updatingReferenceControls;
+    bool? pendingAutoAcceptReference;
     long lastRefreshStarted;
     DateTimeOffset? focusTime;
     DateTimeOffset lastNotification;
@@ -167,7 +173,15 @@ public sealed partial class MainWindow : Window
         histogramStats.Foreground = Palette.Muted;
         var dist = Panel(Vertical(Header("Voltage distribution", bins), histogram, histogramStats)); dist.Margin = new Thickness(0, 0, 8, 0); middle.Children.Add(dist);
         analysisBody.Foreground = Palette.Muted; analysisBody.LineHeight = 20;
-        var reference = Panel(Vertical(Header("Reference & analysis"), analysisTitle, progress, analysisBody)); reference.Margin = new Thickness(8, 0, 0, 0); Grid.SetColumn(reference, 1); middle.Children.Add(reference); content.Children.Add(middle);
+        referenceLifecycle.Foreground = Palette.Muted; referenceLifecycle.Margin = new Thickness(0, 4, 0, 8);
+        acceptReference.Click += async (_, _) => await AcceptReference();
+        autoAcceptReference.IsThreeState = false;
+        autoAcceptReference.Checked += async (_, _) => await SetAutoAcceptReference(true);
+        autoAcceptReference.Unchecked += async (_, _) => await SetAutoAcceptReference(false);
+        var referenceControls = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 8) };
+        referenceControls.Children.Add(acceptReference);
+        referenceControls.Children.Add(autoAcceptReference);
+        var reference = Panel(Vertical(Header("Reference & analysis"), analysisTitle, progress, referenceLifecycle, referenceControls, analysisBody)); reference.Margin = new Thickness(8, 0, 0, 0); Grid.SetColumn(reference, 1); middle.Children.Add(reference); ReferencePreview = reference; content.Children.Add(middle);
         var ack = Button("Acknowledge selected"); ack.Click += (_, _) => Acknowledge();
         var more = Button("View all"); more.Click += (_, _) => { allWarnings = !allWarnings; more.Content = allWarnings ? "Show recent" : "View all"; warnings.Height = allWarnings ? 220 : 76; RenderData(); };
         var warningActions = new StackPanel { Orientation = Orientation.Horizontal }; warningActions.Children.Add(more); warningActions.Children.Add(ack);
@@ -303,6 +317,7 @@ public sealed partial class MainWindow : Window
         powerNote.Text = s?.ConnectorPower.HasValue == true ? "Typed connector rail power" : direct ? "Legacy source; provenance unverified" : "Power supplied by voltage source";
         change.Text = fresh && s?.Drop is double dr ? $"{-dr * 1000:+0;−0;0} mV" : "—";
         referenceNote.Text = s?.Reference is double r ? $"Reference {r:F3} V" : "Awaiting a learned reference";
+        UpdateReferenceControls(s);
         bool alert = fresh && (s?.Status is "SUDDEN_DROOP" or "BASELINE_SHIFT" || s?.ResidualDetectorAlert == true || s?.ActiveIncidentCount > 0);
         string message = StatusMessage(s, fresh, config.MinAnalysisWatts, operation, store.ReadError);
         if (demo) message = "Synthetic demonstration — charts and warnings below are test data.";
@@ -318,6 +333,144 @@ public sealed partial class MainWindow : Window
             tray.Icon = !fresh ? Drawing.SystemIcons.Error : alert ? Drawing.SystemIcons.Warning : Drawing.SystemIcons.Information;
             string text = $"ConnectorWatch · {state}\n{FormatValue(connectorVoltage, "V", 3)} · {age:F0}s ago"; tray.Text = text.Length > 63 ? text[..63] : text;
         }
+    }
+    internal static bool CanAcceptReference(Snapshot? s) =>
+        s is not null && !s.ReferenceAccepted &&
+        s.ReferenceCandidateAvailable && s.ReferenceCandidateQualified &&
+        string.Equals(s.ReferenceCandidateOrigin, "LEARNED", StringComparison.OrdinalIgnoreCase) &&
+        s.ReferenceState is "REFERENCE_UNVERIFIED" &&
+        s.ReferenceCompatibility is "COMPATIBLE" or "RESTART" or "LEGACY";
+    internal static string ReferenceStatusText(Snapshot? s)
+    {
+        if (s is null) return "Reference status unavailable.";
+        if (s.ReferenceState == "REFERENCE_STALE")
+            return "Accepted reference is stale; restore a healthy source before accepting another candidate.";
+        if (s.ReferenceState == "REFERENCE_INVALID")
+            return "Reference identity is invalid; archive or migrate the persisted model first.";
+        if (s.ReferenceAccepted || s.ReferenceState == "REFERENCE_ACCEPTED")
+            return "Accepted reference is active; new candidates remain separate.";
+        if (s.ReferenceCandidateAvailable)
+        {
+            if (s.ReferenceCandidateQualified)
+            {
+                if (string.Equals(s.ReferenceCandidateOrigin, "LEGACY_MIGRATION", StringComparison.OrdinalIgnoreCase))
+                    return "A qualified legacy candidate is waiting for explicit migration acknowledgement.";
+                if (CanAcceptReference(s)) return "Qualified learned candidate ready for acceptance.";
+                return "Qualified candidate is blocked by the current reference compatibility state.";
+            }
+            if (!string.IsNullOrWhiteSpace(s.ReferenceCandidateDetail))
+                return "Learning reference: " + s.ReferenceCandidateDetail;
+            if (s.ReferenceCandidateRequiredSamples > 0)
+                return $"Learning reference: {s.ReferenceCandidateQualifiedSamples} / {s.ReferenceCandidateRequiredSamples} qualified samples.";
+            return "Learning reference; awaiting enough steady observations.";
+        }
+        return s.ReferenceState == "REFERENCE_UNVERIFIED"
+            ? "Awaiting steady load to learn a reference."
+            : "Reference state: " + Friendly(s.ReferenceState);
+    }
+    internal static string ReferenceProgressLabel(Snapshot? s, int baselineSamples)
+    {
+        if (s?.ReferenceState is "REFERENCE_STALE" or "REFERENCE_INVALID")
+            return ReferenceStatusText(s);
+        bool accepted = s?.ReferenceAccepted == true || s?.ReferenceState == "REFERENCE_ACCEPTED";
+        if (accepted)
+            return s?.Reference is double ? "Frozen reference" : "Accepted reference active";
+        if (s?.ReferenceCandidateQualified == true)
+        {
+            string count = s.ReferenceCandidateRequiredSamples > 0
+                ? $"{s.ReferenceCandidateQualifiedSamples} / {s.ReferenceCandidateRequiredSamples} samples"
+                : "qualified candidate";
+            return "Qualified reference candidate · " + count;
+        }
+        return $"Reference learning {s?.Learning ?? 0} / {baselineSamples} samples";
+    }
+    void UpdateReferenceControls(Snapshot? s)
+    {
+        if (pendingAutoAcceptReference is bool pending && s?.AutoAcceptReference == pending)
+            pendingAutoAcceptReference = null;
+        referenceLifecycle.Text = ReferenceStatusText(s);
+        if (s?.AutoAcceptReference == true && s.ReferenceCandidateQualified &&
+            !string.IsNullOrWhiteSpace(s.AutoAcceptReferenceDetail))
+            referenceLifecycle.Text += " " + s.AutoAcceptReferenceDetail;
+        if (operation.Contains("reference", StringComparison.OrdinalIgnoreCase))
+            referenceLifecycle.Text += "\n" + operation;
+        bool autoSupported = demo || s?.AutoAcceptReference.HasValue == true || client.AutoAcceptReference.HasValue;
+        bool hasAccepted = s?.ReferenceAccepted == true || s?.ReferenceState == "REFERENCE_ACCEPTED";
+        bool canAccept = demo || CanAcceptReference(s);
+        bool wanted = pendingAutoAcceptReference ?? s?.AutoAcceptReference ?? client.AutoAcceptReference ?? false;
+        updatingReferenceControls = true;
+        try
+        {
+            if (autoAcceptReference.IsChecked != wanted) autoAcceptReference.IsChecked = wanted;
+            autoAcceptReference.IsEnabled = autoSupported && !referenceOperationBusy;
+            autoAcceptReference.ToolTip = autoSupported
+                ? "The daemon keeps this preference while the GUI is closed. It never replaces an accepted baseline."
+                : "Automatic acceptance requires a newer daemon control endpoint.";
+            acceptReference.IsEnabled = canAccept && !hasAccepted && !referenceOperationBusy;
+            acceptReference.ToolTip = canAccept
+                ? "Accept the qualified learned candidate as the frozen reference."
+                : "Enabled only for a qualified learned candidate with compatible identity and no accepted reference.";
+        }
+        finally { updatingReferenceControls = false; }
+    }
+    async Task AcceptReference()
+    {
+        if (referenceOperationBusy || !CanAcceptReference(store.Current)) return;
+        if (demo)
+        {
+            operation = "Preview only: reference acceptance is disabled in the synthetic dashboard.";
+            UpdateStatus();
+            return;
+        }
+        referenceOperationBusy = true; operation = "Accepting reference…"; UpdateReferenceControls(store.Current); UpdateStatus();
+        try
+        {
+            if (await client.Send("hello") is null)
+            { operation = "Reference acceptance could not contact the monitor. Start monitoring and try again."; return; }
+            var reply = await client.Send("accept-reference");
+            operation = reply is null
+                ? "Reference was not accepted: " + (string.IsNullOrWhiteSpace(client.LastError) ? "the monitor rejected the request." : client.LastError)
+                : string.IsNullOrWhiteSpace(reply.Detail) ? "Reference accepted." : reply.Detail!;
+            await Refresh();
+        }
+        catch (Exception ex) when (ex is IOException or OperationCanceledException or UnauthorizedAccessException or JsonException)
+        { operation = "Reference was not accepted: " + ex.Message; }
+        finally { referenceOperationBusy = false; UpdateStatus(); }
+    }
+    async Task SetAutoAcceptReference(bool enabled)
+    {
+        if (updatingReferenceControls || referenceOperationBusy) return;
+        if (demo)
+        {
+            operation = "Preview only: automatic acceptance is not sent to a daemon.";
+            return;
+        }
+        bool? current = store.Current?.AutoAcceptReference ?? client.AutoAcceptReference;
+        if (current == enabled && pendingAutoAcceptReference is null) return;
+        pendingAutoAcceptReference = enabled; referenceOperationBusy = true;
+        operation = enabled ? "Enabling automatic reference acceptance…" : "Disabling automatic reference acceptance…";
+        UpdateReferenceControls(store.Current); UpdateStatus();
+        try
+        {
+            if (await client.Send("hello") is null)
+            { pendingAutoAcceptReference = null; operation = "Automatic reference acceptance could not contact the monitor. The setting was not changed."; return; }
+            var reply = await client.Send("set-auto-accept-reference", enabled);
+            if (reply is null)
+            {
+                pendingAutoAcceptReference = null;
+                operation = "Automatic acceptance was not changed: " + (string.IsNullOrWhiteSpace(client.LastError) ? "the monitor rejected the request." : client.LastError);
+            }
+            else
+            {
+                operation = string.IsNullOrWhiteSpace(reply.Detail)
+                    ? (enabled ? "Automatic acceptance enabled." : "Automatic acceptance disabled.")
+                    : reply.Detail!;
+                await Refresh();
+            }
+        }
+        catch (Exception ex) when (ex is IOException or OperationCanceledException or UnauthorizedAccessException or JsonException)
+        { pendingAutoAcceptReference = null; operation = "Automatic acceptance was not changed: " + ex.Message; }
+        finally { referenceOperationBusy = false; UpdateStatus(); }
     }
     static string FormatValue(double? value, string? unit, int decimals) => value is double number && double.IsFinite(number) ? number.ToString($"F{decimals}", CultureInfo.InvariantCulture) + (string.IsNullOrWhiteSpace(unit) ? "" : " " + unit) : "—";
     static string SourceLabel(Snapshot? s) => SourceLabel(s?.ElectricalSource ?? "");
@@ -351,6 +504,32 @@ public sealed partial class MainWindow : Window
         if (s.ReferenceCompatibility == "LEGACY") notes.Add("Saved reference is unverified; analysis needs an accepted compatible reference.");
         string activity = s.Status == "OUTSIDE_ANALYSIS_RANGE" ? $"Waiting for steady connector load above {minWatts} W." : Friendly(s.Status) + ".";
         return "Receiving telemetry. " + activity + (notes.Count > 0 ? " " + string.Join(" ", notes) : " Aggregate rail readings do not certify connector safety.");
+    }
+    internal static (string Value, string Caption, string EmptyText) ConfidenceWaitingDisplay(
+        IReadOnlyList<ConfidenceDay> days, string cohort, string referenceState = "")
+    {
+        var relevantDays = days
+            .Where(day => string.IsNullOrWhiteSpace(cohort) ||
+                string.Equals(day.Cohort, cohort, StringComparison.Ordinal))
+            .ToArray();
+        bool allReferenceUnavailable = relevantDays.Length > 0 &&
+            relevantDays.All(day => string.Equals(day.Reason, "REFERENCE_UNAVAILABLE",
+                StringComparison.OrdinalIgnoreCase));
+        if (allReferenceUnavailable)
+        {
+            bool unverified = string.Equals(referenceState?.Trim(),
+                "REFERENCE_UNVERIFIED", StringComparison.OrdinalIgnoreCase);
+            return unverified
+                ? ("Reference pending",
+                    "The reference is unverified; explicit acceptance is required before comparable history can be scored.",
+                    "Reference pending — explicit acceptance is required before comparison.")
+                : ("Reference required",
+                    "No accepted reference is recorded for this source and load.",
+                    "Reference required — no comparable history yet.");
+        }
+        return ("Learning",
+            "Needs three comparable days. Missing measurements do not mean low degradation confidence.",
+            "Learning — needs three comparable days.");
     }
     static string QualityDetails(Snapshot? s)
     {
@@ -388,7 +567,7 @@ public sealed partial class MainWindow : Window
         {
             var now = DateTimeOffset.UtcNow;
             var days = demo ? (IReadOnlyList<ConfidenceDay>)confidenceDemoDays : confidenceHistory?.Days ?? Array.Empty<ConfidenceDay>();
-            var selection = (settings.ConfidenceCohort, settings.ConfidenceRangeDays, now.UtcDateTime.Date, confidenceReadBusy, config.ShiftVolts);
+            var selection = (settings.ConfidenceCohort, settings.ConfidenceRangeDays, now.UtcDateTime.Date, confidenceReadBusy, config.ShiftVolts, store.Current?.ReferenceState ?? "");
             if (ReferenceEquals(days, confidenceRenderedDays) && selection == confidenceRenderedSelection) return;
             var groups = days.Where(d => !string.IsNullOrWhiteSpace(d.Cohort)).GroupBy(d => d.Cohort).ToArray();
             foreach (var group in groups)
@@ -432,17 +611,22 @@ public sealed partial class MainWindow : Window
             }
             else
             {
-                confidenceValue.Text = confidenceReadBusy && days.Count == 0 ? "Reading history…" : points.Any(p => p.Score.HasValue) ? "No recent comparison" : "Learning";
+                var waiting = ConfidenceWaitingDisplay(days, settings.ConfidenceCohort,
+                    store.Current?.ReferenceState ?? "");
+                bool reading = confidenceReadBusy && days.Count == 0;
+                confidenceValue.Text = reading ? "Reading history…" : points.Any(p => p.Score.HasValue) ? "No recent comparison" : waiting.Value;
                 confidenceValue.Foreground = Palette.Muted;
-                confidenceCaption.Text = "Needs three comparable days. Missing measurements do not mean low degradation confidence.";
+                confidenceCaption.Text = reading ? "Loading recorded history…" : points.Any(p => p.Score.HasValue) ? "No recent comparison in the latest completed day." : waiting.Caption;
+                confidencePlot.EmptyText = reading ? "Reading recorded history…" : waiting.EmptyText;
             }
-            confidencePlot.EmptyText = confidenceConfigurationError ? "Confidence unavailable: configure a finite positive voltage-shift threshold." : confidenceReadBusy && days.Count == 0 ? "Reading recorded history…" : "Learning — needs three comparable days.";
+            if (confidenceConfigurationError)
+                confidencePlot.EmptyText = "Confidence unavailable: configure a finite positive voltage-shift threshold.";
             confidenceDetails.Text = "Approximate load matching. Each day needs 10 sampled minutes across at least 30 minutes.\nConfidence combines the size, persistence and number of comparable days in the last week.\nThe voltage-drop threshold is " + (config.ShiftVolts * 1000).ToString("F0", CultureInfo.InvariantCulture) + " mV; this policy is not a calibrated failure probability. Sensor freshness may remain unverified. These readings cannot isolate the cause.\n" + (demo ? "Synthetic demonstration." : confidenceHistory?.Status ?? "Waiting for recorded data.");
             if (confidenceConfigurationError)
                 confidenceDetails.Text = "Confidence unavailable because ShiftVolts is not finite and positive. The confidence score is an operational evidence summary, not a calibrated failure probability.";
             confidenceDetails.ToolTip = settings.ConfidenceCohort;
             confidenceRenderedDays = days;
-            confidenceRenderedSelection = (settings.ConfidenceCohort, settings.ConfidenceRangeDays, now.UtcDateTime.Date, confidenceReadBusy, config.ShiftVolts);
+            confidenceRenderedSelection = (settings.ConfidenceCohort, settings.ConfidenceRangeDays, now.UtcDateTime.Date, confidenceReadBusy, config.ShiftVolts, store.Current?.ReferenceState ?? "");
             confidencePlot.InvalidateVisual();
         }
         finally { renderingConfidence = false; }
@@ -506,7 +690,14 @@ public sealed partial class MainWindow : Window
         analysisTitle.Text = s == null || !s.Fresh(config.MaxAgeSeconds) ? "Monitoring unavailable" : Friendly(s.Status);
         progress.Maximum = config.BaselineSamples; progress.Value = s?.Reference.HasValue == true ? config.BaselineSamples : Math.Min(config.BaselineSamples, s?.Learning ?? 0);
         string binLabel = s?.Bin is int bnow ? $"{bnow}–{bnow + config.BinWatts} W connector load" : "No eligible load bin";
-        string referenceText = s?.Reference.HasValue == true ? $"Frozen reference  {FormatValue(s.Reference, "V", 3)}\nCurrent median  {FormatValue(s.Median, "V", 3)}  ·  P05 {FormatValue(s.P05, "V", 3)}\nWindow  {s.Window} / {config.WindowSamples} eligible samples" : $"Reference learning  {s?.Learning ?? 0} / {config.BaselineSamples} samples\nLearning accumulates during steady load.";
+        string referenceLabel = ReferenceProgressLabel(s, config.BaselineSamples);
+        string referenceText = referenceLabel == "Frozen reference" && s?.Reference is double
+            ? $"Frozen reference  {FormatValue(s.Reference, "V", 3)}\nCurrent median  {FormatValue(s.Median, "V", 3)}  ·  P05 {FormatValue(s.P05, "V", 3)}\nWindow  {s.Window} / {config.WindowSamples} eligible samples"
+            : referenceLabel.StartsWith("Qualified reference candidate", StringComparison.Ordinal)
+                ? referenceLabel + "\nAccept reference to freeze this baseline."
+                : referenceLabel == "Accepted reference active"
+                    ? referenceLabel + "\nWaiting for a comparable load bin."
+                    : referenceLabel + "\nLearning accumulates during steady load.";
         string modelText = $"Selected load  {FormatValue(s?.AnalysisLoadValue, s?.AnalysisLoadUnit, 1)} · {SourceLabel(s?.AnalysisLoadSource)} · {s?.AnalysisLoadStatus ?? "UNAVAILABLE"}\nReference lifecycle  {SourceLabel(s?.ReferenceState)}" + (s?.ReferenceCompatibility.Length > 0 ? $" · {s.ReferenceCompatibility}" : "") + $"\nDifferential model  {SourceLabel(s?.DifferentialModelState)} · slope {FormatValue(s?.DifferentialModelSlope, "V/unit", 5)}\nPrediction  expected {FormatValue(s?.ExpectedVoltage, "V", 3)} · observed {FormatValue(s?.ObservedVoltage, "V", 3)} · residual {FormatValue(s?.Residual, "V", 3)}\nResidual detector  {SourceLabel(s?.ResidualDetectorStatus)}";
         string incidentText = s == null || s.IncidentCount == 0 ? "Incidents  0 active / 0 total" : $"Incidents  {s.ActiveIncidentCount} active / {s.IncidentCount} total · latest {SourceLabel(s.LatestIncidentState)} {SourceLabel(s.LatestIncidentStatus)}";
         string watchdogText = s?.WatchdogAvailable == true ? $"Power-limit monitor  READ-ONLY · {SourceLabel(s.WatchdogStatus)}" : "Power-limit monitor  READ-ONLY · UNAVAILABLE";
@@ -676,7 +867,7 @@ public sealed partial class MainWindow : Window
             store.Samples.Add(new(t, t, v, 12.1 + random.NextDouble() * .008, 438 + random.NextDouble() * 5, 425, state, 12.08, 12.06, 12.08 - v, "Synthetic voltage event"));
         }
         var last = store.Samples[^1];
-        store.Current = new Snapshot { Time = now, Voltage = last.Voltage, Pcie = last.Pcie, Power = last.Power, ConnectorVoltage = last.Voltage, ConnectorCurrent = 36.5, ConnectorPower = last.Power, PcieVoltage = last.Pcie, PcieCurrent = 4.2, PciePower = 50.4, ElectricalSource = "Synthetic fixture · no hardware", ElectricalStatus = "UNVERIFIED", ElectricalFresh = true, ElectricalFreshnessKind = "Synthetic", AnalysisLoadSource = "CONNECTOR_POWER", AnalysisLoadValue = last.Power, AnalysisLoadUnit = "W", AnalysisLoadAvailable = true, AnalysisLoadFresh = true, AnalysisLoadStatus = "UNVERIFIED", DifferentialModelState = "SYNTHETIC", ResidualDetectorStatus = "SYNTHETIC", BoardPower = 452, Temperature = 62, Utilization = 97, Limit = 450, Bin = 425, Status = "BASELINE_SHIFT", Reference = 12.08, Median = 11.856, P05 = 11.849, Drop = .224, Learning = 300, Window = 60, Schema = 2, Source = "Synthetic fixture · no hardware" };
+        store.Current = new Snapshot { Time = now, Voltage = last.Voltage, Pcie = last.Pcie, Power = last.Power, ConnectorVoltage = last.Voltage, ConnectorCurrent = 36.5, ConnectorPower = last.Power, PcieVoltage = last.Pcie, PcieCurrent = 4.2, PciePower = 50.4, ElectricalSource = "Synthetic fixture · no hardware", ElectricalStatus = "UNVERIFIED", ElectricalFresh = true, ElectricalFreshnessKind = "Synthetic", AnalysisLoadSource = "CONNECTOR_POWER", AnalysisLoadValue = last.Power, AnalysisLoadUnit = "W", AnalysisLoadAvailable = true, AnalysisLoadFresh = true, AnalysisLoadStatus = "UNVERIFIED", DifferentialModelState = "SYNTHETIC", ResidualDetectorStatus = "SYNTHETIC", BoardPower = 452, Temperature = 62, Utilization = 97, Limit = 450, Bin = 425, Status = "BASELINE_SHIFT", Reference = 12.08, Median = 11.856, P05 = 11.849, Drop = .224, Learning = 300, Window = 60, Schema = 2, Source = "Synthetic fixture · no hardware", ReferenceState = "REFERENCE_UNVERIFIED", ReferenceCompatibility = "COMPATIBLE", ReferenceCandidateAvailable = true, ReferenceCandidateQualified = true, ReferenceCandidateOrigin = "LEARNED", ReferenceCandidateQualifiedSamples = 300, ReferenceCandidateRequiredSamples = 300, AutoAcceptReference = false };
         store.Baselines[425] = new(12.08, 12.06, 0);
         store.Incidents.Add(new("demo1", now.AddSeconds(-250), "SUDDEN_DROOP", "Synthetic 280 mV drop", 11.80, .28, 425));
         store.Incidents.Add(new("demo2", now.AddSeconds(-100), "BASELINE_SHIFT", "Synthetic sustained change", 11.856, .224, 425));
@@ -687,6 +878,15 @@ public sealed partial class MainWindow : Window
         var checks = new List<string>();
         void Check(bool passed, string name) { if (!passed) throw new Exception("UI test failed: " + name); checks.Add(name); }
         Check(IsVisible && tray?.Visible == true, "Dashboard and notification icon start visible");
+        Check(acceptReference.Content?.ToString() == "Accept reference" && acceptReference.IsEnabled &&
+            ReferenceStatusText(store.Current).Contains("ready for acceptance", StringComparison.Ordinal),
+            "Synthetic preview shows a qualified reference candidate as ready");
+        Check(autoAcceptReference.Content?.ToString() == "Automatically accept qualified reference" &&
+            autoAcceptReference.IsEnabled && autoAcceptReference.IsChecked == false,
+            "Automatic reference acceptance is opt-in and enabled in the supported preview");
+        autoAcceptReference.IsChecked = true;
+        Check(autoAcceptReference.IsChecked == true, "Preview checkbox can show the opted-in state without daemon access");
+        autoAcceptReference.IsChecked = false;
         Check(confidencePlot.Points.Count == 30 && confidencePlot.Points.Any(p => p.Score == 0) && confidencePlot.Points.Any(p => p.Score >= 90), "Long-term confidence uses daily points and shows increasing synthetic evidence");
         double savedConfidenceShift = config.ShiftVolts;
         config.ShiftVolts = 0;

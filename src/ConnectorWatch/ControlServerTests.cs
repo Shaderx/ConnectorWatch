@@ -14,6 +14,12 @@ public static class ControlServerTests
             var helloWire = ControlProtocol.Serialize(new ControlRequest("hello", "gui-a"));
             Check(helloWire.Contains("\"command\":\"hello\"") && helloWire.Contains("\"client_id\":\"gui-a\"") &&
                   !helloWire.Contains("expected_instance_id"), "control request wire shape");
+            var autoWire = ControlProtocol.Serialize(new ControlRequest("set-auto-accept-reference",
+                "gui-a", "test-instance", AutoAcceptReference: false));
+            Check(autoWire.Contains("\"auto_accept_reference\":false") &&
+                ControlProtocol.TryParseRequest(autoWire, out var autoParsed) &&
+                autoParsed!.AutoAcceptReference == false,
+                "automatic reference policy request wire shape");
             Check(ControlProtocol.TryParseRequest(helloWire + "\r", out var parsed) && parsed!.Command == "hello" && parsed.ClientId == "gui-a",
                 "control request parser");
             using var stop = new CancellationTokenSource();
@@ -63,6 +69,19 @@ public static class ControlServerTests
                 "old-instance")).GetAwaiter().GetResult();
             Check(!staleAccept.Ok && staleAccept.ReferenceState == null,
                 "stale instance cannot mutate reference lifecycle");
+
+            server.ReferenceCommand = request => request.Command == "set-auto-accept-reference" &&
+                request.AutoAcceptReference.HasValue
+                ? new ControlCommandResult(true, "Automatic acceptance enabled.",
+                    "REFERENCE_UNVERIFIED", AutoAcceptReference: request.AutoAcceptReference)
+                : new ControlCommandResult(false, "auto_accept_reference is required.");
+            var auto = SendAsync(server, new ControlRequest("set-auto-accept-reference", "gui-a",
+                hello.InstanceId, AutoAcceptReference: true)).GetAwaiter().GetResult();
+            Check(auto.Ok && auto.AutoAcceptReference == true,
+                "identity-bound automatic reference policy command");
+            var autoMissing = SendAsync(server, new ControlRequest("set-auto-accept-reference", "gui-a",
+                hello.InstanceId)).GetAwaiter().GetResult();
+            Check(!autoMissing.Ok, "automatic reference policy command requires a value");
 
             var invalid = SendAsync(server, new ControlRequest("unknown", "gui-a")).GetAwaiter().GetResult();
             Check(!invalid.Ok && invalid.Protocol == ControlProtocol.Version, "unknown command rejected");

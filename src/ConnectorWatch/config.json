@@ -5,6 +5,7 @@
   "FlushSeconds": 30,
   "DataDirectory": "data",
   "DesktopAlerts": true,
+  "AutoAcceptReference": false,
   "VoltageSource": "direct",
   "ValidateDriverVersion": true,
   "HwinfoCsv": "",

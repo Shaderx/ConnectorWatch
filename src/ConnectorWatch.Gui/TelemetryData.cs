@@ -63,6 +63,15 @@ public sealed class Snapshot
     public int Schema { get; set; }
     public string ReferenceState { get; set; } = "";
     public string ReferenceCompatibility { get; set; } = "";
+    public bool ReferenceCandidateAvailable { get; set; }
+    public bool ReferenceCandidateQualified { get; set; }
+    public string ReferenceCandidateOrigin { get; set; } = "";
+    public string ReferenceCandidateDetail { get; set; } = "";
+    public int ReferenceCandidateQualifiedSamples { get; set; }
+    public int ReferenceCandidateRequiredSamples { get; set; }
+    public bool ReferenceAccepted { get; set; }
+    public bool? AutoAcceptReference { get; set; }
+    public string AutoAcceptReferenceDetail { get; set; } = "";
     // Typed electrical data is intentionally kept separate from the legacy
     // Voltage record.  A null value means that the daemon did not report a
     // field; the GUI never substitutes zero for missing hardware data.
@@ -178,8 +187,22 @@ public sealed class Snapshot
         { s.BoardPower = Num(g, "Power"); s.Temperature = Num(g, "Temperature"); s.Utilization = Num(g, "Utilization"); s.Limit = Num(g, "Limit"); }
         if (TryObject(r, "analysis", out var a))
         { s.Status = Str(a, "Status"); s.Bin = (int?)Num(a, "Bin"); s.Drop = Num(a, "Drop"); s.Reference = Num(a, "Reference"); s.Median = Num(a, "Median"); s.P05 = Num(a, "P05"); }
+        s.AutoAcceptReference = OptionalBool(r, "auto_accept_reference");
+        s.AutoAcceptReferenceDetail = Str(r, "auto_accept_reference_detail");
         if (TryObject(r, "reference_lifecycle", out var reference))
-        { s.ReferenceState = Str(reference, "state"); s.ReferenceCompatibility = Str(reference, "compatibility"); }
+        {
+            s.ReferenceState = Str(reference, "state"); s.ReferenceCompatibility = Str(reference, "compatibility");
+            if (TryObject(reference, "candidate", out var candidate))
+            {
+                s.ReferenceCandidateAvailable = true;
+                s.ReferenceCandidateQualified = Bool(candidate, "is_qualified");
+                s.ReferenceCandidateOrigin = Str(candidate, "origin");
+                s.ReferenceCandidateDetail = Str(candidate, "detail");
+                s.ReferenceCandidateQualifiedSamples = (int)(Num(candidate, "qualified_samples") ?? 0);
+                s.ReferenceCandidateRequiredSamples = (int)(Num(candidate, "required_samples") ?? 0);
+            }
+            s.ReferenceAccepted = TryObject(reference, "accepted", out _);
+        }
         if (TryObject(r, "progress", out var p))
         { s.Learning = (int)(Num(p, "learning_samples") ?? 0); s.Window = (int)(Num(p, "window_samples") ?? 0); s.Stable = (int)(Num(p, "stable_samples") ?? 0); }
         ParseElectrical(s, r);
@@ -194,6 +217,13 @@ public sealed class Snapshot
     public static double? Num(JsonElement r, string k) => TryProperty(r, k, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetDouble(out var n) && double.IsFinite(n) ? n : null;
     public static DateTimeOffset? Date(JsonElement r, string k) => TryProperty(r, k, out var v) && v.ValueKind == JsonValueKind.String && DateTimeOffset.TryParse(v.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var t) ? t : null;
     static bool Bool(JsonElement r, string k) => TryProperty(r, k, out var v) && (v.ValueKind == JsonValueKind.True || v.ValueKind == JsonValueKind.String && bool.TryParse(v.GetString(), out var b) && b);
+    static bool? OptionalBool(JsonElement r, string k)
+    {
+        if (!TryProperty(r, k, out var value)) return null;
+        if (value.ValueKind == JsonValueKind.True) return true;
+        if (value.ValueKind == JsonValueKind.False) return false;
+        return value.ValueKind == JsonValueKind.String && bool.TryParse(value.GetString(), out var parsed) ? parsed : null;
+    }
     static string Key(string value) => new string(value.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
     static bool TryProperty(JsonElement r, string key, out JsonElement value)
     {

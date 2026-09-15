@@ -13,6 +13,19 @@ public static class GuiTests
         ElectricalTrendTests.Run(Check);
         DegradationConfidenceTests.Run(Check);
         ConfidenceHistoryTests.Run(Check);
+        var referencePending = MainWindow.ConfidenceWaitingDisplay(
+            new[] { new ConfidenceDay { Cohort = "GPU-A|bin=425W", Reason = "REFERENCE_UNAVAILABLE" } },
+            "", "REFERENCE_UNVERIFIED");
+        Check(referencePending.Value == "Reference pending" &&
+            referencePending.Caption.Contains("explicit acceptance", StringComparison.Ordinal) &&
+            referencePending.EmptyText.Contains("accept", StringComparison.OrdinalIgnoreCase),
+            "Unaccepted reference history is explained instead of shown as generic learning");
+        var settling = MainWindow.ConfidenceWaitingDisplay(
+            new[] { new ConfidenceDay { Cohort = "GPU-A|bin=425W", Reason = "LEARNING_OR_SETTLING" } },
+            "GPU-A|bin=425W");
+        Check(settling.Value == "Learning" &&
+            settling.Caption.Contains("three comparable days", StringComparison.Ordinal),
+            "Other unscored history retains the existing learning explanation");
         var now = DateTimeOffset.UtcNow;
         var approvedDriver = Snapshot.Parse("""
             {"driver_approval":{"state":"Revoked","detail":"Fixture revoked","driver_version":"999.99","catalog_revision":12,"unvalidated":false,"last_checked_utc":"2026-09-10T00:00:00Z"}}
@@ -77,6 +90,7 @@ public static class GuiTests
             Check(true, "Logging failure does not escape into GUI");
         }
         finally { if (Directory.Exists(logDirectory)) Directory.Delete(logDirectory, true); }
+        ControlCommandChecks(Check);
         LiveStorageChecks(Check);
         PointSample Point(int i, double v, int? bin = 425, string state = "NO_SHIFT_DETECTED") => new(now.AddSeconds(i), now.AddSeconds(i), v, 12.1, 440, bin, state, 12.1, 12.09, 12.1 - v, "");
         var samples = new[] { Point(-5, 12.1), Point(-4, 12.11), Point(-4, 12.11), Point(-3, 11.8, 450), Point(-2, 12, null, "OUTSIDE_ANALYSIS_RANGE"), Point(-1, 12.2, 425, "LOAD_SETTLING") };
@@ -101,6 +115,42 @@ public static class GuiTests
         Check(lifecycleSnapshot.ReferenceState == "REFERENCE_UNVERIFIED" &&
             lifecycleSnapshot.ReferenceCompatibility == "LEGACY",
             "Reference lifecycle state remains visible to the GUI");
+        var requestPayload = ControlProtocol.Serialize(new ControlRequest("set-auto-accept-reference", "gui-test", "instance-test", AutoAcceptReference: true));
+        using (var requestDocument = JsonDocument.Parse(requestPayload))
+            Check(requestDocument.RootElement.GetProperty("auto_accept_reference").GetBoolean(),
+                "Automatic reference preference is carried in the typed control request");
+        var qualifiedCandidate = Snapshot.Parse("""
+            {"auto_accept_reference":true,"auto_accept_reference_detail":"Waiting for usable differential model evidence: fitting","reference_lifecycle":{"state":"REFERENCE_UNVERIFIED","compatibility":"COMPATIBLE","candidate":{"origin":"LEARNED","is_qualified":true,"qualified_samples":300,"required_samples":300,"detail":"qualified"}}}
+            """);
+        Check(qualifiedCandidate.AutoAcceptReference == true && qualifiedCandidate.ReferenceCandidateAvailable &&
+            qualifiedCandidate.ReferenceCandidateQualified && MainWindow.CanAcceptReference(qualifiedCandidate) &&
+            MainWindow.ReferenceStatusText(qualifiedCandidate).Contains("ready for acceptance", StringComparison.Ordinal),
+            "Qualified learned candidate is ready for explicit acceptance");
+        qualifiedCandidate.ReferenceCompatibility = "LEGACY";
+        Check(MainWindow.CanAcceptReference(qualifiedCandidate),
+            "Learned candidates remain manually acceptable when only the legacy compatibility label is present");
+        Check(MainWindow.ReferenceProgressLabel(qualifiedCandidate, 300).StartsWith("Qualified reference candidate", StringComparison.Ordinal),
+            "Reference analysis text describes a qualified candidate instead of idle learning");
+        var acceptedReference = Snapshot.Parse("""
+            {"auto_accept_reference":true,"reference_lifecycle":{"state":"REFERENCE_ACCEPTED","compatibility":"COMPATIBLE","accepted":{"accepted_at_utc":"2026-09-15T00:00:00Z"}}}
+            """);
+        Check(!MainWindow.CanAcceptReference(acceptedReference) &&
+            MainWindow.ReferenceStatusText(acceptedReference).Contains("Accepted reference is active", StringComparison.Ordinal),
+            "Accepted reference disables replacement and remains the active baseline");
+        Check(MainWindow.ReferenceProgressLabel(acceptedReference, 300) == "Accepted reference active",
+            "Accepted lifecycle is described as active when no current load bin is available");
+        acceptedReference.Reference = 12.08;
+        Check(MainWindow.ReferenceProgressLabel(acceptedReference, 300) == "Frozen reference",
+            "Accepted lifecycle keeps the frozen reference label when a current load bin is available");
+        var staleReference = new Snapshot { ReferenceState = "REFERENCE_STALE", ReferenceAccepted = true };
+        Check(MainWindow.ReferenceStatusText(staleReference).Contains("stale", StringComparison.OrdinalIgnoreCase),
+            "Stale lifecycle remains visibly stale even when an accepted artifact is present");
+        var waitingReference = Snapshot.Parse("""
+            {"reference_lifecycle":{"state":"REFERENCE_UNVERIFIED","compatibility":"COMPATIBLE"}}
+            """);
+        Check(!MainWindow.CanAcceptReference(waitingReference) &&
+            MainWindow.ReferenceStatusText(waitingReference).Contains("Awaiting steady load", StringComparison.Ordinal),
+            "Reference controls explain that learning is still awaiting steady load");
         var powerPathSnapshot = Snapshot.Parse($$"""
         {
           "timestamp_utc":"{{now:O}}",
@@ -239,5 +289,50 @@ public static class GuiTests
             check(store.Current?.Fresh() == false, "Disconnected live pipe cannot make old disk checkpoint look fresh");
         }
         finally { server.GetAwaiter().GetResult(); Directory.Delete(directory, true); }
+    }
+
+    static void ControlCommandChecks(Action<bool, string> check)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "ConnectorWatch-control-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        string? receivedCommand = null;
+        bool? receivedPreference = null;
+        using var ready = new System.Threading.ManualResetEventSlim();
+        var server = System.Threading.Tasks.Task.Run(async () =>
+        {
+            for (int i = 0; i < 2; i++)
+            {
+                using var pipe = new System.IO.Pipes.NamedPipeServerStream(ConnectorWatch.ControlEndpoint.Name(directory), System.IO.Pipes.PipeDirection.InOut, 1, System.IO.Pipes.PipeTransmissionMode.Byte, System.IO.Pipes.PipeOptions.Asynchronous | System.IO.Pipes.PipeOptions.CurrentUserOnly);
+                ready.Set();
+                using var timeout = new System.Threading.CancellationTokenSource(10000);
+                await pipe.WaitForConnectionAsync(timeout.Token);
+                using var reader = new StreamReader(pipe, System.Text.Encoding.UTF8, false, 1024, true);
+                using var writer = new StreamWriter(pipe, new System.Text.UTF8Encoding(false), 1024, true) { AutoFlush = true };
+                var request = JsonSerializer.Deserialize<ConnectorWatch.ControlRequest>((await reader.ReadLineAsync(timeout.Token))!, ConnectorWatch.ControlProtocol.Json)!;
+                receivedCommand = request.Command;
+                receivedPreference = request.AutoAcceptReference;
+                var response = request.Command == "hello"
+                    ? new ConnectorWatch.ControlResponse(1, Environment.ProcessId, directory, "control-test-instance", true, AutoAcceptReference: false)
+                    : new ConnectorWatch.ControlResponse(1, Environment.ProcessId, directory, "control-test-instance", false, Detail: "Automatic acceptance is unavailable on this daemon.", AutoAcceptReference: false);
+                await writer.WriteLineAsync(ConnectorWatch.ControlProtocol.Serialize(response));
+            }
+        });
+        try
+        {
+            ready.Wait();
+            var client = new ControlClient(directory);
+            check(client.Send("hello").GetAwaiter().GetResult() is not null, "Control client establishes daemon identity before operator commands");
+            var rejected = client.Send("set-auto-accept-reference", true).GetAwaiter().GetResult();
+            check(rejected is null && receivedCommand == "set-auto-accept-reference" && receivedPreference == true,
+                "Control client sends the preference field and preserves daemon rejection");
+            check(client.LastError.Contains("unavailable", StringComparison.OrdinalIgnoreCase),
+                "Rejected automatic-acceptance command is visible to the GUI");
+            server.GetAwaiter().GetResult();
+        }
+        finally
+        {
+            try { server.GetAwaiter().GetResult(); } catch { }
+            Directory.Delete(directory, true);
+        }
     }
 }

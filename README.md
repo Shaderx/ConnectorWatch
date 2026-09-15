@@ -8,9 +8,9 @@ distinguishes that approval from the available structural tests.
 
 A Windows-first dashboard for monitoring RTX 5090 input-rail voltage and electrical trends over time.
 
-[Download for Windows](https://github.com/Shaderx/ConnectorWatch/releases/download/app-stable/ConnectorWatch-Setup.exe) · [User guide](docs/USER-GUIDE.md) · [Release notes](docs/RELEASE-1.5.0.md)
+[Download for Windows](https://github.com/Shaderx/ConnectorWatch/releases/download/app-stable/ConnectorWatch-Setup.exe) · [User guide](docs/USER-GUIDE.md) · [Release notes](docs/RELEASE-1.5.1.md)
 
-Version 1.5.0 uses the project's **self-signed certificate**. Windows can show an
+Version 1.5.1 uses the project's **self-signed certificate**. Windows can show an
 unrecognized publisher or SmartScreen prompt. Obtain it from this repository's
 release page and follow the [signature verification instructions](docs/INSTALLATION.md).
 The public CA signing path remains available for a later release.
@@ -46,6 +46,11 @@ Closing the window keeps monitoring in the system tray. Use **Stop monitoring an
 **Up means stronger evidence of a sustained voltage decline under comparable load.** The score combines the size and persistence of the decline with the number of comparable days. It can fall when measurements recover.
 
 The chart needs at least **three comparable completed days**. Missing, stale or insufficient measurements stay unscored. They do not become a reassuring zero. Expand **Comparison details** for the selected load band and measurement limitations.
+
+Use **Accept reference** in the dashboard when learning is ready, or enable
+**Automatically accept qualified reference** to let the background monitor do
+this when qualification completes. The saved automatic setting preserves any
+accepted baseline. Comparable days accumulate after reference acceptance.
 
 The [user guide](docs/USER-GUIDE.md#long-term-degradation-confidence) explains the calculation and the detailed chart.
 

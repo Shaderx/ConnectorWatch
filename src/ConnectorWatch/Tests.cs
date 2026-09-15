@@ -162,6 +162,7 @@ public static class Tests
         ResidualDetectorTests.Run();
         IncidentLatchingTests.Run();
         PowerLimitWatchdogTests.Run();
+        AutoAcceptReferenceTests.Run();
         RecordedDataCharacterizationTests.Run();
         EarlyWarningIntegrationTests.Run();
         OptionalMitigationTests.Run();

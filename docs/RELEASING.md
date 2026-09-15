@@ -4,7 +4,7 @@ Every branch push, pull request, and manual Actions run builds a fresh Windows p
 
 ## Publish a version
 
-The instructions below describe the legacy portable prerelease track. For 1.5.0
+The instructions below describe the legacy portable prerelease track. For 1.5.1
 signed Windows installers, use [protected application releases](APP-RELEASING.md).
 Driver catalogs use [their own protected publication workflow](MAINTAINER-APPROVALS.md).
 Both require explicit maintainer authorization and provisioned signing material.

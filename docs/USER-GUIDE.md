@@ -2,7 +2,7 @@
 
 ConnectorWatch is an experimental Windows monitor for the 16-pin input-voltage trend of a supported RTX 5090 setup. It consists of a Windows WPF dashboard and a headless .NET 8 daemon. The daemon owns all GPU access, records timestamped telemetry, and evaluates voltage changes within comparable load bands. The dashboard reads the daemon's files and control endpoint.
 
-Version **1.5.0** remains experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Private readings require a signed maintainer decision for the exact board, driver and embedded reader. Multiple GPUs fail closed. The [physical validation record](VALIDATION.md) and [driver catalog](DRIVER-CATALOG.md) describe those separate boundaries.
+Version **1.5.1** remains experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Private readings require a signed maintainer decision for the exact board, driver and embedded reader. Multiple GPUs fail closed. The [physical validation record](VALIDATION.md) and [driver catalog](DRIVER-CATALOG.md) describe those separate boundaries.
 
 ![Synthetic dashboard preview](dashboard.png)
 
@@ -44,12 +44,31 @@ Keep the rest of the package's configuration fields when editing the file. `Volt
 
 `AnalysisLoadSource` pins the comparison basis for the daemon lifetime. Supported values are `CONNECTOR_CURRENT`, `CONNECTOR_POWER`, `NVML_BOARD_POWER`, and `EXTERNAL_SENSOR_POWER`. If the selected measurement is missing or stale, analysis becomes unavailable; it never silently substitutes a different source. Connector-current qualification is converted to the existing watt-binned axis only with voltage from the same fresh connector observation. Direct-reader power is derived from that rail's V×I and is not an independent third measurement.
 
-Reference learning is a two-step lifecycle. A completed learning window is
-written as `REFERENCE_UNVERIFIED` candidate evidence; it is never silently
-promoted into a comparison baseline. An operator must send the identity-bound
-control command `accept-reference` (or `migrate-reference` when explicitly
-reviewing a legacy baseline), optionally with `operator`, `note`, and
-`explicit_legacy_migration` fields. `archive-reference` removes the active
+Reference learning is a two-step lifecycle: collect qualified samples, then
+accept the learned reference. In the dashboard, **Accept reference** becomes
+available when the candidate is ready. Acceptance freezes the baseline used
+for future comparisons.
+
+Enable **Automatically accept qualified reference** to let the monitor perform
+that step once enough qualified samples have been collected. The setting is
+saved as `AutoAcceptReference` in `config.json`, applies without a restart, and
+continues working when the GUI is closed. It is off by default. Automatic
+acceptance never replaces an accepted baseline or migrates a legacy reference;
+identity and source checks still apply. Turning it off stops future automatic
+acceptance but does not undo an already accepted reference.
+
+Automatic acceptance also waits until the voltage model can be fitted. If
+the observations do not yet contain enough usable variation, the dashboard
+explains what is missing and learning continues.
+
+The confidence chart still needs three comparable completed days containing
+recorded reference values. Logs collected before acceptance cannot be scored
+retroactively. **Reference pending** means acceptance is missing, rather than
+that more days alone will complete learning.
+
+The identity-bound control command `accept-reference` remains available for
+scripts, with `migrate-reference` for explicit review of a legacy baseline.
+Both support optional `operator` and `note` fields. `archive-reference` removes the active
 accepted model and retains an immutable archive entry before relearning. The
 daemon rejects these commands when the instance identity is stale, the source
 is degraded, or the candidate is incomplete. Accepted values are frozen and
