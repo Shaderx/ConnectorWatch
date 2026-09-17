@@ -81,7 +81,7 @@ public sealed partial class MainWindow : Window
     {
         this.configPath = configPath; this.config = config; this.data = data; this.settingsPath = settingsPath; this.demo = demo; this.noStart = noStart; this.render = render;
         store = new(data); client = new(data);
-        confidenceHistory = demo ? null : new ConfidenceHistory(data, Path.Combine(data, "confidence-history.json"), config.BinWatts);
+        confidenceHistory = demo ? null : new ConfidenceHistory(data, Path.Combine(data, "confidence-replay-history.json"), config.BinWatts, replayAcceptedReference: true);
         try { if (File.Exists(settingsPath)) settings = JsonSerializer.Deserialize<GuiSettings>(TelemetryStore.ReadShared(settingsPath)) ?? new(); } catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { }
         foreach (var id in settings.Acknowledged ?? Array.Empty<string>()) acknowledged.Add(id);
         if (!demo) { localIncidents.AddRange(settings.LocalIncidents ?? Array.Empty<Incident>()); store.Incidents.AddRange(localIncidents); }
@@ -506,8 +506,17 @@ public sealed partial class MainWindow : Window
         return "Receiving telemetry. " + activity + (notes.Count > 0 ? " " + string.Join(" ", notes) : " Aggregate rail readings do not certify connector safety.");
     }
     internal static (string Value, string Caption, string EmptyText) ConfidenceWaitingDisplay(
-        IReadOnlyList<ConfidenceDay> days, string cohort, string referenceState = "")
+        IReadOnlyList<ConfidenceDay> days, string cohort, string referenceState = "",
+        ConfidencePoint? latestPoint = null, string historyStatus = "")
     {
+        const string unavailablePrefix = "Retrospective confidence unavailable:";
+        if (historyStatus.TrimStart().StartsWith(unavailablePrefix,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            string detail = historyStatus.Trim();
+            return ("Reference unavailable", detail,
+                "Reference unavailable — accepted-reference replay cannot be loaded.");
+        }
         var relevantDays = days
             .Where(day => string.IsNullOrWhiteSpace(cohort) ||
                 string.Equals(day.Cohort, cohort, StringComparison.Ordinal))
@@ -527,9 +536,37 @@ public sealed partial class MainWindow : Window
                     "No accepted reference is recorded for this source and load.",
                     "Reference required — no comparable history yet.");
         }
+        if (latestPoint is { Score: null } point)
+        {
+            int comparableDays = Math.Clamp(point.EvidenceDays, 0, DegradationConfidence.MinimumSupportedDays);
+            switch (point.Reason?.Trim().ToUpperInvariant())
+            {
+                case "INSUFFICIENT_EVIDENCE":
+                case "INSUFFICIENT_DAYS":
+                    string cutoff = NextUtcCutoffLocal();
+                    return ("Learning",
+                        $"{comparableDays} of {DegradationConfidence.MinimumSupportedDays} comparable completed days. " +
+                        $"Next UTC cutoff: {cutoff} local.",
+                        $"Learning — {comparableDays} of {DegradationConfidence.MinimumSupportedDays} comparable completed days.");
+                case "LOAD_NOT_COMPARABLE":
+                    return ("Load mismatch",
+                        "The latest completed day did not match the selected comparison load band.",
+                        "Load mismatch — waiting for a comparable workload.");
+                case "INSUFFICIENT_DAY_EVIDENCE":
+                case "INSUFFICIENT_EXPOSURE":
+                    return ("Sparse day",
+                        "The latest completed day was sparse; it needs 10 sampled minutes across at least 30 minutes.",
+                        "Sparse day — needs 10 sampled minutes across 30 minutes.");
+            }
+        }
         return ("Learning",
             "Needs three comparable days. Missing measurements do not mean low degradation confidence.",
             "Learning — needs three comparable days.");
+    }
+    static string NextUtcCutoffLocal()
+    {
+        var cutoff = new DateTimeOffset(DateTime.UtcNow.Date.AddDays(1), TimeSpan.Zero).ToLocalTime();
+        return cutoff.ToString("g", CultureInfo.CurrentCulture);
     }
     static string QualityDetails(Snapshot? s)
     {
@@ -612,16 +649,23 @@ public sealed partial class MainWindow : Window
             else
             {
                 var waiting = ConfidenceWaitingDisplay(days, settings.ConfidenceCohort,
-                    store.Current?.ReferenceState ?? "");
+                    store.Current?.ReferenceState ?? "", latest,
+                    confidenceHistory?.Status ?? "");
                 bool reading = confidenceReadBusy && days.Count == 0;
-                confidenceValue.Text = reading ? "Reading history…" : points.Any(p => p.Score.HasValue) ? "No recent comparison" : waiting.Value;
+                bool explainLatest = latest?.Score is null && latest?.Reason is
+                    ("INSUFFICIENT_EVIDENCE" or "INSUFFICIENT_DAYS" or
+                    "LOAD_NOT_COMPARABLE" or "INSUFFICIENT_DAY_EVIDENCE" or
+                    "INSUFFICIENT_EXPOSURE");
+                confidenceValue.Text = reading ? "Reading history…" :
+                    explainLatest ? waiting.Value : points.Any(p => p.Score.HasValue) ? "No recent comparison" : waiting.Value;
                 confidenceValue.Foreground = Palette.Muted;
-                confidenceCaption.Text = reading ? "Loading recorded history…" : points.Any(p => p.Score.HasValue) ? "No recent comparison in the latest completed day." : waiting.Caption;
+                confidenceCaption.Text = reading ? "Loading recorded history…" :
+                    explainLatest ? waiting.Caption : points.Any(p => p.Score.HasValue) ? "No recent comparison in the latest completed day." : waiting.Caption;
                 confidencePlot.EmptyText = reading ? "Reading recorded history…" : waiting.EmptyText;
             }
             if (confidenceConfigurationError)
                 confidencePlot.EmptyText = "Confidence unavailable: configure a finite positive voltage-shift threshold.";
-            confidenceDetails.Text = "Approximate load matching. Each day needs 10 sampled minutes across at least 30 minutes.\nConfidence combines the size, persistence and number of comparable days in the last week.\nThe voltage-drop threshold is " + (config.ShiftVolts * 1000).ToString("F0", CultureInfo.InvariantCulture) + " mV; this policy is not a calibrated failure probability. Sensor freshness may remain unverified. These readings cannot isolate the cause.\n" + (demo ? "Synthetic demonstration." : confidenceHistory?.Status ?? "Waiting for recorded data.");
+            confidenceDetails.Text = (demo ? "Synthetic demonstration." : "EDC retrospective accepted-reference comparison. Historical days are replayed against the current accepted reference; the current UTC day remains provisional.") + "\nApproximate load matching. Each day needs 10 sampled minutes across at least 30 minutes.\nConfidence combines the size, persistence and number of comparable days in the last week.\nThe voltage-drop threshold is " + (config.ShiftVolts * 1000).ToString("F0", CultureInfo.InvariantCulture) + " mV; this policy is not a calibrated failure probability. Sensor freshness may remain unverified. These readings cannot isolate the cause.\n" + (demo ? "" : confidenceHistory?.Status ?? "Waiting for recorded data.");
             if (confidenceConfigurationError)
                 confidenceDetails.Text = "Confidence unavailable because ShiftVolts is not finite and positive. The confidence score is an operational evidence summary, not a calibrated failure probability.";
             confidenceDetails.ToolTip = settings.ConfidenceCohort;

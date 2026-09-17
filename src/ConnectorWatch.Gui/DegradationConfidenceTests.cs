@@ -131,6 +131,46 @@ public static class DegradationConfidenceTests
             Point(loadMismatch, 1).EvidenceDays == 2,
             "Load-bin mismatch is excluded from evidence rather than scored as zero");
 
+        var waitingForEvidence = MainWindow.ConfidenceWaitingDisplay(
+            new[] { Day(3, 300), Day(2, 300) }, "GPU-A",
+            latestPoint: new ConfidencePoint
+            {
+                Day = date(1), Reason = "INSUFFICIENT_EVIDENCE", EvidenceDays = 2
+            });
+        Check(waitingForEvidence.Value == "Learning" &&
+            waitingForEvidence.Caption.Contains("2 of 3 comparable completed days", StringComparison.Ordinal) &&
+            waitingForEvidence.Caption.Contains("Next UTC cutoff", StringComparison.Ordinal) &&
+            waitingForEvidence.Caption.Contains("local", StringComparison.OrdinalIgnoreCase),
+            "Incomplete evidence explains the completed-day count and next local cutoff");
+
+        var waitingForMismatch = MainWindow.ConfidenceWaitingDisplay(
+            new[] { Day(1, 300) }, "GPU-A",
+            latestPoint: new ConfidencePoint { Day = date(1), Reason = "LOAD_NOT_COMPARABLE" });
+        Check(waitingForMismatch.Value == "Load mismatch" &&
+            waitingForMismatch.Caption.Contains("load band", StringComparison.OrdinalIgnoreCase),
+            "Load mismatch has a distinct waiting explanation");
+
+        var waitingForSparseDay = MainWindow.ConfidenceWaitingDisplay(
+            new[] { Day(1, 300) }, "GPU-A",
+            latestPoint: new ConfidencePoint { Day = date(1), Reason = "INSUFFICIENT_DAY_EVIDENCE" });
+        Check(waitingForSparseDay.Value == "Sparse day" &&
+            waitingForSparseDay.Caption.Contains("10 sampled minutes", StringComparison.Ordinal),
+            "Sparse day has a distinct exposure explanation");
+
+        foreach (string status in new[]
+        {
+            "Retrospective confidence unavailable: accepted reference is missing",
+            "Retrospective confidence unavailable: reference JSON is malformed",
+        })
+        {
+            var unavailableDisplay = MainWindow.ConfidenceWaitingDisplay(
+                Array.Empty<ConfidenceDay>(), "GPU-A", historyStatus: status);
+            Check(unavailableDisplay.Value == "Reference unavailable" &&
+                unavailableDisplay.Caption == status &&
+                unavailableDisplay.EmptyText.Contains("cannot be loaded", StringComparison.Ordinal),
+                "Fail-closed replay status is shown as reference unavailable");
+        }
+
         bool rejected = false;
         try { DegradationConfidence.Build(Array.Empty<ConfidenceDay>(), "GPU-A", now, 0); }
         catch (ArgumentOutOfRangeException) { rejected = true; }

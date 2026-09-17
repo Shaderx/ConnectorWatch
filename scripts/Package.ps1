@@ -14,7 +14,7 @@ $stage = Join-Path $output 'stage'
 & "$PSScriptRoot/Publish.ps1" -OutputDirectory $stage
 $config = Get-Content "$stage/config.json" -Raw | ConvertFrom-Json
 if ($config.GpuUuid -ne '' -or $config.DataDirectory -ne 'data') { throw 'Release configuration must be unconfigured.' }
-if (Get-ChildItem $stage -Recurse -File | Where-Object { $_.Extension -in @('.pdb','.log') -or $_.Name -in @('status.json','baseline.json','events.csv','monitor.lock','confidence-history.json') -or $_.Name -like 'telemetry-*' }) { throw 'Runtime data or debug files found in release' }
+if (Get-ChildItem $stage -Recurse -File | Where-Object { $_.Extension -in @('.pdb','.log') -or $_.Name -in @('status.json','baseline.json','events.csv','monitor.lock','confidence-history.json','confidence-replay-history.json') -or $_.Name -like 'telemetry-*' }) { throw 'Runtime data or debug files found in release' }
 & "$stage/ConnectorWatch.exe" --self-test
 if ($LASTEXITCODE -ne 0) { throw 'Packaged daemon tests failed' }
 $guiReport = Join-Path $output 'gui-tests.json'

@@ -32,6 +32,7 @@ public sealed class ConfidenceHistory
     readonly string dataDirectory;
     readonly string cachePath;
     readonly double binWatts;
+    readonly bool replayAcceptedReference;
     readonly SemaphoreSlim refreshGate = new(1, 1);
     readonly object stateGate = new();
     IReadOnlyList<ConfidenceDay> days = Array.Empty<ConfidenceDay>();
@@ -45,7 +46,8 @@ public sealed class ConfidenceHistory
     DateTimeOffset? lastCheckpointAtUtc;
     DateTimeOffset? lastRefreshAtUtc;
 
-    public ConfidenceHistory(string dataDirectory, string cachePath, double binWatts = 25)
+    public ConfidenceHistory(string dataDirectory, string cachePath, double binWatts = 25,
+        bool replayAcceptedReference = false)
     {
         if (string.IsNullOrWhiteSpace(dataDirectory))
             throw new ArgumentException("A telemetry directory is required.", nameof(dataDirectory));
@@ -57,6 +59,7 @@ public sealed class ConfidenceHistory
         this.dataDirectory = Path.GetFullPath(dataDirectory);
         this.cachePath = Path.GetFullPath(cachePath);
         this.binWatts = binWatts;
+        this.replayAcceptedReference = replayAcceptedReference;
     }
 
     /// <summary>Published atomically after a complete worker refresh.</summary>
@@ -163,11 +166,31 @@ public sealed class ConfidenceHistory
         DateTimeOffset today = UtcDay(now);
         DateTimeOffset firstDay = today.AddDays(-HistoryDays);
 
-        if (!Directory.Exists(dataDirectory))
+        AcceptedReferenceReplay? replay = null;
+        if (replayAcceptedReference && !AcceptedReferenceReplay.TryLoad(
+                Path.Combine(dataDirectory, "reference.json"), binWatts,
+                out replay, out var replayError))
+        {
+            // Do not leave an earlier replay visible, or allow FlushAsync to
+            // persist one, after the accepted model disappears or becomes
+            // invalid. The source telemetry and its reference lifecycle file
+            // remain untouched.
+            cache = null;
+            persistedCache = null;
+            cacheLoaded = false;
+            cacheHasCheckpoint = false;
+            cacheDirty = false;
+            lastCheckpointAtUtc = null;
             return new(Array.Empty<ConfidenceDay>(),
-                "Historical telemetry directory is unavailable.");
+                "Retrospective confidence unavailable: " + replayError);
+        }
 
-        CacheDocument workingCache = EnsureCacheLoaded(now).Clone();
+        if (!Directory.Exists(dataDirectory))
+            return new(Array.Empty<ConfidenceDay>(), replayAcceptedReference
+                ? "Retrospective confidence unavailable: telemetry directory is unavailable."
+                : "Historical telemetry directory is unavailable.");
+
+        CacheDocument workingCache = EnsureCacheLoaded(now, replay?.CacheKey).Clone();
         var cachedFiles = workingCache.Files
             .Where(file => !string.IsNullOrWhiteSpace(file.Name))
             .GroupBy(FileLogicalName, StringComparer.OrdinalIgnoreCase)
@@ -258,7 +281,7 @@ public sealed class ConfidenceHistory
 
             try
             {
-                var rebuilt = BuildDay(day, contributing, errors);
+                var rebuilt = BuildDay(day, contributing, errors, replay);
                 records.RemoveAll(item => UtcDay(item.Day) == day);
                 records.AddRange(rebuilt.Records);
             }
@@ -313,21 +336,30 @@ public sealed class ConfidenceHistory
 
         string resultStatus;
         if (errors.Count > 0)
-            resultStatus = "Historical confidence loaded with file warnings: " +
+            resultStatus = (replayAcceptedReference
+                ? "Retrospective confidence loaded using accepted reference"
+                : "Historical confidence loaded") + " with file warnings: " +
                 string.Join("; ", errors.Take(2));
         else if (cacheError is not null)
-            resultStatus = "Historical confidence loaded; cache unavailable: " + cacheError;
+            resultStatus = (replayAcceptedReference
+                ? "Retrospective confidence loaded using accepted reference"
+                : "Historical confidence loaded") + "; cache unavailable: " + cacheError;
+        else if (replay is not null)
+            resultStatus = $"Retrospective confidence loaded using accepted reference " +
+                $"(matched {replay.AppliedRows} rows for validation; {published.Length} daily records).";
         else
             resultStatus = $"Historical confidence loaded ({published.Length} daily records).";
         return new(Array.AsReadOnly(published), resultStatus);
     }
 
-    CacheDocument EnsureCacheLoaded(DateTimeOffset now)
+    CacheDocument EnsureCacheLoaded(DateTimeOffset now, string? replayKey)
     {
-        if (cacheLoaded && cache is not null)
+        if (cacheLoaded && cache is not null &&
+            (!replayAcceptedReference || string.Equals(cache.ReplayReferenceKey,
+                replayKey, StringComparison.Ordinal)))
             return cache;
 
-        cache = LoadCache();
+        cache = LoadCache(replayKey);
         persistedCache = cache.Clone();
         cacheLoaded = true;
         // A valid on-disk checkpoint establishes the start of the next
@@ -441,13 +473,13 @@ public sealed class ConfidenceHistory
     }
 
     DayBuild BuildDay(DateTimeOffset day, IReadOnlyList<string> paths,
-        List<string> errors)
+        List<string> errors, AcceptedReferenceReplay? replay)
     {
         var rows = new Dictionary<ObservationKey, RawObservation>();
         bool bounded = false;
         foreach (string path in paths)
         {
-            ParseFileForDay(path, day, rows, () => bounded = true);
+            ParseFileForDay(path, day, rows, () => bounded = true, replay);
         }
         if (bounded)
             errors.Add(day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) +
@@ -464,7 +496,8 @@ public sealed class ConfidenceHistory
     }
 
     void ParseFileForDay(string path, DateTimeOffset day,
-        Dictionary<ObservationKey, RawObservation> rows, Action bounded)
+        Dictionary<ObservationKey, RawObservation> rows, Action bounded,
+        AcceptedReferenceReplay? replay)
     {
         Dictionary<string, int>? headers = null;
         foreach (string record in ReadCsvRecords(path, bounded))
@@ -479,6 +512,25 @@ public sealed class ConfidenceHistory
             if (!TryObservation(headers, cells, out var observation) ||
                 UtcDay(observation.SensorTime) != day)
                 continue;
+            if (replay is not null)
+            {
+                // Recorded references describe what was known at capture time.
+                // A retrospective pass must use only the current accepted
+                // model, and must not let an unmatched historical model leak
+                // into the replay.
+                observation.Reference = null;
+                if (replay.TryApply(observation.GpuUuid,
+                        observation.ElectricalSource,
+                        observation.AnalysisPowerSource,
+                        observation.LoadUnit,
+                        observation.Bin, out var acceptedReference))
+                {
+                    observation.Reference = acceptedReference;
+                    if (string.Equals(observation.Status?.Trim(),
+                            "LEARNING_REFERENCE", StringComparison.OrdinalIgnoreCase))
+                        observation.Status = "LOAD_QUALIFIED";
+                }
+            }
             var key = ObservationKey.For(observation);
             if (!rows.TryGetValue(key, out var previous) ||
                 observation.HostTime > previous.HostTime)
@@ -562,6 +614,9 @@ public sealed class ConfidenceHistory
             HostTime = host,
             SensorTime = sensor,
             Voltage = voltage,
+            GpuUuid = gpu,
+            ElectricalSource = electrical,
+            AnalysisPowerSource = loadSource,
             Reference = Number(Get("reference_v", "reference_volts")),
             Power = Number(Get("analysis_power_w", "power_w", "load_w")),
             Bin = Integer(Get("bin_w", "load_bin_w", "analysis_bin_w")),
@@ -819,7 +874,9 @@ public sealed class ConfidenceHistory
         if (ReferenceEquals(left, right)) return true;
         if (left is null || right is null) return false;
         if (left.SchemaVersion != right.SchemaVersion ||
-            !left.BinWatts.Equals(right.BinWatts)) return false;
+            !left.BinWatts.Equals(right.BinWatts) ||
+            !string.Equals(left.ReplayReferenceKey, right.ReplayReferenceKey,
+                StringComparison.Ordinal)) return false;
 
         var leftFiles = (left.Files ?? new()).OrderBy(file => FileLogicalName(file),
                 StringComparer.OrdinalIgnoreCase).ThenBy(file => file.Name,
@@ -909,22 +966,24 @@ public sealed class ConfidenceHistory
         left.AnchorP10Load == right.AnchorP10Load &&
         left.AnchorP90Load == right.AnchorP90Load;
 
-    CacheDocument LoadCache()
+    CacheDocument LoadCache(string? replayKey)
     {
         cacheHasCheckpoint = false;
         try
         {
-            if (!File.Exists(cachePath)) return NewCache();
+            if (!File.Exists(cachePath)) return NewCache(replayKey);
             var info = new FileInfo(cachePath);
             if (info.Length <= 0 || info.Length > MaximumCacheBytes)
-                return NewCache();
+                return NewCache(replayKey);
             using var stream = new FileStream(cachePath, FileMode.Open, FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete);
             var document = JsonSerializer.Deserialize<CacheDocument>(stream, JsonOptions());
             if (document is null || document.SchemaVersion != CacheSchemaVersion ||
                 !double.IsFinite(document.BinWatts) ||
-                Math.Abs(document.BinWatts - binWatts) > 1e-9)
-                return NewCache();
+                Math.Abs(document.BinWatts - binWatts) > 1e-9 ||
+                !string.Equals(document.ReplayReferenceKey, replayKey,
+                    StringComparison.Ordinal))
+                return NewCache(replayKey);
             document.Files ??= new();
             document.Days ??= new();
             document.Epochs ??= new();
@@ -936,14 +995,15 @@ public sealed class ConfidenceHistory
         {
             GuiLog.Current.Write("confidence_history_cache_read_error",
                 new { cachePath }, ex, throttle: true);
-            return NewCache();
+            return NewCache(replayKey);
         }
     }
 
-    CacheDocument NewCache() => new()
+    CacheDocument NewCache(string? replayKey = null) => new()
     {
         SchemaVersion = CacheSchemaVersion,
         BinWatts = binWatts,
+        ReplayReferenceKey = replayKey,
         Files = new(),
         Days = new(),
         Epochs = new(),
@@ -998,6 +1058,9 @@ public sealed class ConfidenceHistory
         public DateTimeOffset HostTime { get; set; }
         public DateTimeOffset SensorTime { get; set; }
         public double Voltage { get; set; }
+        public string GpuUuid { get; set; } = "";
+        public string ElectricalSource { get; set; } = "";
+        public string AnalysisPowerSource { get; set; } = "";
         public double? Reference { get; set; }
         public double? Power { get; set; }
         public int? Bin { get; set; }
@@ -1031,6 +1094,7 @@ public sealed class ConfidenceHistory
     {
         public int SchemaVersion { get; set; }
         public double BinWatts { get; set; }
+        public string? ReplayReferenceKey { get; set; }
         public DateTimeOffset UpdatedAtUtc { get; set; }
         public List<CachedFile> Files { get; set; } = new();
         public List<CachedDay> Days { get; set; } = new();
@@ -1041,6 +1105,7 @@ public sealed class ConfidenceHistory
         {
             SchemaVersion = SchemaVersion,
             BinWatts = BinWatts,
+            ReplayReferenceKey = ReplayReferenceKey,
             UpdatedAtUtc = UpdatedAtUtc,
             Files = (Files ?? new()).Select(file => file.Clone()).ToList(),
             Days = (Days ?? new()).Select(day => day.Clone()).ToList(),

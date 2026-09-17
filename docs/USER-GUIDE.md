@@ -2,7 +2,7 @@
 
 ConnectorWatch is an experimental Windows monitor for the 16-pin input-voltage trend of a supported RTX 5090 setup. It consists of a Windows WPF dashboard and a headless .NET 8 daemon. The daemon owns all GPU access, records timestamped telemetry, and evaluates voltage changes within comparable load bands. The dashboard reads the daemon's files and control endpoint.
 
-Version **1.5.2** remains experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Private readings require a signed maintainer decision for the exact board, driver and embedded reader. Multiple GPUs fail closed. The [physical validation record](VALIDATION.md) and [driver catalog](DRIVER-CATALOG.md) describe those separate boundaries.
+Version **1.5.3** remains experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Private readings require a signed maintainer decision for the exact board, driver and embedded reader. Multiple GPUs fail closed. The [physical validation record](VALIDATION.md) and [driver catalog](DRIVER-CATALOG.md) describe those separate boundaries.
 
 ![Synthetic dashboard preview](dashboard.png)
 
@@ -62,10 +62,12 @@ Automatic acceptance also waits until the voltage model can be fitted. If
 the observations do not yet contain enough usable variation, the dashboard
 explains what is missing and learning continues.
 
-The confidence chart still needs three comparable completed days containing
-recorded reference values. Logs collected before acceptance cannot be scored
-retroactively. **Reference pending** means acceptance is missing, rather than
-that more days alone will complete learning.
+The confidence chart needs three comparable completed UTC days. Starting with
+1.5.3, it replays compatible retained measurements against the current accepted
+reference, so qualified measurements collected before acceptance can contribute.
+This is labeled retrospective analysis; it does not change what was recorded at
+the time. An unavailable accepted reference must be resolved before replay can
+proceed; collecting more days alone will not resolve that state.
 
 The identity-bound control command `accept-reference` remains available for
 scripts, with `migrate-reference` for explicit review of a legacy baseline.
@@ -198,9 +200,9 @@ See [docs/REPLAY.md](REPLAY.md) for deterministic replay, [docs/RECORDED-DATA-CH
 
 The additional **Electrical degradation confidence** chart displays daily points over 7, 30 or 90 days (default 30). Higher percentages mean stronger operational evidence of a persistent voltage decline under similar load. The percentage is an experimental evidence score, not a measured probability of hardware damage. It can decrease when comparable measurements recover. Missing or insufficient data stays unscored.
 
-The GUI reads historical telemetry in the background and caches sufficient evidence and fixed load-comparison anchors in `data/confidence-history.json` (or the configured data directory). Retain that file along with the CSV recordings when moving installations. The history cache stays in memory between refreshes. Changed state is checkpointed every 30 minutes and on normal GUI exit; initial backfill can save immediately and unchanged state is not rewritten. It reads both CSV and gzip recordings directly. This history is independent of the detailed chart's 24-hour RAM window. Switching the displayed range does not retrain the comparison.
+The GUI reads historical telemetry in the background and replays compatible observations against the current accepted reference. It caches this retrospective evidence and fixed load-comparison anchors in `data/confidence-replay-history.json` (or the configured data directory), separately from the older recorded-reference cache. Keep your accepted reference and CSV/gzip recordings when moving installations. The replay cache is rebuilt when the accepted model changes; an unavailable or incompatible reference prevents replay. Original telemetry and reference acceptance records are not changed. The history cache stays in memory between refreshes. Changed state is checkpointed every 30 minutes and on normal GUI exit; initial backfill can save immediately and unchanged state is not rewritten. It reads both CSV and gzip recordings directly. This history is independent of the detailed chart's 24-hour RAM window. Switching the displayed range does not retrain the comparison.
 
-Each completed UTC day needs at least 10 distinct sampled minutes with five unique eligible observations per minute, spread across at least 30 minutes. A score needs three comparable days spanning at least 48 hours. One daily median receives one vote; faster polling does not increase confidence. Source, load cohort and recorded-reference changes separate comparisons. Approximate load matching checks the daily load median and 10th/90th percentiles against the first qualifying day's fixed load distribution; tolerances are one-quarter and one-half of the load-bin width respectively.
+Each completed UTC day needs at least 10 distinct sampled minutes with five unique eligible observations per minute, spread across at least 30 minutes. A score needs three comparable days spanning at least 48 hours. The current UTC day remains incomplete until midnight UTC (shown in local time in the dashboard). One daily median receives one vote; faster polling does not increase confidence. Replay requires matching GPU, electrical source, load source, unit and accepted load bin; source and load cohorts remain separate. Approximate load matching checks the daily load median and 10th/90th percentiles against the first qualifying day's fixed load distribution; tolerances are one-quarter and one-half of the load-bin width respectively.
 
 For tinkerers: within the last seven calendar days in the same comparison epoch, let `D` be supported daily median drops and `T = ShiftVolts × 1000` mV. The score is `100 × clamp((median(D) − T/4)/(3T/4), 0, 1) × fraction(D > T/4) × min(count(D)/7, 1)`. These are transparent policy choices, not a calibrated sensor or failure model. Sensor-timing limitations remain unverified where reported, and these measurements cannot isolate connector damage from other electrical causes.
 
@@ -208,7 +210,7 @@ For tinkerers: within the last seven calendar days in the same comparison epoch,
 
 The dashboard aggregates raw connector-voltage observations into one-minute intervals for one load band and source context. Positive millivolts mean lower voltage relative to the comparison. The chart uses the selected 15-minute, 1-hour, or 24-hour range; when idle, “Most sampled load” selects a historical load band with observations.
 
-“Initial observation” compares against the first interval with at least five eligible observations in that range. Its zero is the initial observed voltage, not a known healthy state; changing the time range can change that comparison. “Recorded reference” uses only the reference saved alongside each observation and does not retroactively apply today's reference to old data. Legacy reference and timestamp limitations remain visible.
+“Initial observation” compares against the first interval with at least five eligible observations in that range. Its zero is the initial observed voltage, not a known healthy state; changing the time range can change that comparison. This detailed trend chart's “Recorded reference” mode uses only the reference saved alongside each observation and does not retroactively apply today's reference to old data. It remains distinct from the long-term EDC chart's retrospective replay. Legacy reference and timestamp limitations remain visible.
 
 The line is the median voltage drop. Shading is the observed 5th–95th percentile spread, not a statistical confidence interval or probability of connector health. Hover for counts, sampled span, load range, and source-timing qualifications. Sparse intervals and gaps do not become zero-drop readings. Source changes and recorded-reference changes break the trace. Voltage changes within a load band can still reflect load variation, supply voltage, temperature, or measurement behavior; the chart does not establish connector damage.
 

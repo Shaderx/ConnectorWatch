@@ -50,8 +50,10 @@ The chart needs at least **three comparable completed days**. Missing, stale or 
 **Automatically accept qualified reference** is enabled by default. The
 background monitor accepts a qualified reference once usable model evidence is
 available. You can turn it off and use **Accept reference** manually. Existing
-saved preferences and accepted baselines are preserved. Comparable days
-accumulate after reference acceptance.
+saved preferences and accepted baselines are preserved. The EDC chart replays
+compatible retained measurements against that accepted reference, including
+qualified observations recorded before acceptance. The dashboard labels this
+retrospective comparison; original logs remain unchanged.
 
 The [user guide](docs/USER-GUIDE.md#long-term-degradation-confidence) explains the calculation and the detailed chart.
 
