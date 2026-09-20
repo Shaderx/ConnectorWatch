@@ -1011,6 +1011,14 @@ public static class Program
             if (args.Contains("--self-test")) { Tests.Run(); return 0; }
             if (args.Contains("--approval-self-test")) { DriverApprovalTests.Run(); MaintainerValidationTests.Run(); ReleaseTrustPreparationTests.Run(); return 0; }
             if (args.Contains("--deployment-self-test")) { DeploymentTests.Run(); AppUpdateTests.Run(); return 0; }
+            if (args.Contains("--prediction-self-test"))
+            {
+                ShadowTelemetryReaderTests.Run();
+                ShadowPredictionEvaluationTests.Run();
+                ShadowPredictionCommandTests.Run();
+                return 0;
+            }
+            if (ShadowPredictionCommand.TryHandle(args, out var predictionExit)) return predictionExit;
             if (ReleaseSignatureVerificationCommand.TryHandle(args, out var signatureExit)) return signatureExit;
             if (ReleaseTrustPreparation.TryRun(args, out var trustExit)) return trustExit;
             if (AppReleasePublication.TryHandle(args, out var appPublicationExit)) return appPublicationExit;

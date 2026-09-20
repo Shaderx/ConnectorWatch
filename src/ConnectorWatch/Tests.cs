@@ -164,6 +164,9 @@ public static class Tests
         PowerLimitWatchdogTests.Run();
         AutoAcceptReferenceTests.Run();
         RecordedDataCharacterizationTests.Run();
+        ShadowTelemetryReaderTests.Run();
+        ShadowPredictionEvaluationTests.Run();
+        ShadowPredictionCommandTests.Run();
         EarlyWarningIntegrationTests.Run();
         OptionalMitigationTests.Run();
         Console.WriteLine($"PASS: {passed} behavioral checks.");

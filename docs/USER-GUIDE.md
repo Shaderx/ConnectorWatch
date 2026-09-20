@@ -2,7 +2,7 @@
 
 ConnectorWatch is an experimental Windows monitor for the 16-pin input-voltage trend of a supported RTX 5090 setup. It consists of a Windows WPF dashboard and a headless .NET 8 daemon. The daemon owns all GPU access, records timestamped telemetry, and evaluates voltage changes within comparable load bands. The dashboard reads the daemon's files and control endpoint.
 
-Version **1.5.3** remains experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Private readings require a signed maintainer decision for the exact board, driver and embedded reader. Multiple GPUs fail closed. The [physical validation record](VALIDATION.md) and [driver catalog](DRIVER-CATALOG.md) describe those separate boundaries.
+Version **1.5.4** remains experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Private readings require a signed maintainer decision for the exact board, driver and embedded reader. Multiple GPUs fail closed. The [physical validation record](VALIDATION.md) and [driver catalog](DRIVER-CATALOG.md) describe those separate boundaries.
 
 ![Synthetic dashboard preview](dashboard.png)
 
@@ -195,6 +195,10 @@ dotnet run --project .\src\ConnectorWatch\ConnectorWatch.csproj -- --characteriz
 See [docs/REPLAY.md](REPLAY.md) for deterministic replay, [docs/RECORDED-DATA-CHARACTERIZATION.md](RECORDED-DATA-CHARACTERIZATION.md) for the captured-data report, and [docs/VALIDATION.md](VALIDATION.md) for tested behavior and limitations. A passing offline self-test does not validate a user's GPU, driver, cabling, connector, or public release build.
 
 ## Electrical degradation trend
+
+For recurring offline model comparisons and experimental early-advisory
+evaluation, see [automated prediction review](PREDICTION-REVIEW.md). The workflow
+uses retained full-resolution CSV/gzip recordings without disturbing the connector.
 
 ### Long-term degradation confidence
 
