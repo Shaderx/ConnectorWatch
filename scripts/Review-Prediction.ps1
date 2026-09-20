@@ -33,11 +33,11 @@ if ($destination.Equals($DataDirectory, [StringComparison]::OrdinalIgnoreCase) -
     $destination.StartsWith($dataPrefix, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'Review output must be outside the telemetry directory.'
 }
-$evaluator = if ($isPackaged) {
+if ($isPackaged) {
     if (-not (Test-Path -LiteralPath $packagedAssembly -PathType Leaf)) {
         throw 'Packaged evaluator assembly is missing beside ConnectorWatch.exe.'
     }
-    $packagedAssembly
+    $evaluator = $packagedAssembly
 } else {
     $project = Join-Path $repoRoot 'src/ConnectorWatch/ConnectorWatch.csproj'
     if (-not $SkipBuild) {
@@ -49,7 +49,7 @@ $evaluator = if ($isPackaged) {
         & dotnet build $project -c Release --no-restore --nologo
         if ($LASTEXITCODE -ne 0) { throw 'Prediction evaluator build failed.' }
     }
-    Join-Path $repoRoot 'src/ConnectorWatch/bin/Release/net8.0/ConnectorWatch.dll'
+    $evaluator = Join-Path $repoRoot 'src/ConnectorWatch/bin/Release/net8.0/ConnectorWatch.dll'
 }
 if (-not (Test-Path -LiteralPath $evaluator -PathType Leaf)) {
     throw 'Build the evaluator before using -SkipBuild.'
