@@ -8,9 +8,9 @@ distinguishes that approval from the available structural tests.
 
 A Windows-first dashboard for monitoring RTX 5090 input-rail voltage and electrical trends over time.
 
-[Download for Windows](https://github.com/Shaderx/ConnectorWatch/releases/download/app-stable/ConnectorWatch-Setup-1.5.2.exe) · [User guide](docs/USER-GUIDE.md) · [Release notes](docs/RELEASE-1.5.2.md)
+[Download for Windows](https://github.com/Shaderx/ConnectorWatch/releases/download/app-stable/ConnectorWatch-Setup.exe) · [User guide](docs/USER-GUIDE.md) · [Release notes](docs/RELEASE-1.5.5.md)
 
-Version 1.5.2 uses the project's **self-signed certificate**. Windows can show an
+The signed Windows release uses the project's **self-signed certificate**. Windows can show an
 unrecognized publisher or SmartScreen prompt. Obtain it from this repository's
 release page and follow the [signature verification instructions](docs/INSTALLATION.md).
 The public CA signing path remains available for a later release.
@@ -25,6 +25,7 @@ The public CA signing path remains available for a later release.
 - **Long-term confidence** — daily comparisons across **7, 30 or 90 days**, with 30 days selected by default.
 - **Detailed electrical trends** — load-matched voltage changes, observed variation and sample details for closer inspection.
 - **Less disk activity** — buffered telemetry, automatic compression of older recordings, and periodic confidence checkpoints.
+- **Automatic prediction reviews** — weekly background comparisons with coverage, exclusions, repeatable simulations, and recent report history. These experimental results do not change live alerts.
 
 ## Start on Windows
 
@@ -66,6 +67,7 @@ The [user guide](docs/USER-GUIDE.md#long-term-degradation-confidence) explains t
 | Confidence history | Kept in memory, with changed history saved every **30 minutes** and on normal GUI exit. Initial backfill can save immediately; unchanged history is not rewritten. |
 | Live charts | Read live data and use a bounded recent history in memory. |
 | Diagnostics | Rotating GUI and monitor logs under `%LOCALAPPDATA%\ConnectorWatch\logs`. |
+| Prediction reviews | Full local reports under `%LOCALAPPDATA%\ConnectorWatch\shadow-reviews`; the dashboard shows up to 12 recent summaries. |
 
 The confidence chart reads compressed recordings directly. Compression verifies the archive before removing its original CSV. An interrupted checkpoint can be rebuilt from retained recordings; an abrupt stop can still lose unflushed live samples.
 

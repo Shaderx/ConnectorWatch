@@ -167,6 +167,7 @@ public static class Tests
         ShadowTelemetryReaderTests.Run();
         ShadowPredictionEvaluationTests.Run();
         ShadowPredictionCommandTests.Run();
+        ShadowReviewSchedulerTests.Run();
         EarlyWarningIntegrationTests.Run();
         OptionalMitigationTests.Run();
         Console.WriteLine($"PASS: {passed} behavioral checks.");

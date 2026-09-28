@@ -2,7 +2,7 @@
 
 ConnectorWatch is an experimental Windows monitor for the 16-pin input-voltage trend of a supported RTX 5090 setup. It consists of a Windows WPF dashboard and a headless .NET 8 daemon. The daemon owns all GPU access, records timestamped telemetry, and evaluates voltage changes within comparable load bands. The dashboard reads the daemon's files and control endpoint.
 
-Version **1.5.4** remains experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Private readings require a signed maintainer decision for the exact board, driver and embedded reader. Multiple GPUs fail closed. The [physical validation record](VALIDATION.md) and [driver catalog](DRIVER-CATALOG.md) describe those separate boundaries.
+Version **1.5.5** remains experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Private readings require a signed maintainer decision for the exact board, driver and embedded reader. Multiple GPUs fail closed. The [physical validation record](VALIDATION.md) and [driver catalog](DRIVER-CATALOG.md) describe those separate boundaries.
 
 ![Synthetic dashboard preview](dashboard.png)
 
@@ -106,6 +106,16 @@ Startup registration is opt-in and is not installed by the release. The dashboar
 Registration does not request elevation. If Windows rejects it, the dashboard reports the error.
 
 ## Dashboard and recorded data
+
+The **Experimental shadow review** panel shows the background prediction review
+and its recent history. The daemon runs it on first use and every seven days,
+using completed UTC days. It continues when the dashboard is closed and catches
+up after the daemon restarts. Review failures retain the previous result and
+show the next retry. Coverage and exclusions show which recorded conditions
+support the comparison. Simulated detection results describe software tests,
+not connector damage probability. Live alerts and accepted references remain
+unchanged. See [prediction reviews](PREDICTION-REVIEW.md) for report locations,
+scheduling, and interpretation.
 
 The live cards show 16-pin voltage, connector or comparison power, PCIe voltage, and the change from the current reference. History can show 15 minutes, one hour, or 24 hours, with an optional PCIe overlay. Missing readings remain gaps. Minima and maxima are preserved so short dips are not hidden by display averaging. Hover over a point for its exact observation. Open a warning to inspect the time at which it occurred, then use **Back to live** to return to the current range.
 

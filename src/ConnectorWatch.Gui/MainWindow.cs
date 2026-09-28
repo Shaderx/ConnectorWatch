@@ -77,9 +77,10 @@ public sealed partial class MainWindow : Window
     string operation = "";
     bool awaitingApprovalRefresh;
     DateTimeOffset? approvalCheckBeforeRefresh;
-    public MainWindow(string configPath, GuiConfig config, string data, string settingsPath, bool demo, bool noStart, bool render)
+    readonly bool shadowReviewDemoOnly;
+    public MainWindow(string configPath, GuiConfig config, string data, string settingsPath, bool demo, bool noStart, bool render, bool shadowReviewDemoOnly = false)
     {
-        this.configPath = configPath; this.config = config; this.data = data; this.settingsPath = settingsPath; this.demo = demo; this.noStart = noStart; this.render = render;
+        this.configPath = configPath; this.config = config; this.data = data; this.settingsPath = settingsPath; this.demo = demo; this.noStart = noStart; this.render = render; this.shadowReviewDemoOnly = shadowReviewDemoOnly;
         store = new(data); client = new(data);
         confidenceHistory = demo ? null : new ConfidenceHistory(data, Path.Combine(data, "confidence-replay-history.json"), config.BinWatts, replayAcceptedReference: true);
         try { if (File.Exists(settingsPath)) settings = JsonSerializer.Deserialize<GuiSettings>(TelemetryStore.ReadShared(settingsPath)) ?? new(); } catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { }
@@ -146,6 +147,7 @@ public sealed partial class MainWindow : Window
         var confidencePanel = Panel(Vertical(Header("Electrical degradation confidence", confidenceRange), confidenceValue, confidenceCaption, confidencePlot,
             Text("Higher means stronger evidence of a persistent voltage decline under similar load.\nExperimental evidence score, not a measured probability of hardware damage. Updated from completed days.", 10), confidenceAdvanced));
         ConfidencePreview = confidencePanel; confidencePanel.Margin = new Thickness(0, 0, 0, 16); content.Children.Add(confidencePanel);
+        content.Children.Add(BuildShadowReviewPanel());
         powerPath.Foreground = Palette.Text; degradation.Foreground = Palette.Amber;
         var pathPanel = Panel(Vertical(Header("Power path and data quality"), powerPath, degradation)); pathPanel.Margin = new Thickness(0, 0, 0, 16); content.Children.Add(pathPanel);
         range.Items.Add("15 minutes"); range.Items.Add("1 hour"); range.Items.Add("24 hours");
@@ -251,7 +253,7 @@ public sealed partial class MainWindow : Window
                 else operation = "Existing monitor is running without a compatible control endpoint. Viewing only.";
             }
         }
-        initialized = true; await Refresh(); if (!render) timer.Start();
+        initialized = true; await InitializeShadowReviewAsync(); await Refresh(); if (!render) timer.Start();
         if (!demo && !render && !QuietTest) _ = CheckForAppUpdate(false);
     }
     async Task Refresh()
@@ -847,7 +849,7 @@ public sealed partial class MainWindow : Window
     public void Restore() { Show(); if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal; Activate(); }
     public void SessionEnding()
     {
-        exiting = true; timer.Stop(); SaveSettings(); tray?.Dispose();
+        exiting = true; timer.Stop(); shadowReviewTimer.Stop(); SaveSettings(); tray?.Dispose();
         FlushConfidenceHistory(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
     }
     async Task FlushConfidenceHistory(TimeSpan timeout)
@@ -858,7 +860,7 @@ public sealed partial class MainWindow : Window
     }
     public async Task ExitGui()
     {
-        if (exiting) return; exiting = true; timer.Stop();
+        if (exiting) return; exiting = true; timer.Stop(); shadowReviewTimer.Stop();
         updateEnding.Cancel();
         if (!demo) await client.Send("release");
         await FlushConfidenceHistory(TimeSpan.FromSeconds(5));
@@ -932,6 +934,10 @@ public sealed partial class MainWindow : Window
         Check(autoAcceptReference.IsChecked == true, "Preview checkbox can show the opted-in state without daemon access");
         autoAcceptReference.IsChecked = false;
         Check(confidencePlot.Points.Count == 30 && confidencePlot.Points.Any(p => p.Score == 0) && confidencePlot.Points.Any(p => p.Score >= 90), "Long-term confidence uses daily points and shows increasing synthetic evidence");
+        Check(shadowReviewSnapshot?.Status == "COMPLETED" && shadowReviewHistory.Items.Count == 3 &&
+            shadowReviewHistory.SelectedItem is ShadowReviewHistoryChoice &&
+            shadowReviewDetails.Text.Contains("CURRENT_LOAD_ONLY", StringComparison.Ordinal),
+            "Synthetic shadow review panel renders selectable history and model details without reading review state");
         double savedConfidenceShift = config.ShiftVolts;
         config.ShiftVolts = 0;
         RenderConfidence();

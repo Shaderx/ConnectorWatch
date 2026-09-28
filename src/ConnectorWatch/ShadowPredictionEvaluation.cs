@@ -204,6 +204,11 @@ public sealed record ShadowSyntheticFaultEvaluation(
     public DateTimeOffset? FirstAdvisoryTimestampUtc { get; init; }
     public double? DetectionLatencySeconds { get; init; }
     public int AttributableTransitions { get; init; }
+    public string ScenarioIdentity { get; init; } = "";
+    public string ScenarioState { get; init; } = "UNAVAILABLE";
+    public DateTimeOffset? WindowStartTimestampUtc { get; init; }
+    public DateTimeOffset? WindowEndTimestampUtc { get; init; }
+    public double? RampDurationSeconds { get; init; }
 }
 
 public sealed record ShadowAdvisoryEvaluation(
@@ -356,6 +361,8 @@ public sealed class ShadowEvaluationReport
         builder.AppendLine($"- Cohort: `{Coverage.CohortKey}`");
         builder.AppendLine($"- Frozen cutoff fingerprint: `{FrozenCutoffFingerprint}`");
         builder.AppendLine($"- Input cutoff: `{InputCutoffUtc:O}`");
+        builder.AppendLine($"- Model identity: `{ModelIdentity}`");
+        builder.AppendLine($"- Configuration identity: `{ConfigurationIdentity}`");
         builder.AppendLine($"- Winner: **{WinnerModel ?? "none"}**");
         builder.AppendLine($"- Source rows read: {InputInventory.RowsRead}; eligible raw rows: {InputInventory.EligibleRawRows}; truncated: {InputInventory.Truncated}.");
         builder.AppendLine($"- Comparison set: {(ComparisonSetNames.Count == 0 ? "none" : string.Join(", ", ComparisonSetNames))}.");
@@ -396,13 +403,13 @@ public sealed class ShadowEvaluationReport
         builder.AppendLine("## Advisory");
         builder.AppendLine();
         builder.AppendLine($"Model: {Advisory.Model}; transitions: {Advisory.AdvisoryTransitions}; transitions per observed hour: {Format(Advisory.TransitionsPerObservedHour)}; calibration median bias: {Format(Advisory.CalibrationMedianBiasV)} V; noise scale: {Format(Advisory.CalibrationNoiseScaleV)} V; hardware fault probability: **{Advisory.HardwareFaultProbability}**.");
-        builder.AppendLine("Synthetic detection latency is elapsed wall-clock time from heldout injection onset; it includes gaps and does not represent continuous observation time.");
+        builder.AppendLine("Synthetic scenarios use the earliest heldout timestamp as a fixed window start, an onset 30 minutes later, and the exclusive end six hours after the start. Detection latency is elapsed wall-clock time and includes gaps.");
         if (Advisory.SyntheticFaults.Count > 0)
         {
             builder.AppendLine();
             builder.AppendLine("Synthetic connector-only checks:");
             foreach (var synthetic in Advisory.SyntheticFaults)
-                builder.AppendLine($"- {synthetic.Label}: {synthetic.AdvisoryTransitions} transitions, attributable={synthetic.AttributableTransitions}, latency={Format(synthetic.DetectionLatencySeconds)} s, sensitive={synthetic.IsSensitive}.");
+                builder.AppendLine($"- {synthetic.Label}: {synthetic.ScenarioState}, scenario `{synthetic.ScenarioIdentity}`, window `{FormatTimestamp(synthetic.WindowStartTimestampUtc)}` to exclusive `{FormatTimestamp(synthetic.WindowEndTimestampUtc)}`, onset `{FormatTimestamp(synthetic.OnsetTimestampUtc)}`, ramp={Format(synthetic.RampDurationSeconds)} s, {synthetic.AdvisoryTransitions} transitions, attributable={synthetic.AttributableTransitions}, latency={Format(synthetic.DetectionLatencySeconds)} s, sensitive={synthetic.IsSensitive}. {synthetic.Detail}");
         }
         if (PcieCandidate is not null)
         {
@@ -421,6 +428,9 @@ public sealed class ShadowEvaluationReport
         static string Format(double? value) => value is double number && double.IsFinite(number)
             ? number.ToString("0.####", CultureInfo.InvariantCulture)
             : "n/a";
+        static string FormatTimestamp(DateTimeOffset? value) => value is DateTimeOffset timestamp
+            ? timestamp.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture)
+            : "n/a";
     }
 }
 
@@ -431,6 +441,11 @@ public sealed class ShadowEvaluationReport
 /// </summary>
 public static class ShadowPredictionEvaluation
 {
+    public const string ModelAlgorithmIdentity = "shadow-regression-v2";
+    public const int ScenarioOnsetOffsetSeconds = 30 * 60;
+    public const int ScenarioWindowDurationSeconds = 6 * 60 * 60;
+    public const int ScenarioRampDurationSeconds = 30 * 60;
+
     sealed record PreparedRow(ShadowTelemetryRow Row, DateTimeOffset TimestampUtc,
         DateTimeOffset MinuteUtc, string CohortKey, string DayKey);
 
@@ -461,6 +476,7 @@ public static class ShadowPredictionEvaluation
         public int OutOfEnvelopeRows { get; set; }
         public bool TargetCoupledPredictor { get; set; }
         public bool EligibleForRanking { get; set; }
+        public bool EligibleForAdvisory { get; set; }
         public string PowerProvenance { get; set; } = "NOT_APPLICABLE";
         public string EligibilityDetail { get; set; } = "";
     }
@@ -480,6 +496,8 @@ public static class ShadowPredictionEvaluation
         var cutoff = input.InputCutoffUtc == default
             ? DateTimeOffset.UtcNow
             : input.InputCutoffUtc.ToUniversalTime();
+        string modelIdentity = ModelAlgorithmIdentity;
+        string configurationIdentity = ComputeConfigurationIdentity(settings);
         var warnings = input.Warnings?.Where(x => !string.IsNullOrWhiteSpace(x)).ToList()
             ?? new List<string>();
         if (input.Truncated)
@@ -503,7 +521,7 @@ public static class ShadowPredictionEvaluation
             return EmptyReport(input.Truncated ? ShadowEvaluationState.TRUNCATED_INPUT :
                 ShadowEvaluationState.INSUFFICIENT_DATA, cutoff, fingerprint,
                 settings, allPartitions, warnings, "No compatible cohort contains qualified completed UTC days.",
-                BuildInventory(input));
+                BuildInventory(input), modelIdentity, configurationIdentity);
 
         var trainingDays = selected.SupportedDays.Take(settings.MinimumTrainingDays).ToList();
         var calibrationDays = selected.SupportedDays.Skip(settings.MinimumTrainingDays)
@@ -517,7 +535,7 @@ public static class ShadowPredictionEvaluation
         var trainingRows = trainingDays.SelectMany(x => x.Rows).OrderBy(x => x.TimestampUtc).ToList();
         var calibrationRows = calibrationDays.SelectMany(x => x.Rows).OrderBy(x => x.TimestampUtc).ToList();
         var testRows = testDays.SelectMany(x => x.Rows).OrderBy(x => x.TimestampUtc).ToList();
-        var identity = BuildIdentity(settings, selected.CohortKey);
+        var identity = BuildIdentity(settings, selected.CohortKey, configurationIdentity);
         var cappedTrainingRows = CapDeterministically(trainingRows, settings.MaximumTrainingSamples);
         var candidates = BuildCandidates(cappedTrainingRows, calibrationRows, testRows,
             identity, settings);
@@ -582,8 +600,11 @@ public static class ShadowPredictionEvaluation
             testDays.Count, trainingRows.Count, calibrationRows.Count, testRows.Count,
             fairCount, trainingDays.Select(x => x.DayKey).ToList(),
             calibrationDays.Select(x => x.DayKey).ToList(), testDays.Select(x => x.DayKey).ToList());
-        var advisory = BuildAdvisory(winner, candidates, testRows, calibrationRows,
-            settings, identity);
+        var advisory = BuildAdvisory(candidates, testRows, calibrationRows,
+            settings, identity, selected.CohortKey,
+            trainingDays.Select(x => x.DayKey).ToList(),
+            calibrationDays.Select(x => x.DayKey).ToList(), configurationIdentity,
+            fingerprint);
         var pcie = settings.IncludePcieCandidate
             ? BuildPcieCandidate(trainingRows, calibrationRows, testRows, settings)
             : null;
@@ -592,7 +613,7 @@ public static class ShadowPredictionEvaluation
             : $"{winner} has the lowest fair heldout prediction error for this frozen chronological split. This describes prediction accuracy only and is not proof of connector health or failure.";
 
         return new ShadowEvaluationReport(state, winner, conclusion, cutoff, fingerprint,
-            settings.ModelIdentity, settings.ConfigurationIdentity, coverage, allPartitions,
+            modelIdentity, configurationIdentity, coverage, allPartitions,
             modelReports, advisory, pcie, warnings, BuildInventory(input),
             comparatorCandidates.Select(x => x.Definition.Name).ToList());
     }
@@ -600,7 +621,8 @@ public static class ShadowPredictionEvaluation
     static ShadowEvaluationReport EmptyReport(ShadowEvaluationState state,
         DateTimeOffset cutoff, string fingerprint, ShadowEvaluationOptions settings,
         IReadOnlyList<ShadowDayPartition> partitions, IReadOnlyList<string> warnings,
-        string detail, ShadowInputInventory inventory)
+        string detail, ShadowInputInventory inventory, string modelIdentity,
+        string configurationIdentity)
     {
         var coverage = new ShadowCoverage("none", 0, 0, 0, 0, 0, 0, 0, 0, 0,
             Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>());
@@ -610,7 +632,7 @@ public static class ShadowPredictionEvaluation
         var allWarnings = warnings.Concat(new[] { detail }).ToList();
         return new ShadowEvaluationReport(state, null,
             "Prediction accuracy comparison is inconclusive because the frozen chronological split is unavailable; it is not evidence of connector health or failure.",
-            cutoff, fingerprint, settings.ModelIdentity, settings.ConfigurationIdentity,
+            cutoff, fingerprint, modelIdentity, configurationIdentity,
             coverage, partitions, Array.Empty<ShadowModelEvaluation>(), advisory, null,
             allWarnings, inventory);
     }
@@ -773,6 +795,8 @@ public static class ShadowPredictionEvaluation
         var result = new List<CandidateRun>(definitions.Length);
         var powerProvenance = AssessPowerProvenance(trainingRows.Concat(calibrationRows)
             .Concat(testRows));
+        var advisoryPowerProvenance = AssessPowerProvenance(
+            trainingRows.Concat(calibrationRows));
         foreach (var definition in definitions)
         {
             var options = new DifferentialModelOptions
@@ -805,12 +829,14 @@ public static class ShadowPredictionEvaluation
             {
                 run.TargetCoupledPredictor = powerProvenance.HasDerived;
                 run.EligibleForRanking = powerProvenance.Eligible;
+                run.EligibleForAdvisory = advisoryPowerProvenance.Eligible;
                 run.PowerProvenance = powerProvenance.Label;
                 run.EligibilityDetail = powerProvenance.Detail;
             }
             else
             {
                 run.EligibleForRanking = true;
+                run.EligibleForAdvisory = true;
                 run.EligibilityDetail = "Connector current is an independent observed load proxy.";
             }
             foreach (var prepared in calibrationRows)
@@ -877,13 +903,49 @@ public static class ShadowPredictionEvaluation
         return "UNKNOWN";
     }
 
+    static string ComputeConfigurationIdentity(ShadowEvaluationOptions settings)
+    {
+        static string Number(double value) => value.ToString("R", CultureInfo.InvariantCulture);
+        string[] canonicalSettings =
+        [
+            $"ModelAlgorithmIdentity={ModelAlgorithmIdentity}",
+            $"ModelIdentityLabel={settings.ModelIdentity}",
+            $"ConfigurationIdentityLabel={settings.ConfigurationIdentity}",
+            $"MinimumTrainingDays={settings.MinimumTrainingDays.ToString(CultureInfo.InvariantCulture)}",
+            $"MinimumCalibrationDays={settings.MinimumCalibrationDays.ToString(CultureInfo.InvariantCulture)}",
+            $"MinimumTestDays={settings.MinimumTestDays.ToString(CultureInfo.InvariantCulture)}",
+            $"MinimumMinutesPerSupportedDay={settings.MinimumMinutesPerSupportedDay.ToString(CultureInfo.InvariantCulture)}",
+            $"MinimumPowerSpanW={Number(settings.MinimumPowerSpanW)}",
+            $"MinimumCurrentSpanA={Number(settings.MinimumCurrentSpanA)}",
+            $"MinimumEvaluationRows={settings.MinimumEvaluationRows.ToString(CultureInfo.InvariantCulture)}",
+            $"MinimumObservationsPerMinute={settings.MinimumObservationsPerMinute.ToString(CultureInfo.InvariantCulture)}",
+            $"MaximumTrainingSamples={settings.MaximumTrainingSamples.ToString(CultureInfo.InvariantCulture)}",
+            $"MinimumPracticalVoltageV={Number(settings.MinimumPracticalVoltageV)}",
+            $"MinimumSourceVoltageV={Number(settings.MinimumSourceVoltageV)}",
+            $"MaximumSourceVoltageV={Number(settings.MaximumSourceVoltageV)}",
+            $"MinimumAdvisoryDropV={Number(settings.MinimumAdvisoryDropV)}",
+            $"AdvisoryNoiseMultiplier={Number(settings.AdvisoryNoiseMultiplier)}",
+            $"EwmaHalfLifeMinutes={Number(settings.EwmaHalfLifeMinutes)}",
+            $"SustainedPersistenceSeconds={Number(settings.SustainedPersistenceSeconds)}",
+            $"GapResetMinutes={Number(settings.GapResetMinutes)}",
+            $"GradualRampFinalDropV={Number(settings.GradualRampFinalDropV)}",
+            $"IncludePcieCandidate={settings.IncludePcieCandidate.ToString(CultureInfo.InvariantCulture)}",
+            $"ScenarioOnsetOffsetSeconds={ScenarioOnsetOffsetSeconds.ToString(CultureInfo.InvariantCulture)}",
+            $"ScenarioWindowDurationSeconds={ScenarioWindowDurationSeconds.ToString(CultureInfo.InvariantCulture)}",
+            $"ScenarioRampDurationSeconds={ScenarioRampDurationSeconds.ToString(CultureInfo.InvariantCulture)}",
+        ];
+        string canonical = JsonSerializer.Serialize(canonicalSettings);
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical)))
+            .ToLowerInvariant();
+    }
+
     static DifferentialModelIdentity BuildIdentity(ShadowEvaluationOptions settings,
-        string cohort) => new(
+        string cohort, string configurationIdentity) => new(
         gpuUuid: settings.ModelIdentity,
         board: cohort,
         driver: "shadow-offline",
         voltageSource: "shadow-connector-voltage",
-        configurationId: settings.ConfigurationIdentity);
+        configurationId: configurationIdentity);
 
     static DifferentialSample ToSample(PreparedRow row, DifferentialLoadProxy proxy,
         string identity) => ToSample(row.Row, row.TimestampUtc, proxy, identity);
@@ -992,18 +1054,23 @@ public static class ShadowPredictionEvaluation
         return new ShadowErrorMetrics(errors.Count, mae, rmse, bias, tail, perBand);
     }
 
-    static ShadowAdvisoryEvaluation BuildAdvisory(string? winner,
+    static ShadowAdvisoryEvaluation BuildAdvisory(
         IReadOnlyList<CandidateRun> candidates,
         IReadOnlyList<PreparedRow> testRows,
         IReadOnlyList<PreparedRow> calibrationRows,
         ShadowEvaluationOptions settings,
-        DifferentialModelIdentity identity)
+        DifferentialModelIdentity identity,
+        string cohortKey,
+        IReadOnlyList<string> trainingDayKeys,
+        IReadOnlyList<string> calibrationDayKeys,
+        string configurationIdentity,
+        string frozenCutoffFingerprint)
     {
-        var chosen = candidates.Where(x => x.EligibleForRanking && x.Fit.IsUsable &&
-                x.TestPredictions.Count > 0)
+        var chosen = candidates.Where(x => x.EligibleForAdvisory && x.Fit.IsUsable &&
+                x.CalibrationPredictions.Count >= 2)
             .OrderBy(x => x.Definition.Proxy == DifferentialLoadProxy.CONNECTOR_CURRENT ? 0 : 1)
             .ThenBy(x => x.Definition.IncludeBoardPower && x.Definition.IncludeTemperature ? 0 : 1)
-            .ThenBy(x => string.Equals(x.Definition.Name, winner, StringComparison.Ordinal) ? 0 : 1)
+            .ThenBy(x => x.Definition.Name, StringComparer.Ordinal)
             .FirstOrDefault();
         if (chosen is null || !chosen.Fit.IsUsable)
             return new ShadowAdvisoryEvaluation(false, "none", null, 0, 0, null, 0, null,
@@ -1029,55 +1096,54 @@ public static class ShadowPredictionEvaluation
         double noise = Math.Max(.005,
             1.4826 * Median(calibrationErrors.Select(x => Math.Abs(x - calibrationMedian))
                 .OrderBy(x => x).ToArray()));
-        var availableIndices = testRows.Select((row, index) =>
-            chosen.TestPredictions.ContainsKey(row.TimestampUtc.UtcTicks) ? index : -1)
-            .Where(index => index >= 0).ToList();
-        int onsetIndex = availableIndices.Count >= 2
-            ? availableIndices[availableIndices.Count / 2]
-            : testRows.Count / 2;
         var native = ReplayAdvisory(chosen, testRows, settings, identity, noise,
-            injectedDrop: null, ramp: false, onsetIndex: onsetIndex);
+            injectedDrop: null, rampDuration: null, onsetTimestamp: null);
         var synthetic = new List<ShadowSyntheticFaultEvaluation>();
+        if (testRows.Count == 0)
+        {
+            return new ShadowAdvisoryEvaluation(true, chosen.Definition.Name, noise,
+                calibrationErrors.Count, native.AvailablePredictions, native.ObservedHours,
+                native.Transitions, native.TransitionsPerObservedHour, "UNKNOWN", false,
+                native.TransitionList, synthetic,
+                "Experimental early advisory replay; live alert thresholds and persistence are unchanged.")
+                with { CalibrationMedianBiasV = calibrationMedian };
+        }
+
+        DateTimeOffset windowStart = testRows[0].TimestampUtc;
+        DateTimeOffset onset = windowStart.AddSeconds(ScenarioOnsetOffsetSeconds);
+        DateTimeOffset windowEnd = windowStart.AddSeconds(ScenarioWindowDurationSeconds);
+        var windowRows = testRows.Where(x => x.TimestampUtc >= windowStart &&
+            x.TimestampUtc < windowEnd).ToList();
+        DateTimeOffset? completionEvidence = testRows
+            .Where(x => x.TimestampUtc >= windowEnd)
+            .Select(x => (DateTimeOffset?)x.TimestampUtc)
+            .FirstOrDefault();
+        var baselineWindow = ReplayAdvisory(chosen, windowRows, settings, identity, noise,
+            injectedDrop: null, rampDuration: null, onsetTimestamp: onset);
+        bool windowAvailable = completionEvidence is not null &&
+            baselineWindow.AvailablePostOnsetPredictions > 0;
+        string noPostOnsetEvidence = baselineWindow.PowerProvenanceRejectedPostOnsetRows > 0
+            ? "Connector-power provenance is unknown or derived after onset; replay reset continuity and counted no post-onset evidence."
+            : "No baseline post-onset predictions pass model availability and the practical-voltage floor.";
+        string unavailableDetail = string.Join(" ", new[]
+        {
+            completionEvidence is null
+                ? "Heldout observations do not reach the exclusive six-hour window end."
+                : null,
+            baselineWindow.AvailablePostOnsetPredictions == 0
+                ? noPostOnsetEvidence
+                : null,
+        }.Where(x => x is not null));
+
         foreach (double drop in new[] { .02, .05, .1, .2 })
         {
-            var result = ReplayAdvisory(chosen, testRows, settings, identity, noise,
-                injectedDrop: drop, ramp: false, onsetIndex: onsetIndex);
-            var onset = OnsetTimestamp(testRows, onsetIndex);
-            var attribution = FindAttributableTransitions(native.TransitionList,
-                result.TransitionList, onset);
-            var syntheticResult = new ShadowSyntheticFaultEvaluation(
-                $"STEP_{(int)Math.Round(drop * 1000, MidpointRounding.AwayFromZero)}MV", drop,
-                result.RowsEvaluated, result.AvailablePredictions, result.Transitions,
-                result.TransitionsPerObservedHour,
-                attribution.Count > 0 && result.AvailablePredictions > 0,
-                "Connector voltage was changed only after the heldout onset; calibration and training were untouched.")
-                with
-                {
-                    OnsetTimestampUtc = onset,
-                    FirstAdvisoryTimestampUtc = attribution.FirstAdvisoryUtc,
-                    DetectionLatencySeconds = DetectionLatency(attribution.FirstAdvisoryUtc, onset),
-                    AttributableTransitions = attribution.Count,
-                };
-            synthetic.Add(syntheticResult);
+            synthetic.Add(BuildSyntheticScenario($"STEP_{(int)Math.Round(drop * 1000, MidpointRounding.AwayFromZero)}MV",
+                drop, rampDuration: null));
         }
-        var ramp = ReplayAdvisory(chosen, testRows, settings, identity, noise,
-            injectedDrop: settings.GradualRampFinalDropV, ramp: true, onsetIndex: onsetIndex);
-        var rampAttribution = FindAttributableTransitions(native.TransitionList,
-            ramp.TransitionList, OnsetTimestamp(testRows, onsetIndex));
-        var rampResult = new ShadowSyntheticFaultEvaluation("GRADUAL_RAMP",
-            settings.GradualRampFinalDropV, ramp.RowsEvaluated, ramp.AvailablePredictions,
-            ramp.Transitions, ramp.TransitionsPerObservedHour,
-            rampAttribution.Count > 0 && ramp.AvailablePredictions > 0,
-            "A gradual connector-only voltage drop was evaluated after the heldout onset.")
-            with
-            {
-                OnsetTimestampUtc = OnsetTimestamp(testRows, onsetIndex),
-                FirstAdvisoryTimestampUtc = rampAttribution.FirstAdvisoryUtc,
-                DetectionLatencySeconds = DetectionLatency(rampAttribution.FirstAdvisoryUtc,
-                    OnsetTimestamp(testRows, onsetIndex)),
-                AttributableTransitions = rampAttribution.Count,
-            };
-        synthetic.Add(rampResult);
+        synthetic.Add(BuildSyntheticScenario("GRADUAL_RAMP",
+            settings.GradualRampFinalDropV,
+            TimeSpan.FromSeconds(ScenarioRampDurationSeconds)));
+
         return new ShadowAdvisoryEvaluation(true, chosen.Definition.Name, noise,
             calibrationErrors.Count, native.AvailablePredictions, native.ObservedHours,
             native.Transitions, native.TransitionsPerObservedHour, "UNKNOWN", false,
@@ -1089,14 +1155,120 @@ public static class ShadowPredictionEvaluation
                 GapResets = native.GapResets,
                 CalibrationMedianBiasV = calibrationMedian,
             };
+
+        ShadowSyntheticFaultEvaluation BuildSyntheticScenario(string label, double drop,
+            TimeSpan? rampDuration)
+        {
+            string scenarioIdentity = ComputeScenarioIdentity(cohortKey,
+                configurationIdentity, frozenCutoffFingerprint,
+                trainingDayKeys, calibrationDayKeys,
+                chosen.Definition.Name, label, drop, windowStart, onset, windowEnd,
+                rampDuration, completionEvidence is not null, windowRows);
+            if (!windowAvailable)
+            {
+                return new ShadowSyntheticFaultEvaluation(label, drop, windowRows.Count,
+                    baselineWindow.AvailablePredictions, 0, null, false, unavailableDetail)
+                {
+                    OnsetTimestampUtc = onset,
+                    ScenarioIdentity = scenarioIdentity,
+                    ScenarioState = "UNAVAILABLE",
+                    WindowStartTimestampUtc = windowStart,
+                    WindowEndTimestampUtc = windowEnd,
+                    RampDurationSeconds = rampDuration?.TotalSeconds,
+                };
+            }
+
+            var replay = ReplayAdvisory(chosen, windowRows, settings, identity, noise,
+                injectedDrop: drop, rampDuration: rampDuration, onsetTimestamp: onset);
+            if (replay.AvailablePostOnsetPredictions == 0)
+            {
+                string noInjectedEvidence = replay.PowerProvenanceRejectedPostOnsetRows > 0
+                    ? "Connector-power provenance is unknown or derived after onset; replay reset continuity and counted no post-onset evidence."
+                    : "No injected post-onset predictions pass model availability and the practical-voltage floor.";
+                return new ShadowSyntheticFaultEvaluation(label, drop,
+                    replay.RowsEvaluated, replay.AvailablePredictions, 0, null, false,
+                    noInjectedEvidence)
+                {
+                    OnsetTimestampUtc = onset,
+                    ScenarioIdentity = scenarioIdentity,
+                    ScenarioState = "UNAVAILABLE",
+                    WindowStartTimestampUtc = windowStart,
+                    WindowEndTimestampUtc = windowEnd,
+                    RampDurationSeconds = rampDuration?.TotalSeconds,
+                };
+            }
+            var attribution = FindAttributableTransitions(baselineWindow.TransitionList,
+                replay.TransitionList, onset);
+            return new ShadowSyntheticFaultEvaluation(label, drop, replay.RowsEvaluated,
+                replay.AvailablePredictions, replay.Transitions,
+                replay.TransitionsPerObservedHour,
+                attribution.Count > 0 && replay.AvailablePostOnsetPredictions > 0,
+                rampDuration is null
+                    ? "Fixed-window connector step began at the fixed onset; training and calibration were untouched."
+                    : "Connector drop increased by elapsed wall-clock time and reached the configured final drop after exactly 30 minutes; it then held. Gaps did not change the ramp trajectory.")
+            {
+                OnsetTimestampUtc = onset,
+                FirstAdvisoryTimestampUtc = attribution.FirstAdvisoryUtc,
+                DetectionLatencySeconds = DetectionLatency(attribution.FirstAdvisoryUtc, onset),
+                AttributableTransitions = attribution.Count,
+                ScenarioIdentity = scenarioIdentity,
+                ScenarioState = "AVAILABLE",
+                WindowStartTimestampUtc = windowStart,
+                WindowEndTimestampUtc = windowEnd,
+                RampDurationSeconds = rampDuration?.TotalSeconds,
+            };
+        }
     }
 
     sealed record AdvisoryReplay(int RowsEvaluated, int AvailablePredictions,
         int Transitions, double? ObservedHours, double? TransitionsPerObservedHour,
         IReadOnlyList<ShadowAdvisoryTransition> TransitionList,
         int RowsBelowPracticalVoltageFloor, int GapResets,
-        DateTimeOffset? FirstAdvisoryUtc, DateTimeOffset? FirstAdvisoryAfterOnsetUtc,
-        int TransitionsAfterOnset);
+        int AvailablePostOnsetPredictions,
+        int PowerProvenanceRejectedPostOnsetRows);
+
+    static string ComputeScenarioIdentity(string cohortKey,
+        string configurationIdentity, string frozenCutoffFingerprint,
+        IReadOnlyList<string> trainingDayKeys,
+        IReadOnlyList<string> calibrationDayKeys, string advisoryModel, string label,
+        double finalDropV, DateTimeOffset windowStart, DateTimeOffset onset,
+        DateTimeOffset windowEnd, TimeSpan? rampDuration,
+        bool windowComplete, IReadOnlyList<PreparedRow> windowRows)
+    {
+        var payload = new
+        {
+            ModelIdentity = ModelAlgorithmIdentity,
+            ConfigurationIdentity = configurationIdentity,
+            FrozenCutoffFingerprint = frozenCutoffFingerprint,
+            CohortKey = cohortKey,
+            TrainingDayKeys = trainingDayKeys,
+            CalibrationDayKeys = calibrationDayKeys,
+            AdvisoryModel = advisoryModel,
+            Label = label,
+            FinalDropV = finalDropV,
+            WindowStartUtc = windowStart.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture),
+            OnsetUtc = onset.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture),
+            WindowEndUtcExclusive = windowEnd.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture),
+            RampDurationSeconds = rampDuration?.TotalSeconds,
+            WindowComplete = windowComplete,
+            SourceObservations = windowRows.Select(x => new
+            {
+                TimestampUtc = x.TimestampUtc.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture),
+                x.CohortKey,
+                x.DayKey,
+                x.Row.VoltageV,
+                x.Row.ConnectorCurrentA,
+                x.Row.ConnectorPowerW,
+                x.Row.BoardPowerW,
+                x.Row.TemperatureC,
+                x.Row.PcieVoltageV,
+                x.Row.PowerProvenance,
+            }).ToArray(),
+        };
+        string canonical = JsonSerializer.Serialize(payload);
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical)))
+            .ToLowerInvariant();
+    }
 
     sealed record TransitionAttribution(int Count, DateTimeOffset? FirstAdvisoryUtc);
 
@@ -1133,8 +1305,8 @@ public static class ShadowPredictionEvaluation
 
     static AdvisoryReplay ReplayAdvisory(CandidateRun candidate,
         IReadOnlyList<PreparedRow> rows, ShadowEvaluationOptions settings,
-        DifferentialModelIdentity identity, double noise, double? injectedDrop, bool ramp,
-        int? onsetIndex)
+        DifferentialModelIdentity identity, double noise, double? injectedDrop,
+        TimeSpan? rampDuration, DateTimeOffset? onsetTimestamp)
     {
         string state = "UNKNOWN";
         double ewma = 0;
@@ -1142,21 +1314,38 @@ public static class ShadowPredictionEvaluation
         DateTimeOffset? previous = null;
         double observedSeconds = 0;
         int observedRows = 0;
+        int availablePostOnsetRows = 0;
+        int powerProvenanceRejectedPostOnsetRows = 0;
         int belowVoltageFloor = 0;
         int gapResets = 0;
         var transitions = new List<ShadowAdvisoryTransition>();
-        DateTimeOffset? firstAdvisory = null;
-        DateTimeOffset? firstAdvisoryAfterOnset = null;
-        int transitionsAfterOnset = 0;
-        DateTimeOffset? onsetTimestamp = OnsetTimestamp(rows, onsetIndex);
         for (int index = 0; index < rows.Count; index++)
         {
             var prepared = rows[index];
-            bool afterOnset = onsetIndex is int onset && index >= onset;
-            double drop = !afterOnset ? 0 : ramp && rows.Count > 1
-                ? (injectedDrop ?? 0) * (index - onsetIndex!.Value) /
-                    Math.Max(1, rows.Count - 1 - onsetIndex.Value)
-                : injectedDrop ?? 0;
+            if (candidate.Definition.Proxy == DifferentialLoadProxy.CONNECTOR_POWER &&
+                ClassifyPowerProvenance(prepared.Row.PowerProvenance) != "INDEPENDENT")
+            {
+                if (onsetTimestamp is DateTimeOffset rejectedOnset &&
+                    prepared.TimestampUtc >= rejectedOnset)
+                    powerProvenanceRejectedPostOnsetRows++;
+                ewma = 0;
+                candidateSince = null;
+                previous = null;
+                if (state != "UNKNOWN")
+                {
+                    state = "UNKNOWN";
+                    transitions.Add(new ShadowAdvisoryTransition(prepared.TimestampUtc,
+                        state, null, "connector-power provenance is unknown or derived; replay continuity reset"));
+                }
+                continue;
+            }
+            double drop = 0;
+            if (injectedDrop is double finalDrop && onsetTimestamp is DateTimeOffset onset &&
+                prepared.TimestampUtc >= onset)
+            {
+                drop = CalculateSyntheticDropV(finalDrop, prepared.TimestampUtc,
+                    onset, rampDuration);
+            }
             var sampleRow = drop > 0 ? Inject(prepared.Row, drop) : prepared.Row;
             var prediction = candidate.Fit.Artifact.Predict(ToSample(sampleRow,
                 prepared.TimestampUtc, candidate.Definition.Proxy, identity.CanonicalKey));
@@ -1195,6 +1384,9 @@ public static class ShadowPredictionEvaluation
                 continue;
             }
             observedRows++;
+            if (onsetTimestamp is DateTimeOffset onsetMoment &&
+                prepared.TimestampUtc >= onsetMoment)
+                availablePostOnsetRows++;
             double negativeResidual = Math.Max(0, -residual);
             double alpha = dt <= 0 ? 1 : 1 - Math.Exp(-Math.Log(2) * dt /
                 (settings.EwmaHalfLifeMinutes * 60));
@@ -1212,15 +1404,6 @@ public static class ShadowPredictionEvaluation
             if (!string.Equals(next, state, StringComparison.Ordinal))
             {
                 state = next;
-                if (state == "ADVISORY")
-                {
-                    firstAdvisory ??= prepared.TimestampUtc;
-                    if (onsetTimestamp is DateTimeOffset onsetMoment && prepared.TimestampUtc >= onsetMoment)
-                    {
-                        firstAdvisoryAfterOnset ??= prepared.TimestampUtc;
-                        transitionsAfterOnset++;
-                    }
-                }
                 transitions.Add(new ShadowAdvisoryTransition(prepared.TimestampUtc,
                     state, ewma, next == "ADVISORY" ? "sustained residual drop" : "drop below advisory persistence"));
             }
@@ -1229,13 +1412,19 @@ public static class ShadowPredictionEvaluation
         int advisoryTransitions = transitions.Count(x => x.State == "ADVISORY");
         double? perHour = hours is double h && h > 0 ? advisoryTransitions / h : null;
         return new AdvisoryReplay(rows.Count, observedRows, advisoryTransitions, hours, perHour,
-            transitions, belowVoltageFloor, gapResets, firstAdvisory,
-            firstAdvisoryAfterOnset, transitionsAfterOnset);
+            transitions, belowVoltageFloor, gapResets, availablePostOnsetRows,
+            powerProvenanceRejectedPostOnsetRows);
     }
 
-    static DateTimeOffset? OnsetTimestamp(IReadOnlyList<PreparedRow> rows, int? onsetIndex) =>
-        onsetIndex is int index && index >= 0 && index < rows.Count
-            ? rows[index].TimestampUtc : null;
+    internal static double CalculateSyntheticDropV(double finalDropV,
+        DateTimeOffset timestampUtc, DateTimeOffset onsetUtc, TimeSpan? rampDuration)
+    {
+        if (timestampUtc < onsetUtc) return 0;
+        if (rampDuration is not TimeSpan duration || duration <= TimeSpan.Zero)
+            return finalDropV;
+        double elapsedSeconds = (timestampUtc - onsetUtc).TotalSeconds;
+        return finalDropV * Math.Clamp(elapsedSeconds / duration.TotalSeconds, 0, 1);
+    }
 
     static double? DetectionLatency(DateTimeOffset? firstAdvisory,
         DateTimeOffset? onset) => firstAdvisory is DateTimeOffset first &&

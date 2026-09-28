@@ -1011,11 +1011,13 @@ public static class Program
             if (args.Contains("--self-test")) { Tests.Run(); return 0; }
             if (args.Contains("--approval-self-test")) { DriverApprovalTests.Run(); MaintainerValidationTests.Run(); ReleaseTrustPreparationTests.Run(); return 0; }
             if (args.Contains("--deployment-self-test")) { DeploymentTests.Run(); AppUpdateTests.Run(); return 0; }
+            if (args.Contains("--shadow-review-self-test")) { ShadowReviewSchedulerTests.Run(); return 0; }
             if (args.Contains("--prediction-self-test"))
             {
                 ShadowTelemetryReaderTests.Run();
                 ShadowPredictionEvaluationTests.Run();
                 ShadowPredictionCommandTests.Run();
+                ShadowReviewSchedulerTests.Run();
                 return 0;
             }
             if (ShadowPredictionCommand.TryHandle(args, out var predictionExit)) return predictionExit;
@@ -1063,6 +1065,9 @@ public static class Program
                 ? new TelemetryCompressionMaintenance(data, LogRecoverableFailure)
                 : null;
             telemetryCompression?.Start(stop.Token);
+            using var shadowReviews = new ShadowReviewScheduler(data,
+                (message, error) => LogRecoverableFailure(new InvalidOperationException(message, error)));
+            shadowReviews.Start(stop.Token);
             try { c.GpuUuid = Nvml.ResolveUuid(c.GpuUuid); }
             catch (Exception ex)
             {

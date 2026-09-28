@@ -13,6 +13,7 @@ public static class GuiTests
         ElectricalTrendTests.Run(Check);
         DegradationConfidenceTests.Run(Check);
         ConfidenceHistoryTests.Run(Check);
+        ShadowReviewTests.Run(Check);
         var referencePending = MainWindow.ConfidenceWaitingDisplay(
             new[] { new ConfidenceDay { Cohort = "GPU-A|bin=425W", Reason = "REFERENCE_UNAVAILABLE" } },
             "", "REFERENCE_UNVERIFIED");

@@ -124,10 +124,16 @@ public sealed class App : Application
     {
         try
         {
-            bool demo = args.Contains("--demo");
-            string configPath = DeploymentPaths.ResolveConfigPath(Option(args, "--config"));
+            bool shadowReviewRender = args.Contains("--render-shadow-review");
+            bool render = args.Contains("--render") || shadowReviewRender;
+            bool demo = args.Contains("--demo") || render;
+            string configPath = shadowReviewRender
+                ? Path.Combine(Path.GetTempPath(), "ConnectorWatch-shadow-review-preview-config.json")
+                : DeploymentPaths.ResolveConfigPath(Option(args, "--config"));
             var config = demo ? new GuiConfig { GpuUuid = "Demonstration · synthetic readings" } : JsonSerializer.Deserialize<GuiConfig>(TelemetryStore.ReadShared(configPath)) ?? throw new InvalidDataException("Invalid configuration");
-            string data = demo ? Path.Combine(Path.GetTempPath(), "ConnectorWatch-demo") : Path.GetFullPath(config.DataDirectory, Path.GetDirectoryName(configPath)!);
+            string data = shadowReviewRender
+                ? Path.Combine(Path.GetTempPath(), "ConnectorWatch-shadow-review-preview-data")
+                : demo ? Path.Combine(Path.GetTempPath(), "ConnectorWatch-demo") : Path.GetFullPath(config.DataDirectory, Path.GetDirectoryName(configPath)!);
             GuiLog.Current.Write("configuration_loaded", new { configPath, data, config.MaxAgeSeconds, config.SampleSeconds, demo });
             string endpoint = ControlEndpoint.Name(data) + "-gui";
             string settings = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ConnectorWatch", endpoint + ".json");
@@ -137,7 +143,8 @@ public sealed class App : Application
                 try { using var client = new NamedPipeClientStream(".", endpoint, PipeDirection.Out, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly); using var t = new CancellationTokenSource(1500); await client.ConnectAsync(t.Token); await client.WriteAsync(new byte[] { 1 }, t.Token); } catch (Exception ex) when (ex is IOException or OperationCanceledException) { }
                 Shutdown(); return;
             }
-            var window = new MainWindow(configPath, config, data, settings, demo, args.Contains("--no-start"), args.Contains("--render"));
+            var window = new MainWindow(configPath, config, data, settings, demo,
+                args.Contains("--no-start") || shadowReviewRender, render, shadowReviewRender);
             MainWindow = window;
             window.QuietTest = args.Contains("--integration-ui-test") || args.Contains("--ui-self-test") || args.Contains("--ui-memory-test");
             SessionEnding += (_, _) => window.SessionEnding();
@@ -165,13 +172,25 @@ public sealed class App : Application
                 await window.ExitGui(); return;
             }
             if (args.Contains("--tray")) window.Hide();
-            if (args.Contains("--render"))
+            if (render)
             {
+                string? renderPath = shadowReviewRender
+                    ? Option(args, "--render-shadow-review")
+                    : Option(args, "--render");
+                if (string.IsNullOrWhiteSpace(renderPath) || renderPath.StartsWith("--", StringComparison.Ordinal))
+                    renderPath = Option(args, "--render");
+                if (string.IsNullOrWhiteSpace(renderPath) || renderPath.StartsWith("--", StringComparison.Ordinal))
+                    throw new InvalidOperationException("A PNG output path is required after --render-shadow-review (or --render).");
+
                 await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
                 window.UpdateLayout();
-                var visual = args.Contains("--render-confidence") ? window.ConfidencePreview! : args.Contains("--render-electrical") ? window.ElectricalTrendPreview! : args.Contains("--render-reference") ? window.ReferencePreview! : (FrameworkElement)window.Content;
+                var visual = shadowReviewRender ? window.ShadowReviewPreview!
+                    : args.Contains("--render-confidence") ? window.ConfidencePreview!
+                    : args.Contains("--render-electrical") ? window.ElectricalTrendPreview!
+                    : args.Contains("--render-reference") ? window.ReferencePreview!
+                    : (FrameworkElement)window.Content;
                 var bmp = new RenderTargetBitmap((int)visual.ActualWidth, (int)visual.ActualHeight, 96, 96, PixelFormats.Pbgra32);
-                if (args.Contains("--render-electrical") || args.Contains("--render-confidence") || args.Contains("--render-reference"))
+                if (shadowReviewRender || args.Contains("--render-electrical") || args.Contains("--render-confidence") || args.Contains("--render-reference"))
                 {
                     var drawing = new DrawingVisual();
                     using (var dc = drawing.RenderOpen()) dc.DrawRectangle(new VisualBrush(visual), null, new Rect(0, 0, visual.ActualWidth, visual.ActualHeight));
@@ -179,7 +198,7 @@ public sealed class App : Application
                 }
                 else bmp.Render(visual);
                 var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bmp));
-                using (var f = File.Create(Option(args, "--render")!)) encoder.Save(f);
+                using (var f = File.Create(renderPath)) encoder.Save(f);
                 await window.ExitGui();
             }
         }
@@ -187,7 +206,7 @@ public sealed class App : Application
         {
             GuiLog.Current.Write("startup_error", exception: ex);
             if (Option(args, "--test-output") is string report) File.WriteAllText(report, ex.ToString());
-            else if (Option(args, "--render") is string preview) File.WriteAllText(preview + ".error.txt", ex.ToString());
+            else if ((Option(args, "--render-shadow-review") ?? Option(args, "--render")) is string preview) File.WriteAllText(preview + ".error.txt", ex.ToString());
             else MessageBox.Show(ex.Message, "ConnectorWatch startup", MessageBoxButton.OK, MessageBoxImage.Error);
             Shutdown(1);
         }

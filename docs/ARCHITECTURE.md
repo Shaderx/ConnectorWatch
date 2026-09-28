@@ -17,6 +17,11 @@ flowchart LR
     A --> P[(data/ telemetry, status, models, incidents)]
     I --> P
     D --> Q[Current-user control pipe]
+    D --> S[Weekly review scheduler]
+    S --> E[Isolated offline evaluator]
+    P --> E
+    E --> U[(Local shadow reports and summaries)]
+    U --> G
     P --> G[ConnectorWatch.Gui WPF dashboard]
     Q --> G
     G --> T[Tray, charts, warnings, settings]
@@ -75,6 +80,19 @@ The GUI's five-second heartbeat lease controls who presents desktop warnings. If
 History loading is bounded. The GUI considers at most the newest two daily files, caps the initial tail per file, caps retained voltage observations and warning records, rejects oversized records, and reads with pooled chunks. It preserves gaps and reports truncation in the UI. Identifier sets use FIFO bounds, chart brushes are reused and frozen, and warning controls are rebuilt only when their contents change. These limits bound application-owned collections; they do not promise that Windows, WPF, or a future driver has no unrelated cache growth.
 
 ## Analysis and persistence contract
+
+`ShadowReviewScheduler` owns background prediction reviews, retry scheduling,
+child-process cancellation, and atomic summary publication. Its evaluator child
+reads completed telemetry files through the offline command, which dispatches
+before native initialization. Review state and immutable reports live outside
+the telemetry directory. A separate lock guards one scheduler for each normalized
+data path. The sampling loop does not wait for evaluation.
+
+`ShadowReviewContracts` is the shared file contract. The GUI reads a bounded
+snapshot at most every 30 seconds and displays recent summaries. It does not
+link the evaluator or use these results to change an accepted reference or live
+alert. See [prediction reviews](PREDICTION-REVIEW.md) for scheduling, storage, and
+simulation comparability.
 
 The main files are:
 

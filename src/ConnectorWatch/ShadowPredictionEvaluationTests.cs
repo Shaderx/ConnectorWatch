@@ -22,6 +22,13 @@ public static class ShadowPredictionEvaluationTests
         DayPartitionsExposeCoverageRanges();
         MissingRowsAndGapsResetTheExperimentalAdvisory();
         SyntheticGradualDropIsEvaluatedAndPowerIsRecalculated();
+        SyntheticRampUsesWallClockTimeAcrossGaps();
+        SyntheticScenariosRemainFixedAsArchiveGrows();
+        NativeAdvisoryIncludesRowsOutsideSyntheticWindow();
+        IncompleteSyntheticWindowsRemainUnavailable();
+        ScenarioIdentitiesIncludeSettingsAndFrozenAnchors();
+        PowerAdvisoryEligibilityUsesFrozenProvenance();
+        PowerReplayResetsOnUntrustedProvenance();
         JsonAndMarkdownContainOnlyFiniteValues();
         PcieCandidateKeepsItsUnverifiedTimingLabel();
     }
@@ -180,12 +187,240 @@ public static class ShadowPredictionEvaluationTests
     {
         var report = EvaluateFixture(7);
         var ramp = report.Advisory.GradualRamp;
-        Check(ramp is not null && ramp.RowsEvaluated == report.Coverage.TestRows,
-            "gradual connector-only heldout ramp is evaluated");
+        Check(ramp is not null && ramp.ScenarioState == "AVAILABLE" &&
+            ramp.RowsEvaluated == 360,
+            "gradual connector-only ramp uses only the fixed six-hour heldout window");
+        Check(ramp!.WindowStartTimestampUtc is DateTimeOffset start &&
+            ramp.OnsetTimestampUtc == start.AddMinutes(30) &&
+            ramp.WindowEndTimestampUtc == start.AddHours(6) &&
+            ramp.RampDurationSeconds == 1800,
+            "synthetic ramp records its fixed start, onset, exclusive end, and wall-clock duration");
+        Check(ramp.ScenarioIdentity.Length == 64 && report.ModelIdentity ==
+            ShadowPredictionEvaluation.ModelAlgorithmIdentity &&
+            report.ConfigurationIdentity.Length == 64,
+            "model, configuration, and scenario identities are explicit hashes or versions");
         Check(report.Advisory.SyntheticFaults.Any(x => x.Label == "STEP_200MV"),
             "post-fit connector step checks include the 200mV case");
         Check(report.Advisory.Detail.Contains("live alert thresholds", StringComparison.OrdinalIgnoreCase),
             "experimental advisory does not alter live thresholds");
+    }
+
+    static void SyntheticRampUsesWallClockTimeAcrossGaps()
+    {
+        var onset = new DateTimeOffset(2026, 1, 6, 0, 30, 0, TimeSpan.Zero);
+        var duration = TimeSpan.FromMinutes(30);
+        Check(ShadowPredictionEvaluation.CalculateSyntheticDropV(.2, onset.AddSeconds(-1),
+            onset, duration) == 0,
+            "ramp has no effect before the fixed onset");
+        Check(Math.Abs(ShadowPredictionEvaluation.CalculateSyntheticDropV(.2,
+            onset.AddMinutes(15), onset, duration) - .1) < 1e-12,
+            "ramp reaches half its final drop at 15 wall-clock minutes");
+        Check(Math.Abs(ShadowPredictionEvaluation.CalculateSyntheticDropV(.2,
+            onset.AddMinutes(30), onset, duration) - .2) < 1e-12 &&
+            Math.Abs(ShadowPredictionEvaluation.CalculateSyntheticDropV(.2,
+                onset.AddHours(2), onset, duration) - .2) < 1e-12,
+            "ramp reaches and holds its final drop after exactly 30 wall-clock minutes, including gaps");
+        var withGap = EvaluateFixture(7, withGap: true).Advisory.GradualRamp;
+        Check(withGap is not null && withGap.ScenarioState == "AVAILABLE" &&
+            withGap.RampDurationSeconds == 1800,
+            "a heldout telemetry gap does not change the ramp duration");
+    }
+
+    static void SyntheticScenariosRemainFixedAsArchiveGrows()
+    {
+        var earlyRows = FixtureRows(7).ToList();
+        string originalRows = JsonSerializer.Serialize(earlyRows);
+        var early = Evaluate(earlyRows, 7);
+        var later = Evaluate(FixtureRows(8), 8);
+        var laterByLabel = later.Advisory.SyntheticFaults.ToDictionary(x => x.Label,
+            StringComparer.Ordinal);
+        foreach (var scenario in early.Advisory.SyntheticFaults)
+        {
+            var appended = laterByLabel[scenario.Label];
+            Check(scenario.ScenarioIdentity == appended.ScenarioIdentity &&
+                scenario.ScenarioState == appended.ScenarioState &&
+                scenario.WindowStartTimestampUtc == appended.WindowStartTimestampUtc &&
+                scenario.WindowEndTimestampUtc == appended.WindowEndTimestampUtc &&
+                scenario.OnsetTimestampUtc == appended.OnsetTimestampUtc &&
+                scenario.RowsEvaluated == appended.RowsEvaluated &&
+                scenario.AvailablePredictions == appended.AvailablePredictions &&
+                scenario.AdvisoryTransitions == appended.AdvisoryTransitions &&
+                scenario.AttributableTransitions == appended.AttributableTransitions &&
+                scenario.DetectionLatencySeconds == appended.DetectionLatencySeconds,
+                "later archive days preserve fixed-window scenario identity and results");
+        }
+        Check(early.Coverage.TestRows < later.Coverage.TestRows,
+            "archive extension adds native heldout rows");
+        Check(originalRows == JsonSerializer.Serialize(earlyRows),
+            "synthetic injection leaves source observations unchanged");
+    }
+
+    static void NativeAdvisoryIncludesRowsOutsideSyntheticWindow()
+    {
+        var rows = FixtureRows(7).ToList();
+        var before = Evaluate(rows, 7);
+        var outsideWindowRow = rows.First(x => x.TimestampUtc.Date == new DateTime(2026, 1, 1))
+            with
+            {
+                TimestampUtc = new DateTimeOffset(2026, 1, 6, 6, 1, 0, TimeSpan.Zero),
+            };
+        rows.Add(outsideWindowRow);
+        var after = Evaluate(rows, 7);
+        var beforeRamp = before.Advisory.GradualRamp!;
+        var afterRamp = after.Advisory.GradualRamp!;
+        Check(after.Coverage.TestRows == before.Coverage.TestRows + 1 &&
+            after.Advisory.ObservedTestRows == before.Advisory.ObservedTestRows + 1,
+            "native advisory replay counts a valid heldout row after the synthetic window");
+        Check(beforeRamp.ScenarioIdentity == afterRamp.ScenarioIdentity &&
+            beforeRamp.AdvisoryTransitions == afterRamp.AdvisoryTransitions &&
+            beforeRamp.DetectionLatencySeconds == afterRamp.DetectionLatencySeconds,
+            "an out-of-window heldout row does not change the fixed synthetic scenario");
+    }
+
+    static void IncompleteSyntheticWindowsRemainUnavailable()
+    {
+        var rows = FixtureRows(7).Where(row =>
+        {
+            if (row.TimestampUtc.Date < new DateTime(2026, 1, 6)) return true;
+            if (row.TimestampUtc.Date == new DateTime(2026, 1, 6))
+                return row.TimestampUtc.TimeOfDay <= TimeSpan.FromMinutes(45);
+            return row.TimestampUtc.Date == new DateTime(2026, 1, 7) &&
+                row.TimestampUtc.TimeOfDay <= TimeSpan.FromMinutes(9);
+        }).Select(row => row with
+        {
+            TimestampUtc = row.TimestampUtc.Date == new DateTime(2026, 1, 6)
+                ? new DateTimeOffset(2026, 1, 6, 20, 0, 0, TimeSpan.Zero)
+                    .Add(row.TimestampUtc.TimeOfDay)
+                : row.TimestampUtc.Date == new DateTime(2026, 1, 7)
+                    ? new DateTimeOffset(2026, 1, 7, 1, 0, 0, TimeSpan.Zero)
+                        .Add(row.TimestampUtc.TimeOfDay)
+                    : row.TimestampUtc,
+        }).ToList();
+        var incomplete = Evaluate(rows, 7);
+        Check(incomplete.Advisory.SyntheticFaults.Count == 5 &&
+            incomplete.Advisory.SyntheticFaults.All(x => x.ScenarioState == "UNAVAILABLE" &&
+                x.AttributableTransitions == 0 && x.DetectionLatencySeconds is null),
+            "a heldout record that ends before the exclusive six-hour window end is unavailable");
+
+        var noPostOnset = FixtureRows(7).Where(row =>
+            row.TimestampUtc.Date < new DateTime(2026, 1, 6) ||
+            row.TimestampUtc.Date == new DateTime(2026, 1, 6) &&
+                (row.TimestampUtc.TimeOfDay <= TimeSpan.FromMinutes(20) ||
+                 row.TimestampUtc.TimeOfDay == TimeSpan.FromHours(6)) ||
+            row.TimestampUtc.Date == new DateTime(2026, 1, 7) &&
+                row.TimestampUtc.TimeOfDay <= TimeSpan.FromMinutes(9)).ToList();
+        var noPostOnsetReport = Evaluate(noPostOnset, 7);
+        Check(noPostOnsetReport.Advisory.SyntheticFaults.All(x =>
+            x.ScenarioState == "UNAVAILABLE" &&
+            x.Detail.Contains("No baseline post-onset predictions", StringComparison.Ordinal)),
+            "a complete time boundary with no available post-onset observation stays unavailable");
+
+        var floorReport = Evaluate(FixtureRows(7), 7,
+            Options() with { MinimumPracticalVoltageV = 20 });
+        Check(floorReport.Advisory.SyntheticFaults.All(x =>
+            x.ScenarioState == "UNAVAILABLE" &&
+            x.Detail.Contains("practical-voltage floor", StringComparison.Ordinal)),
+            "post-onset rows below the practical-voltage floor do not appear as available scenarios");
+    }
+
+    static void ScenarioIdentitiesIncludeSettingsAndFrozenAnchors()
+    {
+        var rows = FixtureRows(7).ToList();
+        var baseline = Evaluate(rows, 7);
+        var changedOptions = Options() with { SustainedPersistenceSeconds = 90 };
+        var changedConfiguration = Evaluate(rows, 7, changedOptions);
+        Check(baseline.ConfigurationIdentity != changedConfiguration.ConfigurationIdentity &&
+            baseline.Advisory.SyntheticFaults[0].ScenarioIdentity !=
+                changedConfiguration.Advisory.SyntheticFaults[0].ScenarioIdentity,
+            "an advisory setting change changes configuration and scenario identities");
+
+        var changedModelLabel = Evaluate(rows, 7, Options() with { ModelIdentity = "OTHER-SOURCE" });
+        Check(baseline.Advisory.SyntheticFaults[0].ScenarioIdentity !=
+            changedModelLabel.Advisory.SyntheticFaults[0].ScenarioIdentity,
+            "a caller model identity change changes the scenario identity");
+
+        var correctedAnchorRows = rows.Select(row =>
+            row.TimestampUtc.Date == new DateTime(2026, 1, 1)
+                ? row with { VoltageV = row.VoltageV + .01 }
+                : row).ToList();
+        var correctedAnchor = Evaluate(correctedAnchorRows, 7);
+        Check(baseline.FrozenCutoffFingerprint != correctedAnchor.FrozenCutoffFingerprint &&
+            baseline.Advisory.SyntheticFaults[0].ScenarioIdentity !=
+                correctedAnchor.Advisory.SyntheticFaults[0].ScenarioIdentity,
+            "corrected training or calibration anchor evidence breaks scenario identity");
+    }
+
+    static void PowerAdvisoryEligibilityUsesFrozenProvenance()
+    {
+        var earlyRows = PowerAdvisoryRows(7);
+        var early = Evaluate(earlyRows, 7);
+        var later = Evaluate(PowerAdvisoryRows(8), 8);
+        Check(early.PowerBoardTemperature is { EligibleForRanking: true } &&
+            later.PowerBoardTemperature is { EligibleForRanking: false },
+            "a later derived-power cohort row changes full-heldout ranking eligibility");
+        Check(early.Advisory.Model == "POWER_BOARD_TEMPERATURE" &&
+            later.Advisory.Model == early.Advisory.Model &&
+            early.Advisory.SyntheticFaults.Count == later.Advisory.SyntheticFaults.Count,
+            "power advisory selection depends on training and calibration provenance only");
+
+        var laterByLabel = later.Advisory.SyntheticFaults.ToDictionary(x => x.Label,
+            StringComparer.Ordinal);
+        foreach (var scenario in early.Advisory.SyntheticFaults)
+        {
+            var appended = laterByLabel[scenario.Label];
+            Check(scenario.ScenarioIdentity == appended.ScenarioIdentity &&
+                scenario.ScenarioState == appended.ScenarioState &&
+                scenario.DetectionLatencySeconds == appended.DetectionLatencySeconds &&
+                scenario.AttributableTransitions == appended.AttributableTransitions,
+                "later unknown or derived power rows outside the fixed window preserve scenario results");
+        }
+
+        var untrustedAnchors = earlyRows.Select(row =>
+            row.TimestampUtc.Date is var day &&
+            (day == new DateTime(2026, 1, 4) || day == new DateTime(2026, 1, 5))
+                ? row with { PowerProvenance = "Unknown" }
+                : row).ToList();
+        var unavailable = Evaluate(untrustedAnchors, 7);
+        Check(unavailable.Advisory.Model == "none" &&
+            unavailable.Advisory.SyntheticFaults.Count == 0,
+            "unknown training or calibration power provenance disables the power advisory");
+    }
+
+    static void PowerReplayResetsOnUntrustedProvenance()
+    {
+        var rows = PowerAdvisoryRows(7).Select(row =>
+        {
+            if (row.TimestampUtc.Date != new DateTime(2026, 1, 6) ||
+                row.TimestampUtc.TimeOfDay < TimeSpan.FromMinutes(30))
+                return row;
+            var shifted = row with { VoltageV = row.VoltageV - .5 };
+            return row.TimestampUtc.TimeOfDay == TimeSpan.FromMinutes(32)
+                ? shifted with { PowerProvenance = "Derived V*I" }
+                : shifted;
+        }).ToList();
+        var report = Evaluate(rows, 7);
+        var advisoryIndex = report.Advisory.Transitions.ToList().FindIndex(x =>
+            x.State == "ADVISORY" && x.TimestampUtc <
+                new DateTimeOffset(2026, 1, 6, 0, 32, 0, TimeSpan.Zero));
+        var resetIndex = report.Advisory.Transitions.ToList().FindIndex(x =>
+            x.State == "UNKNOWN" && x.TimestampUtc ==
+                new DateTimeOffset(2026, 1, 6, 0, 32, 0, TimeSpan.Zero) &&
+            x.Reason.Contains("provenance", StringComparison.Ordinal));
+        Check(report.Advisory.Model == "POWER_BOARD_TEMPERATURE" &&
+            advisoryIndex >= 0 && resetIndex > advisoryIndex,
+            "a derived-power row resets an active advisory and clears replay continuity");
+
+        var untrustedPostOnset = PowerAdvisoryRows(7).Select(row =>
+            row.TimestampUtc.Date == new DateTime(2026, 1, 6) &&
+            row.TimestampUtc.TimeOfDay >= TimeSpan.FromMinutes(30) &&
+            row.TimestampUtc.TimeOfDay < TimeSpan.FromHours(6)
+                ? row with { PowerProvenance = "Unknown" }
+                : row).ToList();
+        var noEvidence = Evaluate(untrustedPostOnset, 7);
+        Check(noEvidence.Advisory.SyntheticFaults.All(x =>
+            x.ScenarioState == "UNAVAILABLE" &&
+            x.Detail.Contains("provenance", StringComparison.Ordinal)),
+            "unknown power rows after onset reset continuity and add no scenario evidence");
     }
 
     static void JsonAndMarkdownContainOnlyFiniteValues()
@@ -213,38 +448,65 @@ public static class ShadowPredictionEvaluationTests
         Evaluate(FixtureRows(days, withGap), days);
 
     static ShadowEvaluationReport Evaluate(IReadOnlyList<ShadowTelemetryRow> rows, int days)
+        => Evaluate(rows, days, Options());
+
+    static ShadowEvaluationReport Evaluate(IReadOnlyList<ShadowTelemetryRow> rows, int days,
+        ShadowEvaluationOptions options)
     {
         var cutoff = new DateTimeOffset(2026, 1, days + 1, 0, 0, 0, TimeSpan.Zero);
         return ShadowPredictionEvaluation.Evaluate(new ShadowReadResult(rows,
             Array.Empty<ShadowSourceFile>(), rows.Count, rows.Count, 0, 0, 0, 0, 0,
-            false, cutoff, Array.Empty<string>()), new ShadowEvaluationOptions
-            {
-                MinimumMinutesPerSupportedDay = 5,
-                MinimumEvaluationRows = 5,
-                MinimumPowerSpanW = 20,
-                MinimumCurrentSpanA = 2,
-                SustainedPersistenceSeconds = 60,
-                GapResetMinutes = 5,
-                ModelIdentity = "TEST-GPU",
-                ConfigurationIdentity = "TEST-CONFIG",
-            });
+            false, cutoff, Array.Empty<string>()), options);
     }
+
+    static ShadowEvaluationOptions Options() => new()
+    {
+        MinimumMinutesPerSupportedDay = 5,
+        MinimumEvaluationRows = 5,
+        MinimumPowerSpanW = 20,
+        MinimumCurrentSpanA = 2,
+        SustainedPersistenceSeconds = 60,
+        GapResetMinutes = 5,
+        ModelIdentity = "TEST-GPU",
+        ConfigurationIdentity = "TEST-CONFIG",
+    };
+
+    static List<ShadowTelemetryRow> PowerAdvisoryRows(int days) => FixtureRows(days)
+        .Select(row =>
+        {
+            int dayIndex = row.TimestampUtc.Day - 1;
+            int phase = (int)row.TimestampUtc.TimeOfDay.TotalMinutes % 10;
+            double measuredPower = 210 + phase * 27 + (phase % 2) * 3;
+            string provenance = row.TimestampUtc.Date <= new DateTime(2026, 1, 7)
+                ? "Native measured" : "Derived V*I";
+            return row with
+            {
+                ConnectorPowerW = measuredPower,
+                PowerProvenance = provenance,
+                ConnectorCurrentA = dayIndex >= 3
+                    ? row.ConnectorCurrentA + 60
+                    : row.ConnectorCurrentA,
+            };
+        }).ToList();
 
     static IReadOnlyList<ShadowTelemetryRow> FixtureRows(int days, bool withGap = false)
     {
         var rows = new List<ShadowTelemetryRow>();
         for (int day = 0; day < days; day++)
         {
-            for (int minute = 0; minute < 10; minute++)
+            int minuteCount = day >= 5 ? 361 : 10;
+            for (int minute = 0; minute < minuteCount; minute++)
             {
-                int minuteOffset = withGap && day >= 5 && minute == 5 ? 20 : minute;
+                int minuteOffset = withGap && day >= 5 && minute >= 5
+                    ? minute + 20 : minute;
+                int phase = minute % 10;
                 var timestamp = new DateTimeOffset(2026, 1, 1 + day, 0, 0, 0,
                     TimeSpan.Zero).AddMinutes(minuteOffset);
-                double current = 18 + minute * 2.1 + day * .3 + (minute % 3) * .35;
-                double power = 210 + minute * 27 + day * 4 + (minute % 2) * 3;
-                double board = power + 35 + (minute % 4) * 4 + day * .5;
-                double temperature = 38 + day * .8 + minute * .45 + (minute % 3) * .2;
-                double pcie = 11.8 + minute * .025 + day * .01;
+                double current = 18 + phase * 2.1 + day * .3 + (phase % 3) * .35;
+                double power = 210 + phase * 27 + day * 4 + (phase % 2) * 3;
+                double board = power + 35 + (phase % 4) * 4 + day * .5;
+                double temperature = 38 + day * .8 + phase * .45 + (phase % 3) * .2;
+                double pcie = 11.8 + phase * .025 + day * .01;
                 double voltage = 12.35 - .0008 * power + .00025 * board -
                     .0015 * temperature - .0004 * current;
                 rows.Add(new ShadowTelemetryRow(timestamp, voltage, current, voltage * current,
