@@ -1003,9 +1003,11 @@ public static class Program
         return result;
     }
 
-    private static int RunSession(string[] args)
+    internal static int RunSession(string[] args, RuntimeSessionOverrides? runtimeOverrides = null)
     {
         CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+        DateTimeOffset GetUtcNow() => runtimeOverrides?.UtcNow() ?? DateTimeOffset.UtcNow;
+        long GetMonotonicTimestamp() => runtimeOverrides?.MonotonicTimestamp() ?? Stopwatch.GetTimestamp();
         try
         {
             if (args.Contains("--self-test")) { Tests.Run(); return 0; }
@@ -1057,17 +1059,24 @@ public static class Program
                     Option(args, "--operator"), Option(args, "--note"),
                     Option(args, "--incident-id"));
             using var singleInstance = new FileStream(Path.Combine(data, "monitor.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            string sessionInstanceId = Guid.NewGuid().ToString("N");
+            ControlServer? control = null;
+            Analysis? analysis = null;
+            SamplingProgressTracker? samplingProgress = null;
+            string? latestState = null;
+            try
+            {
             using var stop = new CancellationTokenSource();
             using var shutdown = RegisterShutdown(stop);
-            using var control = new ControlServer(data, stop);
+            using var controlLifetime = control = new ControlServer(data, stop, sessionInstanceId);
             control.Start();
             using var telemetryCompression = OperatingSystem.IsWindows()
-                ? new TelemetryCompressionMaintenance(data, LogRecoverableFailure)
+                ? new TelemetryCompressionMaintenance(data, ex => LogRecoverableFailure(ex, runtimeOverrides?.DiagnosticLogDirectory))
                 : null;
-            telemetryCompression?.Start(stop.Token);
+            if (runtimeOverrides?.SkipBackgroundMaintenance != true) telemetryCompression?.Start(stop.Token);
             using var shadowReviews = new ShadowReviewScheduler(data,
-                (message, error) => LogRecoverableFailure(new InvalidOperationException(message, error)));
-            shadowReviews.Start(stop.Token);
+                (message, error) => LogRecoverableFailure(new InvalidOperationException(message, error), runtimeOverrides?.DiagnosticLogDirectory));
+            if (runtimeOverrides?.SkipBackgroundMaintenance != true) shadowReviews.Start(stop.Token);
             try { c.GpuUuid = Nvml.ResolveUuid(c.GpuUuid); }
             catch (Exception ex)
             {
@@ -1076,11 +1085,16 @@ public static class Program
                     autoAcceptReference: c.AutoAcceptReference);
             }
             var sourceMode = c.VoltageSource.Trim().ToLowerInvariant();
-            using var driverApprovals = DriverApprovalService.CreateDefault(data);
+            using var driverApprovals = DriverApprovalService.CreateDefault(data,
+                startBackgroundRefresh: runtimeOverrides?.SkipBackgroundMaintenance != true);
             ApprovalRailSource? directSource = null;
             IVoltageSource? voltageSource = null;
             string? sourceSetupError = null;
-            if (sourceMode == "none")
+            if (runtimeOverrides is not null)
+            {
+                voltageSource = runtimeOverrides.VoltageSource;
+            }
+            else if (sourceMode == "none")
             {
                 voltageSource = null;
             }
@@ -1157,14 +1171,14 @@ public static class Program
                 ? File.ReadAllText(referencePath)
                 : File.Exists(baselinePath) ? File.ReadAllText(baselinePath) : null;
             var referenceLoad = ReferencePersistence.Load(persistedReferenceJson, referenceIdentity,
-                DateTimeOffset.UtcNow,
+                GetUtcNow(),
                 new ReferenceStartupContext(
                     IsRestart: hasPersistedReference,
                     IsDegraded: voltageSource is null || sourceSetupError is not null,
                     Detail: sourceSetupError ?? ""));
             var lifecycle = referenceLoad.Lifecycle;
             var referenceGate = new object();
-            var analysis = new Analysis(c, BuildAnalysisBins(lifecycle, saved));
+            analysis = new Analysis(c, BuildAnalysisBins(lifecycle, saved));
             var differentialIdentity = BuildDifferentialIdentity(referenceIdentity);
             var differentialOptions = BuildDifferentialOptions(c, referenceIdentity);
             var differentialRuntime = new DifferentialModelRuntime(differentialOptions,
@@ -1307,7 +1321,7 @@ public static class Program
                     string actor = string.IsNullOrWhiteSpace(request.Operator)
                         ? request.ClientId : request.Operator.Trim();
                     string note = request.Note?.Trim() ?? "";
-                    DateTimeOffset now = DateTimeOffset.UtcNow;
+                    DateTimeOffset now = GetUtcNow();
                     if (command == "set-auto-accept-reference")
                     {
                         if (!request.AutoAcceptReference.HasValue)
@@ -1376,9 +1390,9 @@ public static class Program
                     {
                         if (command == "acknowledge-incident")
                             _ = incidentLedger.Acknowledge(incidentId,
-                                DateTimeOffset.UtcNow, actor, note);
+                                GetUtcNow(), actor, note);
                         else if (command == "resolve-incident")
-                            _ = incidentLedger.Resolve(incidentId, DateTimeOffset.UtcNow,
+                            _ = incidentLedger.Resolve(incidentId, GetUtcNow(),
                                 actor, note);
                         else
                             return new(false, "Unknown incident command.",
@@ -1398,8 +1412,8 @@ public static class Program
                 }
             }
             control.IncidentCommand = HandleIncidentCommand;
-            Nvml nvml;
-            try { nvml = new Nvml(c.GpuUuid); }
+            Nvml? nvml = null;
+            try { if (runtimeOverrides is null) nvml = new Nvml(c.GpuUuid); }
             catch (Exception ex)
             {
                 return WriteStartupFailure(data, "NVML", "NVML initialization failed: " + ex.Message,
@@ -1410,22 +1424,22 @@ public static class Program
             DateTimeOffset? lastSensor = null; string? previousStatus = null;
             bool alertPresentedForCurrentStatus = false;
             var clock = Stopwatch.StartNew(); double next = 0;
-            long startedMonotonic = Stopwatch.GetTimestamp();
+            long startedMonotonic = GetMonotonicTimestamp();
             var pollTimingTracker = new PollTimingTracker();
-            var samplingProgress = new SamplingProgressTracker(control.InstanceId,
-                DateTimeOffset.UtcNow, startedMonotonic,
+            samplingProgress = new SamplingProgressTracker(control.InstanceId,
+                GetUtcNow(), startedMonotonic,
                 staleAfterSeconds: Math.Max(c.MaxAgeSeconds, c.SampleSeconds * 3),
                 startupGraceSeconds: Math.Max(c.MaxAgeSeconds, c.SampleSeconds * 3));
             var coverageTracker = new AnalysisCoverageTracker(TimeSpan.FromMinutes(30));
             long? priorCompletedPoll = null;
+            DateTimeOffset? priorCoverageTimestamp = null;
             var storage = new HybridStorage(data, c.FlushSeconds);
-            string? latestState = null;
             bool restartForDriverChange = false;
             Console.WriteLine("ConnectorWatch: read-only telemetry. Ctrl+C/SIGTERM stops. No status certifies connector safety.");
             while (!stop.IsCancellationRequested && (count == 0 || n < count))
             {
-                var now = DateTimeOffset.UtcNow; var g = nvml.Read(); Voltage? v = null; ElectricalSample? electrical = null;
-                long pollStartMonotonic = Stopwatch.GetTimestamp();
+                var now = GetUtcNow(); var g = runtimeOverrides?.ReadGpu() ?? nvml!.Read(); Voltage? v = null; ElectricalSample? electrical = null;
+                long pollStartMonotonic = GetMonotonicTimestamp();
                 string status = sourceSetupError != null ? "VOLTAGE_UNAVAILABLE" : "VOLTAGE_NOT_CONFIGURED";
                 string detail = sourceSetupError ?? "";
                 Exception? terminalFailure = null;
@@ -1454,7 +1468,7 @@ public static class Program
                         terminalFailure = ex;
                     }
                 }
-                long pollEndMonotonic = Stopwatch.GetTimestamp();
+                long pollEndMonotonic = GetMonotonicTimestamp();
                 var pollTiming = pollTimingTracker.Record(pollStartMonotonic, pollEndMonotonic, now,
                     electrical is null ? new RawElectricalObservation() :
                         RawElectricalObservation.FromElectricalSample(electrical));
@@ -1595,6 +1609,18 @@ public static class Program
                     ? MonotonicTime.ElapsedSeconds(priorCompletedPoll.Value, pollEndMonotonic) ?? 0
                     : 0;
                 priorCompletedPoll = pollEndMonotonic;
+                bool coverageClockGap = priorCoverageTimestamp.HasValue && now < priorCoverageTimestamp.Value;
+                if (coverageClockGap)
+                {
+                    // UTC observations cannot span a backward host-clock step.
+                    // Start a new coverage interval without changing source or
+                    // monotonic sampling continuity. Compare each adjacent poll
+                    // so the corrected clock need not catch up to the old UTC.
+                    coverageTracker.Gap(now);
+                    sampleDuration = 0;
+                    detail = "Host UTC clock moved backwards; coverage continuity reset. " + detail;
+                }
+                priorCoverageTimestamp = now;
                 bool loadKnown = analysisPower.HasValue;
                 bool loaded = analysisPower >= c.MinAnalysisWatts ||
                     !loadKnown && (g.Power >= c.MinAnalysisWatts || !g.Power.HasValue);
@@ -1776,6 +1802,8 @@ public static class Program
                     throw new Exception("ConnectorWatch stopped after a terminal voltage-source failure.", terminalFailure);
                 }
                 n++;
+                runtimeOverrides?.SampleCompleted?.Invoke(n, latestState);
+                if (runtimeOverrides?.SkipSampleWait == true) continue;
                 next += c.SampleSeconds;
                 if (next < clock.Elapsed.TotalSeconds) next = clock.Elapsed.TotalSeconds;
                 while (!stop.IsCancellationRequested && clock.Elapsed.TotalSeconds < next)
@@ -1794,8 +1822,11 @@ public static class Program
             }
             samplingProgress.MarkStopped(control.StopRequested ? "control" : stop.IsCancellationRequested ? "signal" : "sample_limit");
             MarkStopped(Path.Combine(data, "status.json"), control.StopRequested ? "control" : stop.IsCancellationRequested ? "signal" : "sample_limit",
-                control, analysis.Progress, samplingProgress.Snapshot(Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow),
-                c.AutoAcceptReference);
+                control, analysis.Progress, samplingProgress.Snapshot(GetMonotonicTimestamp(), GetUtcNow()),
+                c.AutoAcceptReference, latestState,
+                stoppedAtUtc: GetUtcNow(),
+                beforeWrite: runtimeOverrides?.BeforeStoppedStatusWrite,
+                diagnosticLogDirectory: runtimeOverrides?.DiagnosticLogDirectory);
             lock (referenceGate)
             {
                 PersistReferenceLocked();
@@ -1805,13 +1836,35 @@ public static class Program
             }
             if (stop.IsCancellationRequested) Console.WriteLine("ConnectorWatch: shutdown requested; state saved.");
             return restartForDriverChange ? 42 : 0;
+            }
+            catch (Exception ex)
+            {
+                // Finalize only inside the lock-owning scope. The outer catch
+                // must retain the original error after releasing the lock.
+                try
+                {
+                    var stoppedAtUtc = GetUtcNow();
+                    samplingProgress?.MarkStopped("failure");
+                    MarkStopped(Path.Combine(data, "status.json"), "failure", control,
+                        analysis?.Progress, samplingProgress?.Snapshot(GetMonotonicTimestamp(), stoppedAtUtc),
+                        c.AutoAcceptReference, latestState, ex, stoppedAtUtc,
+                        runtimeOverrides?.BeforeStoppedStatusWrite,
+                        runtimeOverrides?.DiagnosticLogDirectory, sessionInstanceId);
+                }
+                catch (Exception finalizationError)
+                {
+                    LogRecoverableFailure(new IOException("ConnectorWatch could not mark stopped state: " +
+                        finalizationError.Message, finalizationError), runtimeOverrides?.DiagnosticLogDirectory);
+                }
+                throw;
+            }
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine("ConnectorWatch stopped: " + (args.Contains("--self-test") ? ex.ToString() : ex.Message));
             try
             {
-                string logs = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ConnectorWatch", "logs");
+                string logs = runtimeOverrides?.DiagnosticLogDirectory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ConnectorWatch", "logs");
                 Directory.CreateDirectory(logs);
                 string log = Path.Combine(logs, "errors.log");
                 if (File.Exists(log) && new FileInfo(log).Length > 1024 * 1024) File.Move(log, log + ".previous", true);
@@ -1823,12 +1876,12 @@ public static class Program
     }
     static string? Option(string[] args, string name) { int i = Array.IndexOf(args, name); return i < 0 ? null : i + 1 < args.Length ? args[i + 1] : throw new Exception("Missing value for " + name); }
 
-    static void LogRecoverableFailure(Exception ex)
+    static void LogRecoverableFailure(Exception ex, string? diagnosticLogDirectory = null)
     {
         Console.Error.WriteLine("ConnectorWatch recoverable failure: " + ex.Message);
         try
         {
-            string logs = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ConnectorWatch", "logs");
+            string logs = diagnosticLogDirectory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ConnectorWatch", "logs");
             Directory.CreateDirectory(logs);
             string log = Path.Combine(logs, "errors.log");
             if (File.Exists(log) && new FileInfo(log).Length > 1024 * 1024) File.Move(log, log + ".previous", true);
@@ -1876,17 +1929,25 @@ public static class Program
 
     static void MarkStopped(string path, string reason, ControlServer? control = null,
         AnalysisProgress? progress = null, SamplingProgressContract? samplingProgress = null,
-        bool? autoAcceptReference = null)
+        bool? autoAcceptReference = null, string? latestState = null,
+        Exception? failure = null, DateTimeOffset? stoppedAtUtc = null,
+        Action<string, string>? beforeWrite = null, string? diagnosticLogDirectory = null,
+        string? instanceId = null)
     {
         try
         {
+            var stoppedAt = stoppedAtUtc ?? DateTimeOffset.UtcNow;
+            var currentInstanceId = control?.InstanceId ?? instanceId ?? Guid.NewGuid().ToString("N");
+            JsonObject? existing = latestState is not null
+                ? JsonNode.Parse(latestState) as JsonObject
+                : File.Exists(path) ? JsonNode.Parse(File.ReadAllText(path)) as JsonObject : null;
             JsonObject state;
-            if (File.Exists(path) && JsonNode.Parse(File.ReadAllText(path)) is JsonObject existing)
+            if (existing is not null && existing["instance_id"]?.ToString() == currentInstanceId)
                 state = existing;
             else
                 state = new JsonObject
                 {
-                    ["timestamp_utc"] = DateTimeOffset.UtcNow,
+                    ["timestamp_utc"] = null,
                     ["gpu"] = null,
                     ["voltage"] = null,
                     ["electrical"] = null,
@@ -1896,7 +1957,7 @@ public static class Program
                 };
             state["schema_version"] = 3;
             state["process_id"] = control?.ProcessId ?? Environment.ProcessId;
-            state["instance_id"] = control?.InstanceId ?? Guid.NewGuid().ToString("N");
+            state["instance_id"] = currentInstanceId;
             if (autoAcceptReference.HasValue)
                 state["auto_accept_reference"] = autoAcceptReference.Value;
             if (progress is not null)
@@ -1915,12 +1976,58 @@ public static class Program
                 state["sampling_progress"] = JsonSerializer.SerializeToNode(samplingProgress, Json);
             state["stopped"] = true;
             state["stop_reason"] = reason;
-            state["stopped_at_utc"] = DateTimeOffset.UtcNow;
-            Atomic(path, state.ToJsonString(Json));
+            state["stopped_at_utc"] = stoppedAt;
+            if (failure is not null)
+            {
+                string failureReason = (failure.GetType().Name + ": " + failure.Message)
+                    .Replace('\r', ' ').Replace('\n', ' ');
+                state["failure_reason"] = failureReason.Length > 512 ? failureReason[..512] : failureReason;
+            }
+            else
+                state.Remove("failure_reason");
+            if (state["acquisition"] is JsonObject acquisition)
+            {
+                bool nativeFailure = acquisition["status"]?.ToString() == AcquisitionHealthStatus.NATIVE_FAILURE.WireName();
+                if (!nativeFailure)
+                    acquisition["status"] = AcquisitionHealthStatus.SOURCE_UNAVAILABLE.WireName();
+                acquisition["monitor_running"] = false;
+                acquisition["analysis_available"] = false;
+                acquisition["source_available"] = false;
+                acquisition["fresh"] = false;
+                acquisition["power_available"] = false;
+                acquisition["freshness_known"] = false;
+                acquisition["MonitorAvailable"] = false;
+                acquisition["StatusName"] = acquisition["status"]!.ToString();
+                acquisition["host_timestamp_utc"] = stoppedAt;
+                acquisition["sample_age_seconds"] = samplingProgress?.SampleAgeSeconds;
+                if (!nativeFailure)
+                    acquisition["detail"] = "Monitor stopped: " + reason + ".";
+                if (acquisition["detectors"] is JsonObject detectors)
+                {
+                    foreach (var entry in detectors)
+                    {
+                        if (entry.Value is not JsonObject detector) continue;
+                        detector["available"] = false;
+                        detector["IsAvailable"] = false;
+                        bool detectorNativeFailure = detector["reason"]?.ToString() == DetectorAvailabilityReason.NATIVE_FAILURE.WireName();
+                        detector["reason"] = nativeFailure || detectorNativeFailure
+                            ? DetectorAvailabilityReason.NATIVE_FAILURE.WireName()
+                            : DetectorAvailabilityReason.MONITOR_UNAVAILABLE.WireName();
+                        detector["ReasonName"] = detector["reason"]!.ToString();
+                        detector["updated_at_utc"] = stoppedAt;
+                        if (!nativeFailure && !detectorNativeFailure)
+                            detector["detail"] = "Monitor stopped: " + reason + ".";
+                    }
+                }
+            }
+            string finalState = state.ToJsonString(Json);
+            beforeWrite?.Invoke(path, finalState);
+            Atomic(path, finalState);
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine("ConnectorWatch could not mark stopped state: " + ex.Message);
+            LogRecoverableFailure(new IOException("ConnectorWatch could not mark stopped state: " +
+                ex.Message, ex), diagnosticLogDirectory);
         }
     }
 

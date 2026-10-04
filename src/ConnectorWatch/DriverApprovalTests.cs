@@ -24,12 +24,55 @@ public static class DriverApprovalTests
         var revoked = Envelope(signingKey, CatalogPayload(2, now.AddMinutes(1), now.AddDays(30), "revoked"));
 
         VerifierSecurityCases(signingKey, publicKey, approved, now);
+        await BackgroundRefreshFactoryCases(publicKey, approved, now);
         await CacheAndPolicyCases(signingKey, publicKey, approved, now);
         await OrderlyRestartCleanupCase(signingKey, publicKey, approved, now);
         await TransientStartupContentionFailsClosed(publicKey, revoked, now);
         BundledRollbackCase(signingKey, publicKey, approved, now);
         await PilotUnknownApproveRevoke(publicKey, approved, revoked, now);
         Console.WriteLine("PASS: signed driver approval catalog security and lifecycle fixtures.");
+    }
+
+    private static async Task BackgroundRefreshFactoryCases(SignedMetadataKey publicKey,
+        byte[] approved, DateTimeOffset now)
+    {
+        var folder = TemporaryDirectory();
+        try
+        {
+            var options = new DriverApprovalOptions
+            {
+                CatalogEndpoint = new Uri("https://catalog.invalid/catalog-current.json"),
+                TrustKeys = new[] { publicKey },
+                MaximumAttempts = 1,
+            };
+            var clock = new FixtureTimeProvider(now.AddMinutes(2));
+            var offlineHandler = new QueueHandler();
+            offlineHandler.Enqueue(approved);
+            using (var client = new HttpClient(offlineHandler))
+            using (var offline = DriverApprovalService.CreateDefault(Path.Combine(folder, "offline"),
+                startBackgroundRefresh: false, options, client, clock))
+            {
+                Check(offlineHandler.Requests == 0 && offline.LastCheckedUtc is null,
+                    "disabled background refresh makes no request even with trusted release keys");
+                Check(!offline.Decide(Identity, DriverApprovalService.EmbeddedReaderProfile,
+                    "1.0", "1.4.0").MayStart, "disabled refresh retains the missing-approval gate");
+            }
+
+            var liveHandler = new QueueHandler();
+            liveHandler.Enqueue(approved);
+            using (var client = new HttpClient(liveHandler))
+            using (var live = DriverApprovalService.CreateDefault(Path.Combine(folder, "live"),
+                startBackgroundRefresh: true, options, client, clock))
+            {
+                Check(liveHandler.Requests == 1,
+                    "enabled factory starts a background request without an explicit refresh call");
+                await live.RefreshAsync(force: false);
+                Check(liveHandler.Requests == 1 && live.CatalogRevision == 1 &&
+                    live.Decide(Identity, DriverApprovalService.EmbeddedReaderProfile, "1.0", "1.4.0").MayStart,
+                    "enabled factory retains authenticated background refresh");
+            }
+        }
+        finally { Directory.Delete(folder, recursive: true); }
     }
 
     private static void VerifierSecurityCases(ECDsa signingKey, SignedMetadataKey publicKey,

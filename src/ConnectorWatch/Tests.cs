@@ -156,6 +156,7 @@ public static class Tests
         CoarseRailGuardTests.Run();
         LoadQualifierTests.Run();
         TelemetryPhaseOneTests.Run();
+        RuntimeClockTests.Run();
         ReferenceLifecycleTests.Run();
         OfflineReplayTests.Run();
         DifferentialModelTests.Run();
@@ -170,6 +171,7 @@ public static class Tests
         ShadowReviewSchedulerTests.Run();
         EarlyWarningIntegrationTests.Run();
         OptionalMitigationTests.Run();
+        FailedSessionTests.Run();
         Console.WriteLine($"PASS: {passed} behavioral checks.");
     }
 }
