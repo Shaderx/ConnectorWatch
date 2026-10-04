@@ -63,7 +63,10 @@ public sealed record ControlRequest(
     bool ExplicitLegacyMigration = false,
     [property: JsonPropertyName("incident_id")]
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    string? IncidentId = null);
+    string? IncidentId = null,
+    [property: JsonPropertyName("auto_accept_reference")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    bool? AutoAcceptReference = null);
 
 /// <summary>Result returned by an identity-bound daemon command. This is kept
 /// separate from the pipe response so the existing hello/live/lease protocol
@@ -73,7 +76,8 @@ public sealed record ControlCommandResult(
     string Detail = "",
     string? ReferenceState = null,
     string? IncidentId = null,
-    string? IncidentState = null);
+    string? IncidentState = null,
+    bool? AutoAcceptReference = null);
 
 public sealed record ControlResponse(
     [property: JsonPropertyName("protocol")] int Protocol,
@@ -90,7 +94,9 @@ public sealed record ControlResponse(
     [property: JsonPropertyName("incident_id")]
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? IncidentId = null,
     [property: JsonPropertyName("incident_state")]
-    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? IncidentState = null);
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? IncidentState = null,
+    [property: JsonPropertyName("auto_accept_reference")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? AutoAcceptReference = null);
 
 public sealed record LiveTelemetry(string Status, string Header, string[] Rows);
 

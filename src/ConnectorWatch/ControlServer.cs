@@ -146,6 +146,7 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
                     "accept-reference" when identityMatches => true,
                     "migrate-reference" when identityMatches => true,
                     "archive-reference" when identityMatches => true,
+                    "set-auto-accept-reference" when identityMatches => true,
                     "acknowledge-incident" when identityMatches &&
                         !string.IsNullOrWhiteSpace(request.IncidentId) => true,
                     "resolve-incident" when identityMatches &&
@@ -153,7 +154,8 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
                     _ => false,
                 };
                 referenceCommandRequested = identityMatches && command is
-                    ("accept-reference" or "migrate-reference" or "archive-reference");
+                    ("accept-reference" or "migrate-reference" or "archive-reference" or
+                     "set-auto-accept-reference");
                 incidentCommandRequested = identityMatches && command is
                     ("acknowledge-incident" or "resolve-incident");
                 stopRequested = ok && command == "stop";
@@ -219,7 +221,8 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
             commandResult?.Detail,
             commandResult?.ReferenceState,
             commandResult?.IncidentId,
-            commandResult?.IncidentState);
+            commandResult?.IncidentState,
+            commandResult?.AutoAcceptReference);
     }
 
     bool GrantLeaseLocked(string clientId, long now)

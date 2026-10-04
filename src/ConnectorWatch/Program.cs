@@ -28,6 +28,10 @@ public sealed class Config
     public int FlushSeconds { get; set; } = 30;
     public string DataDirectory { get; set; } = "data";
     public bool DesktopAlerts { get; set; } = true;
+    // Automatic promotion is enabled for new and pre-1.5.1 configurations by
+    // default. An explicitly persisted false remains the operator opt-out;
+    // the daemon persists changes through the identity-bound control endpoint.
+    public bool AutoAcceptReference { get; set; } = true;
     // auto prefers a configured external source, then the direct Windows rail
     // provider. Explicit values are direct/nvapi, hwinfo, json, or none.
     public string VoltageSource { get; set; } = "auto";
@@ -655,6 +659,10 @@ internal sealed class DifferentialModelRuntime
 
     public DifferentialModelArtifact? Artifact { get; private set; }
     public int LearningSampleCount => learningSamples.Count;
+    // Monotonic admitted-evidence count. Unlike LearningSampleCount, this
+    // continues advancing when the bounded in-memory window evicts its oldest
+    // sample, so automatic fit retries cannot stop at the cap.
+    public long LearningSampleGeneration { get; private set; }
     public CompositeResidualDetectorResult? LastDetector { get; private set; }
     public DifferentialPrediction? LastPrediction { get; private set; }
     public DifferentialModelOptions Options => options;
@@ -665,6 +673,7 @@ internal sealed class DifferentialModelRuntime
         if (!artifact.Identity.Matches(options.Identity) || artifact.LoadProxy != options.LoadProxy)
             throw new InvalidDataException("Differential artifact identity does not match the current monitor.");
         Artifact = artifact;
+        LearningSampleGeneration = 0;
         detector.Reset();
         LastPrediction = null;
         LastDetector = null;
@@ -676,16 +685,28 @@ internal sealed class DifferentialModelRuntime
         var result = DifferentialModelTrainer.Fit(learningSamples, fitOptions);
         Artifact = result.Artifact;
         learningSamples.Clear();
+        LearningSampleGeneration = 0;
         detector.Reset();
         LastPrediction = null;
         LastDetector = null;
         return result;
     }
 
+    /// <summary>Checks whether the evidence collected so far can produce a
+    /// usable frozen model without changing runtime state. Automatic reference
+    /// acceptance uses this gate before applying the normal fit-and-freeze
+    /// pipeline.</summary>
+    public DifferentialModelFitResult PreviewFit(DateTimeOffset atUtc)
+    {
+        var fitOptions = options with { ArtifactCreatedAtUtc = atUtc.ToUniversalTime() };
+        return DifferentialModelTrainer.Fit(learningSamples, fitOptions);
+    }
+
     public void Archive()
     {
         Artifact = null;
         learningSamples.Clear();
+        LearningSampleGeneration = 0;
         detector.Reset();
         LastPrediction = null;
         LastDetector = null;
@@ -699,6 +720,7 @@ internal sealed class DifferentialModelRuntime
         if (admitted)
         {
             learningSamples.Add(sample);
+            LearningSampleGeneration++;
             while (learningSamples.Count > maximumLearningSamples)
                 learningSamples.RemoveAt(0);
         }
@@ -981,14 +1003,26 @@ public static class Program
         return result;
     }
 
-    private static int RunSession(string[] args)
+    internal static int RunSession(string[] args, RuntimeSessionOverrides? runtimeOverrides = null)
     {
         CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+        DateTimeOffset GetUtcNow() => runtimeOverrides?.UtcNow() ?? DateTimeOffset.UtcNow;
+        long GetMonotonicTimestamp() => runtimeOverrides?.MonotonicTimestamp() ?? Stopwatch.GetTimestamp();
         try
         {
             if (args.Contains("--self-test")) { Tests.Run(); return 0; }
             if (args.Contains("--approval-self-test")) { DriverApprovalTests.Run(); MaintainerValidationTests.Run(); ReleaseTrustPreparationTests.Run(); return 0; }
             if (args.Contains("--deployment-self-test")) { DeploymentTests.Run(); AppUpdateTests.Run(); return 0; }
+            if (args.Contains("--shadow-review-self-test")) { ShadowReviewSchedulerTests.Run(); return 0; }
+            if (args.Contains("--prediction-self-test"))
+            {
+                ShadowTelemetryReaderTests.Run();
+                ShadowPredictionEvaluationTests.Run();
+                ShadowPredictionCommandTests.Run();
+                ShadowReviewSchedulerTests.Run();
+                return 0;
+            }
+            if (ShadowPredictionCommand.TryHandle(args, out var predictionExit)) return predictionExit;
             if (ReleaseSignatureVerificationCommand.TryHandle(args, out var signatureExit)) return signatureExit;
             if (ReleaseTrustPreparation.TryRun(args, out var trustExit)) return trustExit;
             if (AppReleasePublication.TryHandle(args, out var appPublicationExit)) return appPublicationExit;
@@ -1025,26 +1059,42 @@ public static class Program
                     Option(args, "--operator"), Option(args, "--note"),
                     Option(args, "--incident-id"));
             using var singleInstance = new FileStream(Path.Combine(data, "monitor.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            string sessionInstanceId = Guid.NewGuid().ToString("N");
+            ControlServer? control = null;
+            Analysis? analysis = null;
+            SamplingProgressTracker? samplingProgress = null;
+            string? latestState = null;
+            try
+            {
             using var stop = new CancellationTokenSource();
             using var shutdown = RegisterShutdown(stop);
-            using var control = new ControlServer(data, stop);
+            using var controlLifetime = control = new ControlServer(data, stop, sessionInstanceId);
             control.Start();
             using var telemetryCompression = OperatingSystem.IsWindows()
-                ? new TelemetryCompressionMaintenance(data, LogRecoverableFailure)
+                ? new TelemetryCompressionMaintenance(data, ex => LogRecoverableFailure(ex, runtimeOverrides?.DiagnosticLogDirectory))
                 : null;
-            telemetryCompression?.Start(stop.Token);
+            if (runtimeOverrides?.SkipBackgroundMaintenance != true) telemetryCompression?.Start(stop.Token);
+            using var shadowReviews = new ShadowReviewScheduler(data,
+                (message, error) => LogRecoverableFailure(new InvalidOperationException(message, error), runtimeOverrides?.DiagnosticLogDirectory));
+            if (runtimeOverrides?.SkipBackgroundMaintenance != true) shadowReviews.Start(stop.Token);
             try { c.GpuUuid = Nvml.ResolveUuid(c.GpuUuid); }
             catch (Exception ex)
             {
                 return WriteStartupFailure(data, "GPU auto-detection", "GPU selection failed: " + ex.Message,
-                    control.InstanceId, new AnalysisProgress(0, c.BaselineSamples, 0, c.WindowSamples, 0, c.StableSamples));
+                    control.InstanceId, new AnalysisProgress(0, c.BaselineSamples, 0, c.WindowSamples, 0, c.StableSamples),
+                    autoAcceptReference: c.AutoAcceptReference);
             }
             var sourceMode = c.VoltageSource.Trim().ToLowerInvariant();
-            using var driverApprovals = DriverApprovalService.CreateDefault(data);
+            using var driverApprovals = DriverApprovalService.CreateDefault(data,
+                startBackgroundRefresh: runtimeOverrides?.SkipBackgroundMaintenance != true);
             ApprovalRailSource? directSource = null;
             IVoltageSource? voltageSource = null;
             string? sourceSetupError = null;
-            if (sourceMode == "none")
+            if (runtimeOverrides is not null)
+            {
+                voltageSource = runtimeOverrides.VoltageSource;
+            }
+            else if (sourceMode == "none")
             {
                 voltageSource = null;
             }
@@ -1121,20 +1171,24 @@ public static class Program
                 ? File.ReadAllText(referencePath)
                 : File.Exists(baselinePath) ? File.ReadAllText(baselinePath) : null;
             var referenceLoad = ReferencePersistence.Load(persistedReferenceJson, referenceIdentity,
-                DateTimeOffset.UtcNow,
+                GetUtcNow(),
                 new ReferenceStartupContext(
                     IsRestart: hasPersistedReference,
                     IsDegraded: voltageSource is null || sourceSetupError is not null,
                     Detail: sourceSetupError ?? ""));
             var lifecycle = referenceLoad.Lifecycle;
             var referenceGate = new object();
-            var analysis = new Analysis(c, BuildAnalysisBins(lifecycle, saved));
+            analysis = new Analysis(c, BuildAnalysisBins(lifecycle, saved));
             var differentialIdentity = BuildDifferentialIdentity(referenceIdentity);
             var differentialOptions = BuildDifferentialOptions(c, referenceIdentity);
             var differentialRuntime = new DifferentialModelRuntime(differentialOptions,
                 BuildResidualDetectorOptions(c, differentialIdentity));
             string differentialModelPath = Path.Combine(data, "differential-model.json");
             string? differentialModelDetail = null;
+            string autoAcceptReferenceDetail = c.AutoAcceptReference
+                ? "Waiting for a qualified learned reference candidate."
+                : "Automatic acceptance is disabled.";
+            long autoPreviewLearningGeneration = -1;
             if (lifecycle.Snapshot().CanAnalyze && File.Exists(differentialModelPath))
             {
                 try
@@ -1225,6 +1279,40 @@ public static class Program
                 Atomic(incidentsPath, incidentLedger.ToJson());
             void PersistPowerLimitWatchdogLocked() =>
                 Atomic(powerLimitWatchdogPath, powerLimitWatchdog.SerializeState());
+            ReferenceOperationResult ApplyAcceptedLocked(DateTimeOffset acceptedAtUtc,
+                string actor, string note, bool explicitLegacyMigration)
+            {
+                var operation = lifecycle.AcceptCandidate(acceptedAtUtc, actor, note,
+                    explicitLegacyMigration);
+                if (operation.Succeeded && lifecycle.Accepted is not null)
+                {
+                    analysis.ApplyAccepted(lifecycle.Accepted);
+                    // Acceptance is the only operation that may fit and
+                    // replace the immutable differential artifact.
+                    var fit = differentialRuntime.FitAndFreeze(acceptedAtUtc);
+                    differentialModelDetail = fit.Detail;
+                    PersistDifferentialModelLocked();
+                    PersistReferenceLocked();
+                }
+                return operation;
+            }
+            bool TryAutomaticallyAcceptLocked(DateTimeOffset now,
+                ElectricalSample? electrical, Voltage? voltage)
+            {
+                bool sourceHealthy = !IsSourceDegraded(electrical, voltage, sourceSetupError);
+                bool accepted = ReferenceAutoAcceptance.TryAccept(lifecycle,
+                    c.AutoAcceptReference, sourceHealthy,
+                    differentialRuntime.LearningSampleGeneration,
+                    ref autoPreviewLearningGeneration,
+                    differentialOptions.MinimumSamples,
+                    () => differentialRuntime.PreviewFit(now),
+                    () => ApplyAcceptedLocked(now, "auto",
+                        "Automatic acceptance enabled.", explicitLegacyMigration: false),
+                    out var attemptDetail);
+                if (!string.IsNullOrWhiteSpace(attemptDetail))
+                    autoAcceptReferenceDetail = attemptDetail;
+                return accepted;
+            }
             ControlCommandResult? HandleReferenceCommand(ControlRequest request)
             {
                 lock (referenceGate)
@@ -1233,25 +1321,37 @@ public static class Program
                     string actor = string.IsNullOrWhiteSpace(request.Operator)
                         ? request.ClientId : request.Operator.Trim();
                     string note = request.Note?.Trim() ?? "";
-                    DateTimeOffset now = DateTimeOffset.UtcNow;
+                    DateTimeOffset now = GetUtcNow();
+                    if (command == "set-auto-accept-reference")
+                    {
+                        if (!request.AutoAcceptReference.HasValue)
+                            return new(false, "auto_accept_reference is required.",
+                                lifecycle.State.WireName(),
+                                AutoAcceptReference: c.AutoAcceptReference);
+
+                        bool enabled = request.AutoAcceptReference.Value;
+                        ConfigPersistence.SetAutoAcceptReference(configPath, enabled);
+                        c.AutoAcceptReference = enabled;
+                        autoPreviewLearningGeneration = -1;
+                        autoAcceptReferenceDetail = enabled
+                            ? "Waiting for a qualified learned reference candidate."
+                            : "Automatic acceptance is disabled.";
+                        return new(true,
+                            enabled ? "Automatic acceptance enabled."
+                                : "Automatic acceptance disabled.",
+                            lifecycle.State.WireName(),
+                            AutoAcceptReference: enabled);
+                    }
+
                     ReferenceOperationResult operation;
                     if (command is "accept-reference" or "migrate-reference")
                     {
-                        operation = lifecycle.AcceptCandidate(now, actor, note,
+                        operation = ApplyAcceptedLocked(now, actor, note,
                             explicitLegacyMigration: command == "migrate-reference" ||
                                 request.ExplicitLegacyMigration);
-                        if (operation.Succeeded && lifecycle.Accepted is not null)
-                        {
-                            analysis.ApplyAccepted(lifecycle.Accepted);
-                            // Acceptance is the only operation that may fit
-                            // and replace the immutable differential artifact.
-                            var fit = differentialRuntime.FitAndFreeze(now);
-                            differentialModelDetail = fit.Detail;
-                            PersistDifferentialModelLocked();
-                            PersistReferenceLocked();
-                        }
                         return new(operation.Succeeded, operation.Detail,
-                            lifecycle.State.WireName());
+                            lifecycle.State.WireName(),
+                            AutoAcceptReference: c.AutoAcceptReference);
                     }
 
                     try
@@ -1262,11 +1362,17 @@ public static class Program
                         differentialRuntime.Archive();
                         differentialModelDetail = "Differential artifact is inactive until the next explicit reference acceptance.";
                         PersistReferenceLocked();
-                        return new(true, lifecycle.Detail, lifecycle.State.WireName());
+                        autoPreviewLearningGeneration = -1;
+                        autoAcceptReferenceDetail = c.AutoAcceptReference
+                            ? "Waiting for a qualified learned reference candidate."
+                            : "Automatic acceptance is disabled.";
+                        return new(true, lifecycle.Detail, lifecycle.State.WireName(),
+                            AutoAcceptReference: c.AutoAcceptReference);
                     }
                     catch (InvalidOperationException ex)
                     {
-                        return new(false, ex.Message, lifecycle.State.WireName());
+                        return new(false, ex.Message, lifecycle.State.WireName(),
+                            AutoAcceptReference: c.AutoAcceptReference);
                     }
                 }
             }
@@ -1284,9 +1390,9 @@ public static class Program
                     {
                         if (command == "acknowledge-incident")
                             _ = incidentLedger.Acknowledge(incidentId,
-                                DateTimeOffset.UtcNow, actor, note);
+                                GetUtcNow(), actor, note);
                         else if (command == "resolve-incident")
-                            _ = incidentLedger.Resolve(incidentId, DateTimeOffset.UtcNow,
+                            _ = incidentLedger.Resolve(incidentId, GetUtcNow(),
                                 actor, note);
                         else
                             return new(false, "Unknown incident command.",
@@ -1306,34 +1412,34 @@ public static class Program
                 }
             }
             control.IncidentCommand = HandleIncidentCommand;
-            Nvml nvml;
-            try { nvml = new Nvml(c.GpuUuid); }
+            Nvml? nvml = null;
+            try { if (runtimeOverrides is null) nvml = new Nvml(c.GpuUuid); }
             catch (Exception ex)
             {
                 return WriteStartupFailure(data, "NVML", "NVML initialization failed: " + ex.Message,
-                    control.InstanceId, analysis.Progress, lifecycle.Snapshot());
+                    control.InstanceId, analysis.Progress, lifecycle.Snapshot(), c.AutoAcceptReference);
             }
             using var nvmlLifetime = nvml;
             int count = int.Parse(Option(args, "--samples") ?? "0"); int n = 0;
             DateTimeOffset? lastSensor = null; string? previousStatus = null;
             bool alertPresentedForCurrentStatus = false;
             var clock = Stopwatch.StartNew(); double next = 0;
-            long startedMonotonic = Stopwatch.GetTimestamp();
+            long startedMonotonic = GetMonotonicTimestamp();
             var pollTimingTracker = new PollTimingTracker();
-            var samplingProgress = new SamplingProgressTracker(control.InstanceId,
-                DateTimeOffset.UtcNow, startedMonotonic,
+            samplingProgress = new SamplingProgressTracker(control.InstanceId,
+                GetUtcNow(), startedMonotonic,
                 staleAfterSeconds: Math.Max(c.MaxAgeSeconds, c.SampleSeconds * 3),
                 startupGraceSeconds: Math.Max(c.MaxAgeSeconds, c.SampleSeconds * 3));
             var coverageTracker = new AnalysisCoverageTracker(TimeSpan.FromMinutes(30));
             long? priorCompletedPoll = null;
+            DateTimeOffset? priorCoverageTimestamp = null;
             var storage = new HybridStorage(data, c.FlushSeconds);
-            string? latestState = null;
             bool restartForDriverChange = false;
             Console.WriteLine("ConnectorWatch: read-only telemetry. Ctrl+C/SIGTERM stops. No status certifies connector safety.");
             while (!stop.IsCancellationRequested && (count == 0 || n < count))
             {
-                var now = DateTimeOffset.UtcNow; var g = nvml.Read(); Voltage? v = null; ElectricalSample? electrical = null;
-                long pollStartMonotonic = Stopwatch.GetTimestamp();
+                var now = GetUtcNow(); var g = runtimeOverrides?.ReadGpu() ?? nvml!.Read(); Voltage? v = null; ElectricalSample? electrical = null;
+                long pollStartMonotonic = GetMonotonicTimestamp();
                 string status = sourceSetupError != null ? "VOLTAGE_UNAVAILABLE" : "VOLTAGE_NOT_CONFIGURED";
                 string detail = sourceSetupError ?? "";
                 Exception? terminalFailure = null;
@@ -1362,7 +1468,7 @@ public static class Program
                         terminalFailure = ex;
                     }
                 }
-                long pollEndMonotonic = Stopwatch.GetTimestamp();
+                long pollEndMonotonic = GetMonotonicTimestamp();
                 var pollTiming = pollTimingTracker.Record(pollStartMonotonic, pollEndMonotonic, now,
                     electrical is null ? new RawElectricalObservation() :
                         RawElectricalObservation.FromElectricalSample(electrical));
@@ -1422,9 +1528,7 @@ public static class Program
                     {
                         PersistReferenceLocked();
                     }
-                    referenceStatus = lifecycle.Snapshot();
-                    referenceChanged = beforeState != referenceStatus.State ||
-                        beforeCandidateQualified != (referenceStatus.Candidate?.IsQualified == true);
+                    var lifecycleBeforeAuto = lifecycle.Snapshot();
 
                     if (newSensor && electrical is not null && v is not null)
                     {
@@ -1434,12 +1538,18 @@ public static class Program
                             temperatureC: g.Temperature,
                             isSettled: result.LoadQualification?.IsQualified == true,
                             identity: differentialIdentity.CanonicalKey);
-                        bool candidateLearning = referenceStatus.State ==
+                        bool candidateLearning = lifecycleBeforeAuto.State ==
                                 ReferenceLifecycleState.REFERENCE_UNVERIFIED &&
-                            referenceStatus.Compatibility is ReferenceCompatibility.COMPATIBLE or
+                            lifecycleBeforeAuto.Compatibility is ReferenceCompatibility.COMPATIBLE or
                                 ReferenceCompatibility.RESTART or ReferenceCompatibility.LEGACY;
                         differentialObservation = differentialRuntime.Observe(differentialSample,
                             candidateLearning);
+
+                        // Run the preview after admitting this sample so a
+                        // restarted daemon can qualify a persisted candidate
+                        // from fresh evidence. The helper still rejects stale,
+                        // mismatched, legacy, or already-accepted lifecycles.
+                        _ = TryAutomaticallyAcceptLocked(now, electrical, v);
 
                         bool residualAlert = differentialObservation.Detector.IsAlert;
                         bool legacyAlert = result.Status is "SUDDEN_DROOP" or "BASELINE_SHIFT" or
@@ -1473,6 +1583,15 @@ public static class Program
                             incidentObservation = incidentLedger.Observe(observation);
                         }
                     }
+                    else
+                    {
+                        // Keep the live policy detail actionable while a
+                        // persisted candidate waits for a healthy source.
+                        _ = TryAutomaticallyAcceptLocked(now, electrical, v);
+                    }
+                    referenceStatus = lifecycle.Snapshot();
+                    referenceChanged = beforeState != referenceStatus.State ||
+                        beforeCandidateQualified != (referenceStatus.Candidate?.IsQualified == true);
                     if (powerLimitResult.IncidentLatched)
                     {
                         var powerObservation = new IncidentObservation(now,
@@ -1490,6 +1609,18 @@ public static class Program
                     ? MonotonicTime.ElapsedSeconds(priorCompletedPoll.Value, pollEndMonotonic) ?? 0
                     : 0;
                 priorCompletedPoll = pollEndMonotonic;
+                bool coverageClockGap = priorCoverageTimestamp.HasValue && now < priorCoverageTimestamp.Value;
+                if (coverageClockGap)
+                {
+                    // UTC observations cannot span a backward host-clock step.
+                    // Start a new coverage interval without changing source or
+                    // monotonic sampling continuity. Compare each adjacent poll
+                    // so the corrected clock need not catch up to the old UTC.
+                    coverageTracker.Gap(now);
+                    sampleDuration = 0;
+                    detail = "Host UTC clock moved backwards; coverage continuity reset. " + detail;
+                }
+                priorCoverageTimestamp = now;
                 bool loadKnown = analysisPower.HasValue;
                 bool loaded = analysisPower >= c.MinAnalysisWatts ||
                     !loadKnown && (g.Power >= c.MinAnalysisWatts || !g.Power.HasValue);
@@ -1559,6 +1690,8 @@ public static class Program
                     timestamp_utc = now,
                     gpu = g,
                     voltage = v,
+                    auto_accept_reference = c.AutoAcceptReference,
+                    auto_accept_reference_detail = autoAcceptReferenceDetail,
                     voltage_source = voltageSource?.Description,
                     driver_approval = directSource?.Diagnostics,
                     electrical,
@@ -1669,6 +1802,8 @@ public static class Program
                     throw new Exception("ConnectorWatch stopped after a terminal voltage-source failure.", terminalFailure);
                 }
                 n++;
+                runtimeOverrides?.SampleCompleted?.Invoke(n, latestState);
+                if (runtimeOverrides?.SkipSampleWait == true) continue;
                 next += c.SampleSeconds;
                 if (next < clock.Elapsed.TotalSeconds) next = clock.Elapsed.TotalSeconds;
                 while (!stop.IsCancellationRequested && clock.Elapsed.TotalSeconds < next)
@@ -1687,7 +1822,11 @@ public static class Program
             }
             samplingProgress.MarkStopped(control.StopRequested ? "control" : stop.IsCancellationRequested ? "signal" : "sample_limit");
             MarkStopped(Path.Combine(data, "status.json"), control.StopRequested ? "control" : stop.IsCancellationRequested ? "signal" : "sample_limit",
-                control, analysis.Progress, samplingProgress.Snapshot(Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow));
+                control, analysis.Progress, samplingProgress.Snapshot(GetMonotonicTimestamp(), GetUtcNow()),
+                c.AutoAcceptReference, latestState,
+                stoppedAtUtc: GetUtcNow(),
+                beforeWrite: runtimeOverrides?.BeforeStoppedStatusWrite,
+                diagnosticLogDirectory: runtimeOverrides?.DiagnosticLogDirectory);
             lock (referenceGate)
             {
                 PersistReferenceLocked();
@@ -1697,13 +1836,35 @@ public static class Program
             }
             if (stop.IsCancellationRequested) Console.WriteLine("ConnectorWatch: shutdown requested; state saved.");
             return restartForDriverChange ? 42 : 0;
+            }
+            catch (Exception ex)
+            {
+                // Finalize only inside the lock-owning scope. The outer catch
+                // must retain the original error after releasing the lock.
+                try
+                {
+                    var stoppedAtUtc = GetUtcNow();
+                    samplingProgress?.MarkStopped("failure");
+                    MarkStopped(Path.Combine(data, "status.json"), "failure", control,
+                        analysis?.Progress, samplingProgress?.Snapshot(GetMonotonicTimestamp(), stoppedAtUtc),
+                        c.AutoAcceptReference, latestState, ex, stoppedAtUtc,
+                        runtimeOverrides?.BeforeStoppedStatusWrite,
+                        runtimeOverrides?.DiagnosticLogDirectory, sessionInstanceId);
+                }
+                catch (Exception finalizationError)
+                {
+                    LogRecoverableFailure(new IOException("ConnectorWatch could not mark stopped state: " +
+                        finalizationError.Message, finalizationError), runtimeOverrides?.DiagnosticLogDirectory);
+                }
+                throw;
+            }
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine("ConnectorWatch stopped: " + (args.Contains("--self-test") ? ex.ToString() : ex.Message));
             try
             {
-                string logs = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ConnectorWatch", "logs");
+                string logs = runtimeOverrides?.DiagnosticLogDirectory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ConnectorWatch", "logs");
                 Directory.CreateDirectory(logs);
                 string log = Path.Combine(logs, "errors.log");
                 if (File.Exists(log) && new FileInfo(log).Length > 1024 * 1024) File.Move(log, log + ".previous", true);
@@ -1715,12 +1876,12 @@ public static class Program
     }
     static string? Option(string[] args, string name) { int i = Array.IndexOf(args, name); return i < 0 ? null : i + 1 < args.Length ? args[i + 1] : throw new Exception("Missing value for " + name); }
 
-    static void LogRecoverableFailure(Exception ex)
+    static void LogRecoverableFailure(Exception ex, string? diagnosticLogDirectory = null)
     {
         Console.Error.WriteLine("ConnectorWatch recoverable failure: " + ex.Message);
         try
         {
-            string logs = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ConnectorWatch", "logs");
+            string logs = diagnosticLogDirectory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ConnectorWatch", "logs");
             Directory.CreateDirectory(logs);
             string log = Path.Combine(logs, "errors.log");
             if (File.Exists(log) && new FileInfo(log).Length > 1024 * 1024) File.Move(log, log + ".previous", true);
@@ -1767,17 +1928,26 @@ public static class Program
     static void Atomic(string path, string value) => HybridStorage.Atomic(path, value);
 
     static void MarkStopped(string path, string reason, ControlServer? control = null,
-        AnalysisProgress? progress = null, SamplingProgressContract? samplingProgress = null)
+        AnalysisProgress? progress = null, SamplingProgressContract? samplingProgress = null,
+        bool? autoAcceptReference = null, string? latestState = null,
+        Exception? failure = null, DateTimeOffset? stoppedAtUtc = null,
+        Action<string, string>? beforeWrite = null, string? diagnosticLogDirectory = null,
+        string? instanceId = null)
     {
         try
         {
+            var stoppedAt = stoppedAtUtc ?? DateTimeOffset.UtcNow;
+            var currentInstanceId = control?.InstanceId ?? instanceId ?? Guid.NewGuid().ToString("N");
+            JsonObject? existing = latestState is not null
+                ? JsonNode.Parse(latestState) as JsonObject
+                : File.Exists(path) ? JsonNode.Parse(File.ReadAllText(path)) as JsonObject : null;
             JsonObject state;
-            if (File.Exists(path) && JsonNode.Parse(File.ReadAllText(path)) is JsonObject existing)
+            if (existing is not null && existing["instance_id"]?.ToString() == currentInstanceId)
                 state = existing;
             else
                 state = new JsonObject
                 {
-                    ["timestamp_utc"] = DateTimeOffset.UtcNow,
+                    ["timestamp_utc"] = null,
                     ["gpu"] = null,
                     ["voltage"] = null,
                     ["electrical"] = null,
@@ -1787,7 +1957,9 @@ public static class Program
                 };
             state["schema_version"] = 3;
             state["process_id"] = control?.ProcessId ?? Environment.ProcessId;
-            state["instance_id"] = control?.InstanceId ?? Guid.NewGuid().ToString("N");
+            state["instance_id"] = currentInstanceId;
+            if (autoAcceptReference.HasValue)
+                state["auto_accept_reference"] = autoAcceptReference.Value;
             if (progress is not null)
             {
                 state["progress"] = new JsonObject
@@ -1804,17 +1976,64 @@ public static class Program
                 state["sampling_progress"] = JsonSerializer.SerializeToNode(samplingProgress, Json);
             state["stopped"] = true;
             state["stop_reason"] = reason;
-            state["stopped_at_utc"] = DateTimeOffset.UtcNow;
-            Atomic(path, state.ToJsonString(Json));
+            state["stopped_at_utc"] = stoppedAt;
+            if (failure is not null)
+            {
+                string failureReason = (failure.GetType().Name + ": " + failure.Message)
+                    .Replace('\r', ' ').Replace('\n', ' ');
+                state["failure_reason"] = failureReason.Length > 512 ? failureReason[..512] : failureReason;
+            }
+            else
+                state.Remove("failure_reason");
+            if (state["acquisition"] is JsonObject acquisition)
+            {
+                bool nativeFailure = acquisition["status"]?.ToString() == AcquisitionHealthStatus.NATIVE_FAILURE.WireName();
+                if (!nativeFailure)
+                    acquisition["status"] = AcquisitionHealthStatus.SOURCE_UNAVAILABLE.WireName();
+                acquisition["monitor_running"] = false;
+                acquisition["analysis_available"] = false;
+                acquisition["source_available"] = false;
+                acquisition["fresh"] = false;
+                acquisition["power_available"] = false;
+                acquisition["freshness_known"] = false;
+                acquisition["MonitorAvailable"] = false;
+                acquisition["StatusName"] = acquisition["status"]!.ToString();
+                acquisition["host_timestamp_utc"] = stoppedAt;
+                acquisition["sample_age_seconds"] = samplingProgress?.SampleAgeSeconds;
+                if (!nativeFailure)
+                    acquisition["detail"] = "Monitor stopped: " + reason + ".";
+                if (acquisition["detectors"] is JsonObject detectors)
+                {
+                    foreach (var entry in detectors)
+                    {
+                        if (entry.Value is not JsonObject detector) continue;
+                        detector["available"] = false;
+                        detector["IsAvailable"] = false;
+                        bool detectorNativeFailure = detector["reason"]?.ToString() == DetectorAvailabilityReason.NATIVE_FAILURE.WireName();
+                        detector["reason"] = nativeFailure || detectorNativeFailure
+                            ? DetectorAvailabilityReason.NATIVE_FAILURE.WireName()
+                            : DetectorAvailabilityReason.MONITOR_UNAVAILABLE.WireName();
+                        detector["ReasonName"] = detector["reason"]!.ToString();
+                        detector["updated_at_utc"] = stoppedAt;
+                        if (!nativeFailure && !detectorNativeFailure)
+                            detector["detail"] = "Monitor stopped: " + reason + ".";
+                    }
+                }
+            }
+            string finalState = state.ToJsonString(Json);
+            beforeWrite?.Invoke(path, finalState);
+            Atomic(path, finalState);
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine("ConnectorWatch could not mark stopped state: " + ex.Message);
+            LogRecoverableFailure(new IOException("ConnectorWatch could not mark stopped state: " +
+                ex.Message, ex), diagnosticLogDirectory);
         }
     }
 
     static int WriteStartupFailure(string data, string source, string detail, string? instanceId = null,
-        AnalysisProgress? progress = null, ReferenceStatusSnapshot? referenceLifecycle = null)
+        AnalysisProgress? progress = null, ReferenceStatusSnapshot? referenceLifecycle = null,
+        bool? autoAcceptReference = null)
     {
         var now = DateTimeOffset.UtcNow;
         var result = new Result("VOLTAGE_UNAVAILABLE", null, null, null, null, null);
@@ -1829,6 +2048,7 @@ public static class Program
                 timestamp_utc = now,
                 gpu = new Gpu(null, null, null, null),
                 voltage = (Voltage?)null,
+                auto_accept_reference = autoAcceptReference,
                 voltage_source = source,
                 electrical = (ElectricalSample?)null,
                 analysis_load = (AnalysisLoadSelection?)null,

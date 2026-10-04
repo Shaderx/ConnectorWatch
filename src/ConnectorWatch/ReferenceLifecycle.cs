@@ -688,6 +688,9 @@ public sealed class ReferenceLifecycle
     public ReferenceCompatibility Compatibility => compatibility;
     public ReferenceCandidateModel? Candidate => candidate;
     public AcceptedReferenceModel? Accepted => accepted;
+    /// <summary>True when the active model came from an imported legacy
+    /// baseline and still requires an explicit migration acknowledgement.</summary>
+    public bool RequiresExplicitMigration => requiresExplicitMigration;
     public DateTimeOffset UpdatedAtUtc => updatedAtUtc;
     public string Detail => detail;
     public IReadOnlyList<ArchivedReferenceModel> Archived =>

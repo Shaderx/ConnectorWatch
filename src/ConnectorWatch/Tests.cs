@@ -156,15 +156,22 @@ public static class Tests
         CoarseRailGuardTests.Run();
         LoadQualifierTests.Run();
         TelemetryPhaseOneTests.Run();
+        RuntimeClockTests.Run();
         ReferenceLifecycleTests.Run();
         OfflineReplayTests.Run();
         DifferentialModelTests.Run();
         ResidualDetectorTests.Run();
         IncidentLatchingTests.Run();
         PowerLimitWatchdogTests.Run();
+        AutoAcceptReferenceTests.Run();
         RecordedDataCharacterizationTests.Run();
+        ShadowTelemetryReaderTests.Run();
+        ShadowPredictionEvaluationTests.Run();
+        ShadowPredictionCommandTests.Run();
+        ShadowReviewSchedulerTests.Run();
         EarlyWarningIntegrationTests.Run();
         OptionalMitigationTests.Run();
+        FailedSessionTests.Run();
         Console.WriteLine($"PASS: {passed} behavioral checks.");
     }
 }

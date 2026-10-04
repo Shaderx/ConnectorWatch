@@ -17,6 +17,11 @@ flowchart LR
     A --> P[(data/ telemetry, status, models, incidents)]
     I --> P
     D --> Q[Current-user control pipe]
+    D --> S[Weekly review scheduler]
+    S --> E[Isolated offline evaluator]
+    P --> E
+    E --> U[(Local shadow reports and summaries)]
+    U --> G
     P --> G[ConnectorWatch.Gui WPF dashboard]
     Q --> G
     G --> T[Tray, charts, warnings, settings]
@@ -30,13 +35,17 @@ The default public configuration selects `VoltageSource: "direct"` and `Analysis
 
 The newline-delimited JSON adapter reads at most the newest 128 KiB from the file tail. When that window begins inside a record it discards the partial leading bytes, ignores an unterminated append, and returns the newest complete non-empty record. A single record larger than the bound is unavailable unless a later complete record fits in the window; the adapter never rescans an unbounded growing file.
 
-The analyzer groups eligible samples into 25 W bins. It waits for stable samples after a load transition, learns a per-bin median and fifth percentile, and publishes a candidate snapshot. Candidate values remain outside comparison until an identity-bound operator command explicitly accepts them. Acceptance freezes both the snapshot and a robust differential voltage model fitted from qualified evidence using one labelled load proxy and available operating-condition features. Later learning can produce a separate candidate without mutating accepted artifacts. `accept-reference`, `migrate-reference`, and `archive-reference` commands are instance-checked by the current-user control endpoint. A source degradation leaves accepted evidence available for forensics but marks it stale and prevents comparison; a GPU/source/configuration mismatch marks it invalid.
+The analyzer groups eligible samples into 25 W bins. It waits for stable samples after a load transition, learns a per-bin median and fifth percentile, and publishes a candidate snapshot. Candidate values remain outside comparison until accepted through an identity-bound operator command or the saved `AutoAcceptReference` policy (enabled by default). The GUI exposes manual acceptance and the automatic policy; the daemon persists and executes the policy even when the GUI is closed. Automatic acceptance requires a qualified learned candidate, valid identity and source, and no accepted model; it cannot migrate legacy evidence or replace an accepted baseline. Both paths freeze the snapshot and a robust differential voltage model fitted from qualified evidence using one labelled load proxy and available operating-condition features. Later learning can produce a separate candidate without mutating accepted artifacts. `accept-reference`, `migrate-reference`, `archive-reference`, and `set-auto-accept-reference` commands are instance-checked by the current-user control endpoint. A source degradation leaves accepted evidence available for forensics but marks it stale and prevents comparison; a GPU/source/configuration mismatch marks it invalid.
 
 The differential model emits expected voltage, residual, and an explicitly unit-labelled descriptive slope. A fast residual detector and a time-aware EWMA detector consume that output. Missing samples, insufficient coverage, poor conditioning, discontinuities, and stale sources remain explicit states rather than being filled or reinterpreted. Detector transitions latch incidents with deterministic identifiers and bounded pre-trigger, trigger, and post-trigger windows. Acknowledgement and resolution are separate operator records and neither mutates a reference. The reported slope is not represented as connector resistance.
 
 The power-limit watchdog records the optional configured desired cap, reported management limit, enforced limit where supported, connector power, board power, identity, and time continuity as independent nullable channels. It detects drift, staleness, discontinuity, and bounded non-enforcement without exposing a hardware write path. Unsupported enforcement telemetry is `PARTIALLY_VERIFIED`, not inferred from board power. A separate optional mitigation policy is disabled by default and tested only through fake authorization, adapter, audit, and bounded load-observation seams. Its lifecycle distinguishes requested, accepted readback, verified load reduction, and failure/unobservable states; no production/native adapter or helper is wired to it.
 
+If host UTC moves backward between polls, the daemon records an explicit `GENUINE_GAP` coverage reset before the first corrected observation. Coverage does not span the clock step. Observations retain actual UTC timestamps; poll durations and sampling progress use monotonic time. Later increasing timestamps enter the corrected interval without repeated resets while UTC catches up. Sampling can continue while existing freshness and analysis gates report unavailable. Accepted reference values and archived history remain intact.
+
 The daemon publishes live status and up to 512 recent CSV rows (512 KiB text cap) through the instance-checked `live` control command. Routine daily telemetry and transitions accumulate in bounded RAM, then flush with status, the legacy baseline mirror, and the versioned reference lifecycle every `FlushSeconds` (30 by default, 1–60 allowed), at the buffer threshold, on an urgent warning/failure, and on graceful shutdown. The GUI merges pipe history with disk history using observation timestamps. `status.json` is a checkpoint and can lag live state by the flush interval. Atomic replacements and append opens retry temporary Windows sharing/access failures with bounded backoff; appends are not retried after writing may have begun. A lock file prevents multiple writers from using one data directory. On a clean signal, control stop, or finite sample run it marks the status as stopped and saves the lifecycle. File and terminal voltage-source failures are surfaced as process failure; the logger does not continue while claiming that monitoring is live.
+
+After an unexpected failure in a session that owns `monitor.lock`, the daemon attempts a stopped checkpoint with `stop_reason: "failure"` before releasing the lock. `stopped_at_utc` records the stop time separately from `timestamp_utc` and the last completed sample time, which retain their measurement values. The daemon preserves the original failure diagnostic and exits with a nonzero code. If the final status write fails, it also reports that write failure in diagnostics.
 
 ## Direct native reader and identity gates
 
@@ -75,6 +84,19 @@ The GUI's five-second heartbeat lease controls who presents desktop warnings. If
 History loading is bounded. The GUI considers at most the newest two daily files, caps the initial tail per file, caps retained voltage observations and warning records, rejects oversized records, and reads with pooled chunks. It preserves gaps and reports truncation in the UI. Identifier sets use FIFO bounds, chart brushes are reused and frozen, and warning controls are rebuilt only when their contents change. These limits bound application-owned collections; they do not promise that Windows, WPF, or a future driver has no unrelated cache growth.
 
 ## Analysis and persistence contract
+
+`ShadowReviewScheduler` owns background prediction reviews, retry scheduling,
+child-process cancellation, and atomic summary publication. Its evaluator child
+reads completed telemetry files through the offline command, which dispatches
+before native initialization. Review state and immutable reports live outside
+the telemetry directory. A separate lock guards one scheduler for each normalized
+data path. The sampling loop does not wait for evaluation.
+
+`ShadowReviewContracts` is the shared file contract. The GUI reads a bounded
+snapshot at most every 30 seconds and displays recent summaries. It does not
+link the evaluator or use these results to change an accepted reference or live
+alert. See [prediction reviews](PREDICTION-REVIEW.md) for scheduling, storage, and
+simulation comparability.
 
 The main files are:
 

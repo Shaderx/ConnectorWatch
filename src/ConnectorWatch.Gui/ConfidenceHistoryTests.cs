@@ -31,6 +31,8 @@ public static class ConfidenceHistoryTests
         ReturnedReferenceSurvivesExpiry(report);
         CheckpointWritesAreThrottledAndFlushable(report);
         CompressedHistoryMatchesPlainAndArchiveConversion(report);
+        AcceptedReferenceReplayUsesCurrentModel(report);
+        AcceptedReferenceReplayPreservesGatesAndGzip(report);
     }
 
     /// <summary>
@@ -472,6 +474,107 @@ public static class ConfidenceHistoryTests
         }
     }
 
+    static void AcceptedReferenceReplayUsesCurrentModel(Action<bool, string> report)
+    {
+        string directory = TemporaryDirectory("accepted-replay");
+        try
+        {
+            DateTimeOffset now = new(2036, 12, 20, 12, 0, 0, TimeSpan.Zero);
+            DateTimeOffset day = UtcDay(now.AddDays(-2));
+            var rows = Rows(day.AddHours(1), 12.5, 11.9, 5,
+                status: "LEARNING_REFERENCE");
+            WriteRows(directory, day, rows);
+            string sourcePath = Path.Combine(directory,
+                $"telemetry-{day:yyyy-MM-dd}.csv");
+            byte[] original = File.ReadAllBytes(sourcePath);
+            string cache = Path.Combine(directory, "confidence-replay-history.json");
+            var history = new ConfidenceHistory(directory, cache, 25,
+                replayAcceptedReference: true);
+
+            history.RefreshAsync(now).GetAwaiter().GetResult();
+            report(history.Days.Count == 0 && history.Status.Contains("missing",
+                    StringComparison.OrdinalIgnoreCase),
+                "retrospective replay fails closed while the accepted reference is missing");
+
+            WriteAcceptedReference(directory, "GPU-A", "connector", "CONNECTOR_POWER",
+                (425, 12.0));
+            history.RefreshAsync(now).GetAwaiter().GetResult();
+            var accepted = history.Days.Single(record => record.Day == day);
+            report(accepted.ObservationCount == 5 && accepted.MedianDropMv is double drop &&
+                Math.Abs(drop - 100) < .001 &&
+                history.Status.Contains("accepted reference", StringComparison.OrdinalIgnoreCase) &&
+                history.Status.Contains("matched 5", StringComparison.OrdinalIgnoreCase),
+                "accepted reference replay scores preacceptance rows and reports match count");
+            report(original.SequenceEqual(File.ReadAllBytes(sourcePath)),
+                "accepted reference replay leaves raw telemetry unchanged");
+
+            string timestampOnly = File.ReadAllText(Path.Combine(directory, "reference.json"))
+                .Replace("2036-01-01T00:00:00Z", "2036-01-02T00:00:00Z",
+                    StringComparison.Ordinal);
+            File.WriteAllText(Path.Combine(directory, "reference.json"), timestampOnly,
+                new UTF8Encoding(false));
+            history.RefreshAsync(now.AddMinutes(1)).GetAwaiter().GetResult();
+            var timestampRecord = history.Days.Single(record => record.Day == day);
+            report(timestampRecord.MedianDropMv is double stableDrop &&
+                Math.Abs(stableDrop - 100) < .001,
+                "lifecycle timestamp noise does not change accepted replay identity (" +
+                (timestampRecord.MedianDropMv?.ToString("R", CultureInfo.InvariantCulture) ?? "null") +
+                "; " + history.Status + ")");
+
+            WriteAcceptedReference(directory, "GPU-A", "connector", "CONNECTOR_POWER",
+                (425, 11.8));
+            var restarted = new ConfidenceHistory(directory, cache, 25,
+                replayAcceptedReference: true);
+            restarted.RefreshAsync(now.AddMinutes(2)).GetAwaiter().GetResult();
+            report(restarted.Days.Single(record => record.Day == day).MedianDropMv is double changedDrop &&
+                Math.Abs(changedDrop + 100) < .001,
+                "changed accepted bin invalidates the replay cache after restart");
+
+            File.Delete(Path.Combine(directory, "reference.json"));
+            restarted.RefreshAsync(now.AddMinutes(3)).GetAwaiter().GetResult();
+            report(restarted.Days.Count == 0 && restarted.Status.Contains("missing",
+                    StringComparison.OrdinalIgnoreCase),
+                "removing the accepted reference clears replay output");
+        }
+        finally { DeleteTemporaryDirectory(directory); }
+    }
+
+    static void AcceptedReferenceReplayPreservesGatesAndGzip(Action<bool, string> report)
+    {
+        string directory = TemporaryDirectory("accepted-replay-gzip");
+        try
+        {
+            DateTimeOffset now = new(2037, 1, 20, 12, 0, 0, TimeSpan.Zero);
+            DateTimeOffset day = UtcDay(now.AddDays(-2));
+            var qualifying = Rows(day.AddHours(1), 12.0, 11.9, 5,
+                status: "LEARNING_REFERENCE");
+            var settling = Rows(day.AddHours(2), 12.0, 11.9, 5,
+                status: "LOAD_SETTLING");
+            var stale = Rows(day.AddHours(3), 12.0, 11.9, 5,
+                health: "STALE", status: "NO_SHIFT_DETECTED");
+            var wrongIdentity = Rows(day.AddHours(4), 12.0, 11.9, 5,
+                gpu: "GPU-OTHER", status: "NO_SHIFT_DETECTED");
+            WriteGzipRows(directory, day,
+                qualifying.Concat(settling).Concat(stale).Concat(wrongIdentity));
+            WriteAcceptedReference(directory, "GPU-A", "connector", "CONNECTOR_POWER",
+                (425, 12.0));
+
+            var history = new ConfidenceHistory(directory,
+                Path.Combine(directory, "confidence-replay-history.json"), 25,
+                replayAcceptedReference: true);
+            history.RefreshAsync(now).GetAwaiter().GetResult();
+            var record = history.Days.Single(dayRecord => dayRecord.Day == day &&
+                dayRecord.Cohort.StartsWith("GPU-A", StringComparison.Ordinal));
+            report(record.ObservationCount == 5 && record.MedianDropMv is double drop &&
+                Math.Abs(drop - 100) < .001 &&
+                history.Days.Where(dayRecord => dayRecord.Day == day &&
+                    dayRecord.Cohort.Contains("GPU-OTHER", StringComparison.Ordinal))
+                    .All(dayRecord => dayRecord.ObservationCount == 0),
+                "accepted replay reads gzip telemetry while retaining settling, stale, and identity gates");
+        }
+        finally { DeleteTemporaryDirectory(directory); }
+    }
+
     static void ConvertTelemetryToGzip(string directory, DateTimeOffset day)
     {
         string plain = Path.Combine(directory,
@@ -541,10 +644,10 @@ public static class ConfidenceHistoryTests
     static RowSpec[] Rows(DateTimeOffset start, double reference,
         double voltage, int count, string gpu = "GPU-A", string electrical = "connector",
         string loadSource = "CONNECTOR_POWER", string unit = "W", string health = "HEALTHY",
-        string freshness = "VerifiedSourceTimestamp") =>
+        string freshness = "VerifiedSourceTimestamp", string status = "NO_SHIFT_DETECTED") =>
         Enumerable.Range(0, count).Select(index => start.AddSeconds(index))
             .Select(time => new RowSpec(time, voltage, reference, gpu, electrical,
-                loadSource, unit, health, freshness)).ToArray();
+            loadSource, unit, health, freshness, status)).ToArray();
 
     static RowSpec[] QualifyingRows(DateTimeOffset start, double reference,
         double voltage) => Enumerable.Range(0, 10)
@@ -553,16 +656,16 @@ public static class ConfidenceHistoryTests
 
     static string Row(RowSpec row) =>
         Row(row.Time, row.Voltage, row.Reference, row.Gpu, row.Electrical,
-            row.LoadSource, row.Unit, row.Health, row.Freshness);
+            row.LoadSource, row.Unit, row.Health, row.Freshness, row.Status);
 
     static string Row(DateTimeOffset time, double voltage, double reference,
         string gpu, string electrical, string loadSource, string unit,
-        string health, string freshness) =>
+        string health, string freshness, string status = "NO_SHIFT_DETECTED") =>
         string.Join(',', time.ToString("O", CultureInfo.InvariantCulture), gpu,
             voltage.ToString("R", CultureInfo.InvariantCulture),
             time.ToString("O", CultureInfo.InvariantCulture), "425", loadSource,
             electrical, "425", reference.ToString("R", CultureInfo.InvariantCulture),
-            "NO_SHIFT_DETECTED", electrical, freshness, unit, health) + "\n";
+            status, electrical, freshness, unit, health) + "\n";
 
     static void WriteRows(string directory, DateTimeOffset sensorTime,
         IEnumerable<RowSpec> rows, string suffix = "")
@@ -571,6 +674,16 @@ public static class ConfidenceHistoryTests
             sensorTime.ToUniversalTime().ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) +
             suffix + ".csv");
         File.WriteAllText(path, Header + string.Concat(rows.Select(Row)),
+            new UTF8Encoding(false));
+    }
+
+    static void WriteAcceptedReference(string directory, string gpuUuid,
+        string source, string loadSource, params (int Bin, double Reference)[] bins)
+    {
+        string binJson = string.Join(",", bins.Select(bin =>
+            $"\"{bin.Bin}\":{{\"reference_volts\":{bin.Reference.ToString("R", CultureInfo.InvariantCulture)},\"is_qualified\":true}}"));
+        string json = $"{{\"schema_version\":1,\"state\":\"REFERENCE_ACCEPTED\",\"compatibility\":\"RESTART\",\"identity\":{{\"gpu_uuid\":\"{gpuUuid}\",\"source\":\"{source}\",\"analysis_load_source\":\"{loadSource}\",\"qualification\":{{\"bin_watts\":25}}}},\"accepted\":{{\"identity\":{{\"gpu_uuid\":\"{gpuUuid}\",\"source\":\"{source}\",\"analysis_load_source\":\"{loadSource}\",\"qualification\":{{\"bin_watts\":25}}}},\"bins\":{{{binJson}}},\"accepted_at_utc\":\"2036-01-01T00:00:00Z\"}}}}";
+        File.WriteAllText(Path.Combine(directory, "reference.json"), json,
             new UTF8Encoding(false));
     }
 
@@ -591,5 +704,5 @@ public static class ConfidenceHistoryTests
 
     readonly record struct RowSpec(DateTimeOffset Time, double Voltage,
         double Reference, string Gpu, string Electrical, string LoadSource,
-        string Unit, string Health, string Freshness);
+        string Unit, string Health, string Freshness, string Status = "NO_SHIFT_DETECTED");
 }

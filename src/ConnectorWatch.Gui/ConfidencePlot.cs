@@ -24,10 +24,10 @@ public sealed class ConfidencePlot : Plot
             var point = Points.MinBy(p => Math.Abs((p.Day.AddHours(12) - time).TotalSeconds))!;
             ToolTip = $"{point.Day:dd MMM yyyy} (UTC day)\n" + (point.Score.HasValue
                 ? $"Degradation confidence: {point.Score:F0}%\n{point.EvidenceDays} comparable days in the previous week\nTypical recorded-reference drop: {point.MedianDropMv:F1} mV\n" + (point.Unverified ? "Sensor timing or reference remains unverified." : "Based on recorded measurement metadata.")
-                : "No score: " + Reason(point.Reason));
+                : "No score: " + Reason(point.Reason, point.EvidenceDays));
         };
     }
-    public static string Reason(string reason)
+    public static string Reason(string reason, int evidenceDays = -1)
     {
         reason ??= "";
         return reason switch
@@ -36,10 +36,13 @@ public sealed class ConfidencePlot : Plot
             "CONTEXT_UNKNOWN" => "telemetry context is unavailable",
             "MEDIAN_UNAVAILABLE" => "the daily voltage-drop summary is unavailable",
             "LEARNING" or "LEARNING_REFERENCE" => "reference learning is still in progress",
-            "LOAD_NOT_COMPARABLE" => "workload differs from the comparison period",
+            "LOAD_NOT_COMPARABLE" => "the load does not match the selected comparison band",
             "EPOCH_CHANGED" => "comparison changed; learning again",
-            "INSUFFICIENT_DAYS" or "INSUFFICIENT_EVIDENCE" => "needs three comparable days",
-            "INSUFFICIENT_EXPOSURE" or "INSUFFICIENT_DAY_EVIDENCE" => "not enough comparable loaded measurements that day",
+            "INSUFFICIENT_DAYS" or "INSUFFICIENT_EVIDENCE" => evidenceDays >= 0
+                ? $"{Math.Max(0, evidenceDays)} of {DegradationConfidence.MinimumSupportedDays} comparable completed days are available"
+                : "needs three comparable days",
+            "INSUFFICIENT_EXPOSURE" or "INSUFFICIENT_DAY_EVIDENCE" => "sparse day: needs 10 sampled minutes across at least 30 minutes",
+            "CURRENT_DAY_PROVISIONAL" => "the current UTC day is still provisional",
             "AMBIGUOUS_EPOCH" => "the reference changed during that day",
             _ when reason.Contains("LEARNING", StringComparison.OrdinalIgnoreCase) => "reference learning is still in progress",
             _ when reason.Contains("UNAVAILABLE", StringComparison.OrdinalIgnoreCase) || reason.Contains("TRUNCATED", StringComparison.OrdinalIgnoreCase) => "recorded measurements are unavailable or incomplete",

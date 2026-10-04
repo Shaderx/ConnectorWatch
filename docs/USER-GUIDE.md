@@ -2,7 +2,7 @@
 
 ConnectorWatch is an experimental Windows monitor for the 16-pin input-voltage trend of a supported RTX 5090 setup. It consists of a Windows WPF dashboard and a headless .NET 8 daemon. The daemon owns all GPU access, records timestamped telemetry, and evaluates voltage changes within comparable load bands. The dashboard reads the daemon's files and control endpoint.
 
-Version **1.5.0** remains experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Private readings require a signed maintainer decision for the exact board, driver and embedded reader. Multiple GPUs fail closed. The [physical validation record](VALIDATION.md) and [driver catalog](DRIVER-CATALOG.md) describe those separate boundaries.
+Version **1.5.5** remains experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Private readings require a signed maintainer decision for the exact board, driver and embedded reader. Multiple GPUs fail closed. The [physical validation record](VALIDATION.md) and [driver catalog](DRIVER-CATALOG.md) describe those separate boundaries.
 
 ![Synthetic dashboard preview](dashboard.png)
 
@@ -44,12 +44,34 @@ Keep the rest of the package's configuration fields when editing the file. `Volt
 
 `AnalysisLoadSource` pins the comparison basis for the daemon lifetime. Supported values are `CONNECTOR_CURRENT`, `CONNECTOR_POWER`, `NVML_BOARD_POWER`, and `EXTERNAL_SENSOR_POWER`. If the selected measurement is missing or stale, analysis becomes unavailable; it never silently substitutes a different source. Connector-current qualification is converted to the existing watt-binned axis only with voltage from the same fresh connector observation. Direct-reader power is derived from that rail's V×I and is not an independent third measurement.
 
-Reference learning is a two-step lifecycle. A completed learning window is
-written as `REFERENCE_UNVERIFIED` candidate evidence; it is never silently
-promoted into a comparison baseline. An operator must send the identity-bound
-control command `accept-reference` (or `migrate-reference` when explicitly
-reviewing a legacy baseline), optionally with `operator`, `note`, and
-`explicit_legacy_migration` fields. `archive-reference` removes the active
+Reference learning is a two-step lifecycle: collect qualified samples, then
+accept the learned reference. In the dashboard, **Accept reference** becomes
+available when the candidate is ready. Acceptance freezes the baseline used
+for future comparisons.
+
+**Automatically accept qualified reference** is enabled by default, letting the
+monitor perform that step once enough qualified samples have been collected. The setting is
+saved as `AutoAcceptReference` in `config.json`, applies without a restart, and
+continues working when the GUI is closed. An explicitly saved `false` remains
+off after an upgrade; configurations without the setting use the new default. Automatic
+acceptance never replaces an accepted baseline or migrates a legacy reference;
+identity and source checks still apply. Turning it off stops future automatic
+acceptance but does not undo an already accepted reference.
+
+Automatic acceptance also waits until the voltage model can be fitted. If
+the observations do not yet contain enough usable variation, the dashboard
+explains what is missing and learning continues.
+
+The confidence chart needs three comparable completed UTC days. Starting with
+1.5.3, it replays compatible retained measurements against the current accepted
+reference, so qualified measurements collected before acceptance can contribute.
+This is labeled retrospective analysis; it does not change what was recorded at
+the time. An unavailable accepted reference must be resolved before replay can
+proceed; collecting more days alone will not resolve that state.
+
+The identity-bound control command `accept-reference` remains available for
+scripts, with `migrate-reference` for explicit review of a legacy baseline.
+Both support optional `operator` and `note` fields. `archive-reference` removes the active
 accepted model and retains an immutable archive entry before relearning. The
 daemon rejects these commands when the instance identity is stale, the source
 is degraded, or the candidate is incomplete. Accepted values are frozen and
@@ -85,6 +107,16 @@ Registration does not request elevation. If Windows rejects it, the dashboard re
 
 ## Dashboard and recorded data
 
+The **Experimental shadow review** panel shows the background prediction review
+and its recent history. The daemon runs it on first use and every seven days,
+using completed UTC days. It continues when the dashboard is closed and catches
+up after the daemon restarts. Review failures retain the previous result and
+show the next retry. Coverage and exclusions show which recorded conditions
+support the comparison. Simulated detection results describe software tests,
+not connector damage probability. Live alerts and accepted references remain
+unchanged. See [prediction reviews](PREDICTION-REVIEW.md) for report locations,
+scheduling, and interpretation.
+
 The live cards show 16-pin voltage, connector or comparison power, PCIe voltage, and the change from the current reference. History can show 15 minutes, one hour, or 24 hours, with an optional PCIe overlay. Missing readings remain gaps. Minima and maxima are preserved so short dips are not hidden by display averaging. Hover over a point for its exact observation. Open a warning to inspect the time at which it occurred, then use **Back to live** to return to the current range.
 
 The histogram counts distinct voltage samples in the selected load bin and time range. It excludes settling and other ineligible analysis states. Saved median and fifth-percentile markers are shown when available. **All loads** is a descriptive distribution that includes idle samples and does not compare them with a reference. The histogram does not invent a reference distribution from summary statistics.
@@ -112,6 +144,10 @@ The dashboard shows stale or stopped readings as unavailable. It records monitor
 Live status and recent observations stay in bounded daemon RAM and reach the dashboard through the current-user control pipe. The daemon retains at most 512 recent rows (also capped at 512 KiB of text); the GUI merges these with saved history without duplicating samples when batches reach disk.
 
 `FlushSeconds` defaults to 30 and accepts 1–60 seconds. Routine telemetry, transitions and status checkpoints are written in batches; unchanged baseline snapshots are skipped. Other checkpoints are written at that interval (or earlier at the buffer threshold). New voltage-trend warnings, unavailable-source transitions and terminal source failures trigger an immediate checkpoint; graceful shutdown flushes pending samples before recording stopped state. Temporary Windows sharing/access conflicts receive bounded retries. Persistent storage failures stop the daemon and record diagnostics under `%LOCALAPPDATA%\ConnectorWatch\logs`, independently of the data directory.
+
+A backward correction of host UTC creates an explicit coverage gap. Observations keep their actual UTC timestamps. Poll timing and sampling progress continue to use monotonic time, so monitoring can continue while existing source freshness or analysis gates report unavailable. Accepted references and archived history are preserved.
+
+After an unexpected failure while the daemon owns the data-directory lock, it attempts to mark `status.json` stopped before releasing the lock. `stopped_at_utc` records the stop time; `timestamp_utc` and the last completed sample time retain their measurement values. If this final checkpoint cannot be written, the daemon still exits with a nonzero code and records the write failure alongside the original failure in diagnostics.
 
 An abrupt process termination can lose the unflushed interval. Checkpoints use normal operating-system file buffering, so power-loss durability is not guaranteed. `status.json` is a disk checkpoint, not the live one-second transport; scripts requiring live state should use the instance-checked `live` control request after `hello`. Upgrade the GUI and daemon together.
 
@@ -174,13 +210,17 @@ See [docs/REPLAY.md](REPLAY.md) for deterministic replay, [docs/RECORDED-DATA-CH
 
 ## Electrical degradation trend
 
+For recurring offline model comparisons and experimental early-advisory
+evaluation, see [automated prediction review](PREDICTION-REVIEW.md). The workflow
+uses retained full-resolution CSV/gzip recordings without disturbing the connector.
+
 ### Long-term degradation confidence
 
 The additional **Electrical degradation confidence** chart displays daily points over 7, 30 or 90 days (default 30). Higher percentages mean stronger operational evidence of a persistent voltage decline under similar load. The percentage is an experimental evidence score, not a measured probability of hardware damage. It can decrease when comparable measurements recover. Missing or insufficient data stays unscored.
 
-The GUI reads historical telemetry in the background and caches sufficient evidence and fixed load-comparison anchors in `data/confidence-history.json` (or the configured data directory). Retain that file along with the CSV recordings when moving installations. The history cache stays in memory between refreshes. Changed state is checkpointed every 30 minutes and on normal GUI exit; initial backfill can save immediately and unchanged state is not rewritten. It reads both CSV and gzip recordings directly. This history is independent of the detailed chart's 24-hour RAM window. Switching the displayed range does not retrain the comparison.
+The GUI reads historical telemetry in the background and replays compatible observations against the current accepted reference. It caches this retrospective evidence and fixed load-comparison anchors in `data/confidence-replay-history.json` (or the configured data directory), separately from the older recorded-reference cache. Keep your accepted reference and CSV/gzip recordings when moving installations. The replay cache is rebuilt when the accepted model changes; an unavailable or incompatible reference prevents replay. Original telemetry and reference acceptance records are not changed. The history cache stays in memory between refreshes. Changed state is checkpointed every 30 minutes and on normal GUI exit; initial backfill can save immediately and unchanged state is not rewritten. It reads both CSV and gzip recordings directly. This history is independent of the detailed chart's 24-hour RAM window. Switching the displayed range does not retrain the comparison.
 
-Each completed UTC day needs at least 10 distinct sampled minutes with five unique eligible observations per minute, spread across at least 30 minutes. A score needs three comparable days spanning at least 48 hours. One daily median receives one vote; faster polling does not increase confidence. Source, load cohort and recorded-reference changes separate comparisons. Approximate load matching checks the daily load median and 10th/90th percentiles against the first qualifying day's fixed load distribution; tolerances are one-quarter and one-half of the load-bin width respectively.
+Each completed UTC day needs at least 10 distinct sampled minutes with five unique eligible observations per minute, spread across at least 30 minutes. A score needs three comparable days spanning at least 48 hours. The current UTC day remains incomplete until midnight UTC (shown in local time in the dashboard). One daily median receives one vote; faster polling does not increase confidence. Replay requires matching GPU, electrical source, load source, unit and accepted load bin; source and load cohorts remain separate. Approximate load matching checks the daily load median and 10th/90th percentiles against the first qualifying day's fixed load distribution; tolerances are one-quarter and one-half of the load-bin width respectively.
 
 For tinkerers: within the last seven calendar days in the same comparison epoch, let `D` be supported daily median drops and `T = ShiftVolts × 1000` mV. The score is `100 × clamp((median(D) − T/4)/(3T/4), 0, 1) × fraction(D > T/4) × min(count(D)/7, 1)`. These are transparent policy choices, not a calibrated sensor or failure model. Sensor-timing limitations remain unverified where reported, and these measurements cannot isolate connector damage from other electrical causes.
 
@@ -188,7 +228,7 @@ For tinkerers: within the last seven calendar days in the same comparison epoch,
 
 The dashboard aggregates raw connector-voltage observations into one-minute intervals for one load band and source context. Positive millivolts mean lower voltage relative to the comparison. The chart uses the selected 15-minute, 1-hour, or 24-hour range; when idle, “Most sampled load” selects a historical load band with observations.
 
-“Initial observation” compares against the first interval with at least five eligible observations in that range. Its zero is the initial observed voltage, not a known healthy state; changing the time range can change that comparison. “Recorded reference” uses only the reference saved alongside each observation and does not retroactively apply today's reference to old data. Legacy reference and timestamp limitations remain visible.
+“Initial observation” compares against the first interval with at least five eligible observations in that range. Its zero is the initial observed voltage, not a known healthy state; changing the time range can change that comparison. This detailed trend chart's “Recorded reference” mode uses only the reference saved alongside each observation and does not retroactively apply today's reference to old data. It remains distinct from the long-term EDC chart's retrospective replay. Legacy reference and timestamp limitations remain visible.
 
 The line is the median voltage drop. Shading is the observed 5th–95th percentile spread, not a statistical confidence interval or probability of connector health. Hover for counts, sampled span, load range, and source-timing qualifications. Sparse intervals and gaps do not become zero-drop readings. Source changes and recorded-reference changes break the trace. Voltage changes within a load band can still reflect load variation, supply voltage, temperature, or measurement behavior; the chart does not establish connector damage.
 

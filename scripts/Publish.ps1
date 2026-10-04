@@ -27,7 +27,7 @@ if ($ReleaseTrustDirectory) {
 if (-not (Test-Path "$destination/config.json")) {
     Copy-Item "$root/src/ConnectorWatch/config.json" "$destination/config.json"
 }
-foreach ($file in @('Start.cmd', 'Start-GUI.cmd', 'RunBackground.ps1', 'Configure-Startup.ps1')) {
+foreach ($file in @('Start.cmd', 'Start-GUI.cmd', 'RunBackground.ps1', 'Configure-Startup.ps1', 'Review-Prediction.ps1')) {
     Copy-Item "$PSScriptRoot/$file" $destination
 }
 Copy-Item "$root/README.md", "$root/LICENSE" $destination

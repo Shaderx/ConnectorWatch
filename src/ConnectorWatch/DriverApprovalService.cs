@@ -93,12 +93,16 @@ public sealed class DriverApprovalService : IDisposable, IAsyncDisposable
     }
 
     public static DriverApprovalService CreateDefault(string dataDirectory) =>
-        new(dataDirectory, new DriverApprovalOptions
+        CreateDefault(dataDirectory, startBackgroundRefresh: true);
+
+    internal static DriverApprovalService CreateDefault(string dataDirectory, bool startBackgroundRefresh,
+        DriverApprovalOptions? options = null, HttpClient? httpClient = null, TimeProvider? timeProvider = null) =>
+        new(dataDirectory, options ?? new DriverApprovalOptions
         {
             TrustKeys = DriverCatalogReleaseTrust.Keys,
             BundledCatalogPath = Path.Combine(AppContext.BaseDirectory, "trust", CacheFileName),
-        },
-            startBackgroundRefresh: true);
+        }, httpClient, timeProvider,
+            startBackgroundRefresh: startBackgroundRefresh);
 
     public DateTimeOffset? LastCheckedUtc { get { lock (_gate) return _lastCheckedUtc; } }
     public DateTimeOffset NextRefreshUtc { get { lock (_gate) return _nextRefreshUtc; } }

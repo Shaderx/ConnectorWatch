@@ -99,6 +99,9 @@ jobs:
           }
       - name: Restore
         run: dotnet restore src/ConnectorWatch/ConnectorWatch.csproj
+      - name: Verify installer asset naming
+        shell: pwsh
+        run: ./scripts/Test-AppInstallerNaming.ps1
       - name: Build release signature verifier from source
         run: dotnet build src/ConnectorWatch/ConnectorWatch.csproj -c Release --no-restore
       - name: Download current authenticated app metadata
@@ -340,8 +343,8 @@ jobs:
           if (Test-Path previous-app.envelope.json) { $args.PreviousEnvelopePath='previous-app.envelope.json' }
           if ($env:ROLLBACK_POLICY) { $args.RollbackPolicyPath=$env:ROLLBACK_POLICY }
           ./scripts/Publish-AppRelease.ps1 @args
-          Copy-Item $installer artifacts/app-release/ConnectorWatch-Setup.exe
-          foreach ($name in @('SHA256SUMS.txt','ConnectorWatch-publisher.cer','publisher.json','installer-build-info.json')) {
+          ./scripts/Stage-AppInstaller.ps1 -InstallerPath $installer -Version $env:VERSION -OutputDirectory artifacts/app-release
+          foreach ($name in @('ConnectorWatch-publisher.cer','publisher.json','installer-build-info.json')) {
             $candidate = Get-ChildItem prepared -Filter $name -Recurse -File | Select-Object -First 1
             if ($candidate) { Copy-Item $candidate.FullName (Join-Path 'artifacts/app-release' $name) }
           }
@@ -361,7 +364,7 @@ jobs:
             gh release create $tag --target $env:GITHUB_SHA --draft --title $title --notes-file $env:NOTES --latest=false
             if ($LASTEXITCODE -ne 0) { throw 'Draft creation failed.' }
           }
-          $assets = @('artifacts/app-release/ConnectorWatch-Setup.exe','artifacts/app-release/app-release.payload.json','artifacts/app-release/app-release.envelope.json','artifacts/app-release/SHA256SUMS.txt','artifacts/app-release/ConnectorWatch-publisher.cer','artifacts/app-release/publisher.json') | Where-Object { Test-Path $_ }
+          $assets = @("artifacts/app-release/ConnectorWatch-Setup-$env:VERSION.exe",'artifacts/app-release/ConnectorWatch-Setup.exe','artifacts/app-release/app-release.payload.json','artifacts/app-release/app-release.envelope.json','artifacts/app-release/SHA256SUMS.txt','artifacts/app-release/ConnectorWatch-publisher.cer','artifacts/app-release/publisher.json') | Where-Object { Test-Path $_ }
           gh release upload $tag @assets --clobber; if ($LASTEXITCODE -ne 0) { throw 'Immutable upload failed.' }
           gh release edit $tag --draft=false --latest; if ($LASTEXITCODE -ne 0) { throw 'Immutable publish failed.' }
       - name: Publish immutable app metadata revision
@@ -384,7 +387,7 @@ jobs:
       - name: Publish stable installer and signed discovery last
         if: inputs.mode == 'Publish'
         shell: pwsh
-        env: { GH_TOKEN: '${{ github.token }}', GH_REPO: '${{ github.repository }}', SIGNING_MODE: '${{ inputs.signing_mode }}' }
+        env: { GH_TOKEN: '${{ github.token }}', GH_REPO: '${{ github.repository }}', VERSION: '${{ inputs.version }}', SIGNING_MODE: '${{ inputs.signing_mode }}' }
         run: |
           $tag='app-stable'
           $releaseJson = gh release list --limit 1000 --json tagName,isDraft
@@ -396,6 +399,6 @@ jobs:
             gh release create $tag --target $env:GITHUB_SHA --title $title --notes 'Stable signed installer and authenticated app metadata.' --latest=false
             if ($LASTEXITCODE -ne 0) { throw 'Stable release creation failed.' }
           }
-          $assets = @('artifacts/app-release/ConnectorWatch-Setup.exe','artifacts/app-release/SHA256SUMS.txt','artifacts/app-release/ConnectorWatch-publisher.cer','artifacts/app-release/publisher.json') | Where-Object { Test-Path $_ }
+          $assets = @("artifacts/app-release/ConnectorWatch-Setup-$env:VERSION.exe",'artifacts/app-release/ConnectorWatch-Setup.exe','artifacts/app-release/SHA256SUMS.txt','artifacts/app-release/ConnectorWatch-publisher.cer','artifacts/app-release/publisher.json') | Where-Object { Test-Path $_ }
           gh release upload $tag @assets --clobber; if ($LASTEXITCODE -ne 0) { throw 'Stable installer upload failed; discovery unchanged.' }
           gh release upload $tag artifacts/app-release/app-current.json --clobber; if ($LASTEXITCODE -ne 0) { throw 'App discovery upload failed.' }
