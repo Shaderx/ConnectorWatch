@@ -21,6 +21,7 @@ public sealed class ShadowReviewScheduler : IDisposable
     const int MaximumReportBytes = 16 * 1024 * 1024;
     const int MaximumCapturedOutputCharacters = 64 * 1024;
     static readonly TimeSpan DefaultPollPeriod = TimeSpan.FromMinutes(1);
+    internal static readonly TimeSpan RecoveryPeriod = TimeSpan.FromMinutes(5);
 
     readonly string suppliedDataDirectory;
     readonly Action<string, Exception?>? log;
@@ -38,6 +39,8 @@ public sealed class ShadowReviewScheduler : IDisposable
     string? directory;
     string? statePath;
     string? reportsDirectory;
+    ShadowReviewRecoveryStore? recoveryStore;
+    DateTimeOffset? lastRecoveryUtc;
     bool stateDirty;
 
     public ShadowReviewScheduler(string dataDirectory, Action<string, Exception?>? log = null)
@@ -133,14 +136,30 @@ public sealed class ShadowReviewScheduler : IDisposable
                             continue;
                         }
                         LoadInitialState();
+                        ReconcileSnapshot(UtcNow());
                     }
 
-                    if (stateDirty) SaveSnapshot();
+                    // A failed projection write must not change the accepted result or deadline.
+                    if (stateDirty && !TrySaveSnapshot())
+                    {
+                        await DelayAsync(pollPeriod, cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
                     DateTimeOffset now = UtcNow();
                     if (snapshot is null)
                     {
                         await DelayAsync(pollPeriod, cancellationToken).ConfigureAwait(false);
                         continue;
+                    }
+
+                    if (lastRecoveryUtc is null || now < lastRecoveryUtc.Value || now - lastRecoveryUtc.Value >= RecoveryPeriod)
+                    {
+                        ReconcileSnapshot(now);
+                        if (!TrySaveSnapshot())
+                        {
+                            await DelayAsync(pollPeriod, cancellationToken).ConfigureAwait(false);
+                            continue;
+                        }
                     }
 
                     if (snapshot.Status == "RUNNING")
@@ -151,10 +170,15 @@ public sealed class ShadowReviewScheduler : IDisposable
                         {
                             Status = "FAILED",
                             Detail = "The previous daemon stopped during this review. The persisted retry deadline remains in effect.",
+                            LastAttemptRunId = snapshot.LastAttemptRunId ?? snapshot.ActiveRunId,
                             ActiveRunId = null,
                             UpdatedUtc = now,
                         };
-                        SaveSnapshot();
+                        if (!TrySaveSnapshot())
+                        {
+                            await DelayAsync(pollPeriod, cancellationToken).ConfigureAwait(false);
+                            continue;
+                        }
                     }
 
                     DateTimeOffset dueAt = NextAttempt(snapshot);
@@ -229,6 +253,7 @@ public sealed class ShadowReviewScheduler : IDisposable
 
         statePath = Path.Combine(directory, "state.json");
         reportsDirectory = Path.Combine(directory, "reports");
+        recoveryStore = new ShadowReviewRecoveryStore(dataDirectory, directory);
     }
 
     bool TryAcquireSchedulerLock()
@@ -265,10 +290,9 @@ public sealed class ShadowReviewScheduler : IDisposable
                 Status = "WAITING",
                 Detail = string.IsNullOrEmpty(readError)
                     ? "Waiting for the first offline shadow review."
-                    : "Previous review state was invalid. A new review will start now.",
+                    : "Previous review state was invalid. Checking retained completion records.",
                 UpdatedUtc = now,
             };
-            SaveSnapshot();
             return;
         }
 
@@ -277,8 +301,26 @@ public sealed class ShadowReviewScheduler : IDisposable
                 OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
         {
             snapshot = snapshot with { DataDirectory = dataDirectory! };
-            SaveSnapshot();
         }
+    }
+
+    void ReconcileSnapshot(DateTimeOffset now)
+    {
+        try { snapshot = recoveryStore!.Reconcile(snapshot!, now).Snapshot; }
+        catch (Exception ex)
+        {
+            SafeLog("Could not reconcile retained shadow review history.", ex);
+            snapshot = snapshot! with
+            {
+                Recovery = new ShadowReviewRecoveryInfo
+                {
+                    Status = "ATTENTION", CheckedUtc = now, ScanIncomplete = true,
+                    Detail = "History recovery could not finish: " + ex.Message,
+                },
+            };
+        }
+        lastRecoveryUtc = now;
+        stateDirty = true;
     }
 
     async Task RunReviewAsync(CancellationToken shutdown)
@@ -300,6 +342,7 @@ public sealed class ShadowReviewScheduler : IDisposable
             StartedUtc = started,
             NextAttemptUtc = started + FailureRetryPeriod,
             ActiveRunId = runId,
+            LastAttemptRunId = runId,
         };
         SaveSnapshot();
 
@@ -341,11 +384,11 @@ public sealed class ShadowReviewScheduler : IDisposable
             if (summary.State is not ("SUFFICIENT" or "INSUFFICIENT_DATA"))
                 throw new InvalidDataException($"Evaluator returned unsupported state {summary.State}.");
 
-            summary = AddReviewWarnings(summary, snapshot!.History);
+            summary = ShadowReviewStore.CompactSummary(AddReviewWarnings(summary, snapshot!.History));
             DateTimeOffset completed = summary.CompletedUtc;
             var history = new[] { summary }.Concat(snapshot!.History)
                 .Take(12).ToArray();
-            snapshot = snapshot with
+            var accepted = snapshot with
             {
                 Status = "COMPLETED",
                 Detail = summary.State == "INSUFFICIENT_DATA"
@@ -358,7 +401,10 @@ public sealed class ShadowReviewScheduler : IDisposable
                 ActiveRunId = null,
                 History = history,
             };
-            SaveSnapshot();
+            // The immutable receipt is the commit point. A later index failure only retries persistence.
+            recoveryStore!.PublishCompletion(summary, started, reportBytes);
+            snapshot = accepted;
+            TrySaveSnapshot();
         }
         catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
         {
@@ -375,6 +421,7 @@ public sealed class ShadowReviewScheduler : IDisposable
                 StartedUtc = started,
                 NextAttemptUtc = failed + FailureRetryPeriod,
                 ActiveRunId = null,
+                LastAttemptRunId = runId,
             };
             try { SaveSnapshot(); }
             catch (Exception persistError)
@@ -383,6 +430,7 @@ public sealed class ShadowReviewScheduler : IDisposable
             }
             SafeLog("Offline shadow review failed; the previous completed result remains available.", ex);
         }
+        finally { lastRecoveryUtc = null; }
     }
 
     ShadowReviewSummary AddReviewWarnings(ShadowReviewSummary summary, ShadowReviewSummary[] priorHistory)
@@ -407,6 +455,16 @@ public sealed class ShadowReviewScheduler : IDisposable
         stateDirty = true;
         snapshot = ShadowReviewStore.WriteAtomic(statePath!, snapshot!);
         stateDirty = false;
+    }
+
+    bool TrySaveSnapshot()
+    {
+        try { SaveSnapshot(); return true; }
+        catch (Exception ex)
+        {
+            SafeLog("Could not persist the shadow review snapshot; accepted history and the deadline are retained for retry.", ex);
+            return false;
+        }
     }
 
     void SetFailureInMemory(Exception exception, DateTimeOffset failed)

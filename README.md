@@ -8,7 +8,7 @@ distinguishes that approval from the available structural tests.
 
 A Windows-first dashboard for monitoring RTX 5090 input-rail voltage and electrical trends over time.
 
-[Download for Windows](https://github.com/Shaderx/ConnectorWatch/releases/download/app-stable/ConnectorWatch-Setup.exe) · [User guide](docs/USER-GUIDE.md) · [Release notes](docs/RELEASE-1.5.6.md)
+[Download for Windows](https://github.com/Shaderx/ConnectorWatch/releases/download/app-stable/ConnectorWatch-Setup.exe) · [User guide](docs/USER-GUIDE.md) · [Release notes](docs/RELEASE-1.5.7.md)
 
 The signed Windows release uses the project's **self-signed certificate**. Windows can show an
 unrecognized publisher or SmartScreen prompt. Obtain it from this repository's

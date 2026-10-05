@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Linq;
 
 namespace ConnectorWatch.Gui;
@@ -70,6 +71,75 @@ public static class ShadowReviewTests
             !MainWindow.IsSafeShadowReviewReportBasename("review.json:launch") &&
             MainWindow.ResolveShadowReviewReportPath("synthetic-data", Summary(now, "report") with { ReportFileName = "review.exe" }) is null,
             "Report links accept only JSON or Markdown basenames and reject paths and executable files");
+
+        var recoveryWarning = MainWindow.BuildShadowReviewRecoveryDisplay(new ShadowReviewRecoveryInfo
+        {
+            Status = "ATTENTION",
+            RecoveredCount = 2,
+            ScanIncomplete = true,
+            Detail = new string('x', 400)
+        });
+        report(recoveryWarning.NeedsAttention &&
+            recoveryWarning.StatusText.Contains("Recovery needs attention", StringComparison.Ordinal) &&
+            recoveryWarning.StatusText.Contains("report scan is incomplete", StringComparison.Ordinal) &&
+            recoveryWarning.StatusText.Length < 400 && recoveryWarning.StatusText.EndsWith("…", StringComparison.Ordinal),
+            "Recovery attention and incomplete scans produce concise diagnostics");
+
+        var recoveryOk = MainWindow.BuildShadowReviewRecoveryDisplay(new ShadowReviewRecoveryInfo
+        {
+            Status = "OK",
+            RecoveredCount = 7
+        });
+        report(!recoveryOk.NeedsAttention &&
+            recoveryOk.StatusText == "Completed history recovery checked." &&
+            !recoveryOk.StatusText.Contains("retained report", StringComparison.OrdinalIgnoreCase),
+            "Completed history recovery counts are not presented as retained reports");
+
+        var uncheckedRecovery = MainWindow.BuildShadowReviewRecoveryDisplay(new ShadowReviewRecoveryInfo());
+        report(uncheckedRecovery.StatusText == "Recovery has not been checked.",
+            "An unchecked recovery scan is not shown as an empty completed scan");
+
+        var retainedReports = Enumerable.Range(0, 14)
+            .Select(index => new ShadowReviewRetainedReport
+            {
+                ReportFileName = $"retained-{index}.json",
+                Detail = "Synthetic recovery fixture."
+            })
+            .Append(new ShadowReviewRetainedReport { ReportFileName = "..\\outside.json" })
+            .ToArray();
+        var selectedRetained = MainWindow.SelectRetainedShadowReviewReports(retainedReports);
+        report(selectedRetained.Length == 12 && selectedRetained[0].ReportFileName == "retained-0.json" &&
+            selectedRetained[^1].ReportFileName == "retained-11.json",
+            "Retained report selection is separate and bounded to 12 safe JSON basenames");
+
+        var syntheticPreview = MainWindow.CreateSyntheticShadowReview(now);
+        var syntheticRecovery = MainWindow.BuildShadowReviewRecoveryDisplay(syntheticPreview.Recovery);
+        report(syntheticPreview.RetainedReports.Length == 1 &&
+            syntheticPreview.RetainedReports[0].ReportFileName == "retained-unknown-completion.json" &&
+            syntheticRecovery.NeedsAttention && syntheticRecovery.StatusText.Contains("report scan is incomplete", StringComparison.Ordinal) &&
+            syntheticPreview.DataDirectory.StartsWith(Path.GetTempPath(), StringComparison.OrdinalIgnoreCase),
+            "Synthetic preview demonstrates a retained report and warning without using a real data directory");
+
+        string reportsDirectory = Path.Combine(Path.GetTempPath(), "ConnectorWatch-shadow-review-ui-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(reportsDirectory);
+        try
+        {
+            string reportFile = Path.Combine(reportsDirectory, "retained.json");
+            File.WriteAllText(reportFile, "{}");
+            string? resolvedRetained = MainWindow.ResolveRetainedShadowReviewReportPathInDirectory(
+                reportsDirectory, new ShadowReviewRetainedReport { ReportFileName = "retained.json" });
+            report(string.Equals(resolvedRetained, Path.GetFullPath(reportFile),
+                    OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal) &&
+                MainWindow.ResolveRetainedShadowReviewReportPathInDirectory(reportsDirectory,
+                    new ShadowReviewRetainedReport { ReportFileName = "..\\outside.json" }) is null &&
+                MainWindow.ResolveRetainedShadowReviewReportPathInDirectory(reportsDirectory,
+                    new ShadowReviewRetainedReport { ReportFileName = "retained.md" }) is null,
+                "Retained report links resolve only existing safe JSON files under their reports directory");
+        }
+        finally
+        {
+            Directory.Delete(reportsDirectory, recursive: true);
+        }
     }
 
     static ShadowReviewSummary Summary(DateTimeOffset completed, string runId) => new()

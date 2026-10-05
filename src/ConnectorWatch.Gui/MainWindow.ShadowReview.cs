@@ -20,19 +20,25 @@ public sealed partial class MainWindow
 
     readonly DispatcherTimer shadowReviewTimer = new() { Interval = TimeSpan.FromSeconds(30) };
     readonly ComboBox shadowReviewHistory = new() { MinWidth = 240 };
+    readonly ComboBox shadowReviewRetainedReports = new() { MinWidth = 240 };
     readonly TextBlock shadowReviewStatus = Text("Waiting for review status", 12);
     readonly TextBlock shadowReviewSchedule = Text("", 10);
     readonly TextBlock shadowReviewResult = Text("No completed review is available yet.", 12);
+    readonly TextBlock shadowReviewRecoveryStatus = Text("", 10);
     readonly TextBlock shadowReviewDetails = Text("", 10);
+    readonly TextBlock shadowReviewRetainedReportDetails = Text("", 10);
     readonly Button shadowReviewReport = Button("Open selected review report");
+    readonly Button shadowReviewRetainedReport = Button("Open selected retained report");
     readonly Expander shadowReviewExpander = new() { Header = "Coverage, models and scenarios", Foreground = Palette.Muted, Margin = new Thickness(0, 6, 0, 0) };
 
     ShadowReviewSnapshot? shadowReviewSnapshot;
     string shadowReviewReadError = "";
     string selectedShadowReviewRunId = "";
+    string selectedRetainedShadowReviewReportFileName = "";
     DateTimeOffset lastShadowReviewReadUtc;
     bool shadowReviewReadBusy;
     bool updatingShadowReviewHistory;
+    bool updatingRetainedShadowReviewReports;
 
     internal FrameworkElement? ShadowReviewPreview { get; private set; }
 
@@ -55,6 +61,14 @@ public sealed partial class MainWindow
             RenderShadowReviewDetails();
         };
         shadowReviewReport.Click += (_, _) => OpenSelectedShadowReviewReport();
+        shadowReviewRetainedReports.SelectionChanged += (_, _) =>
+        {
+            if (updatingRetainedShadowReviewReports) return;
+            selectedRetainedShadowReviewReportFileName =
+                (shadowReviewRetainedReports.SelectedItem as ShadowReviewRetainedReportChoice)?.FileName ?? "";
+            RenderRetainedShadowReviewReportDetails();
+        };
+        shadowReviewRetainedReport.Click += (_, _) => OpenSelectedRetainedShadowReviewReport();
 
         var historyRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 2, 0, 8) };
         var historyLabel = Text("Review history", 10);
@@ -68,11 +82,23 @@ public sealed partial class MainWindow
         shadowReviewExpander.Content = detailContent;
         shadowReviewExpander.IsExpanded = UsesSyntheticShadowReview;
 
+        var retainedReportsRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 4, 0, 2) };
+        var retainedReportsLabel = Text("Retained reports (completion unverified)", 10);
+        retainedReportsLabel.Foreground = Palette.Muted;
+        retainedReportsLabel.VerticalAlignment = VerticalAlignment.Center;
+        retainedReportsLabel.Margin = new Thickness(0, 0, 10, 0);
+        retainedReportsRow.Children.Add(retainedReportsLabel);
+        retainedReportsRow.Children.Add(shadowReviewRetainedReports);
+
         var panel = Panel(Vertical(
             Header("Experimental shadow review"),
             shadowReviewStatus,
             shadowReviewSchedule,
             shadowReviewResult,
+            shadowReviewRecoveryStatus,
+            retainedReportsRow,
+            shadowReviewRetainedReportDetails,
+            shadowReviewRetainedReport,
             disclosure,
             shadowReviewExpander));
         panel.Margin = new Thickness(0, 0, 0, 16);
@@ -160,6 +186,10 @@ public sealed partial class MainWindow
             ? "No completed review is available yet."
             : FormatReviewHeadline(display.Latest);
 
+        ShadowReviewRecoveryDisplay recoveryDisplay = BuildShadowReviewRecoveryDisplay(shadowReviewSnapshot?.Recovery);
+        shadowReviewRecoveryStatus.Text = recoveryDisplay.StatusText;
+        shadowReviewRecoveryStatus.Foreground = recoveryDisplay.NeedsAttention ? Palette.Amber : Palette.Muted;
+
         updatingShadowReviewHistory = true;
         try
         {
@@ -181,7 +211,26 @@ public sealed partial class MainWindow
             updatingShadowReviewHistory = false;
         }
 
+        updatingRetainedShadowReviewReports = true;
+        try
+        {
+            shadowReviewRetainedReports.Items.Clear();
+            foreach (var report in SelectRetainedShadowReviewReports(shadowReviewSnapshot?.RetainedReports))
+                shadowReviewRetainedReports.Items.Add(new ShadowReviewRetainedReportChoice(report.ReportFileName, report.Detail));
+
+            var selectedRetainedReport = shadowReviewRetainedReports.Items.OfType<ShadowReviewRetainedReportChoice>()
+                .FirstOrDefault(item => item.FileName == selectedRetainedShadowReviewReportFileName)
+                ?? shadowReviewRetainedReports.Items.OfType<ShadowReviewRetainedReportChoice>().FirstOrDefault();
+            shadowReviewRetainedReports.SelectedItem = selectedRetainedReport;
+            selectedRetainedShadowReviewReportFileName = selectedRetainedReport?.FileName ?? "";
+        }
+        finally
+        {
+            updatingRetainedShadowReviewReports = false;
+        }
+
         RenderShadowReviewDetails();
+        RenderRetainedShadowReviewReportDetails();
     }
 
     void RenderShadowReviewDetails()
@@ -210,6 +259,68 @@ public sealed partial class MainWindow
         {
             ShowText("Could not open review report", ex.Message);
         }
+    }
+
+    void RenderRetainedShadowReviewReportDetails()
+    {
+        var report = SelectRetainedShadowReviewReports(shadowReviewSnapshot?.RetainedReports)
+            .FirstOrDefault(item => item.ReportFileName == selectedRetainedShadowReviewReportFileName);
+        shadowReviewRetainedReportDetails.Text = report is null
+            ? "No retained reports are listed."
+            : "Completion status is unverified. " + NonEmpty(report.Detail, "No recovery detail was recorded.");
+
+        string? path = UsesSyntheticShadowReview ? null : ResolveRetainedShadowReviewReportPath(data, report);
+        shadowReviewRetainedReport.IsEnabled = path is not null;
+        shadowReviewRetainedReport.ToolTip = shadowReviewRetainedReport.IsEnabled
+            ? "Open the retained report. Its completion status is unverified."
+            : "The retained report is unavailable or has an invalid file name.";
+    }
+
+    void OpenSelectedRetainedShadowReviewReport()
+    {
+        if (UsesSyntheticShadowReview) return;
+        var report = SelectRetainedShadowReviewReports(shadowReviewSnapshot?.RetainedReports)
+            .FirstOrDefault(item => item.ReportFileName == selectedRetainedShadowReviewReportFileName);
+        string? path = ResolveRetainedShadowReviewReportPath(data, report);
+        if (path is null) return;
+
+        try { Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or IOException)
+        {
+            ShowText("Could not open retained report", ex.Message);
+        }
+    }
+
+    internal static ShadowReviewRecoveryDisplay BuildShadowReviewRecoveryDisplay(ShadowReviewRecoveryInfo? recovery)
+    {
+        if (recovery is null) return new ShadowReviewRecoveryDisplay("", false);
+
+        bool attention = recovery.Status == "ATTENTION";
+        bool incomplete = recovery.ScanIncomplete;
+        if (attention || incomplete)
+        {
+            string prefix = attention && incomplete
+                ? "Recovery needs attention; report scan is incomplete"
+                : attention
+                    ? "Recovery needs attention"
+                    : "Report scan is incomplete";
+            string detail = string.IsNullOrWhiteSpace(recovery.Detail)
+                ? ""
+                : ": " + CompactRecoveryDetail(recovery.Detail);
+            return new ShadowReviewRecoveryDisplay(prefix + detail, true);
+        }
+
+        string status = recovery.Status == "NOT_CHECKED"
+            ? "Recovery has not been checked."
+            : "Completed history recovery checked.";
+        return new ShadowReviewRecoveryDisplay(status, false);
+    }
+
+    static string CompactRecoveryDetail(string detail)
+    {
+        const int maximumLength = 320;
+        string clean = detail.Trim();
+        return clean.Length <= maximumLength ? clean : clean[..(maximumLength - 1)] + "…";
     }
 
     internal static ShadowReviewDisplay BuildShadowReviewDisplay(
@@ -268,6 +379,13 @@ public sealed partial class MainWindow
             .Take(ShadowReviewHistoryLimit)
             .ToArray();
 
+    internal static ShadowReviewRetainedReport[] SelectRetainedShadowReviewReports(ShadowReviewRetainedReport[]? reports) =>
+        (reports ?? Array.Empty<ShadowReviewRetainedReport>())
+            .Where(item => item is not null && IsSafeRetainedShadowReviewReportBasename(item.ReportFileName))
+            .Take(ShadowReviewHistoryLimit)
+            .Select(item => item with { Detail = (item.Detail ?? string.Empty)[..Math.Min(item.Detail?.Length ?? 0, 512)] })
+            .ToArray();
+
     internal static string? ResolveShadowReviewReportPath(string dataDirectory, ShadowReviewSummary? summary)
     {
         string? name = summary?.ReportFileName;
@@ -288,6 +406,42 @@ public sealed partial class MainWindow
             return null;
         }
     }
+
+    internal static string? ResolveRetainedShadowReviewReportPath(string dataDirectory, ShadowReviewRetainedReport? report)
+    {
+        if (!IsSafeRetainedShadowReviewReportBasename(report?.ReportFileName)) return null;
+        try
+        {
+            string reports = Path.Combine(ShadowReviewStore.DirectoryFor(dataDirectory), "reports");
+            return ResolveRetainedShadowReviewReportPathInDirectory(reports, report);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
+    internal static string? ResolveRetainedShadowReviewReportPathInDirectory(
+        string reportsDirectory, ShadowReviewRetainedReport? report)
+    {
+        if (!IsSafeRetainedShadowReviewReportBasename(report?.ReportFileName)) return null;
+        try
+        {
+            string reports = Path.GetFullPath(reportsDirectory);
+            string candidate = Path.GetFullPath(Path.Combine(reports, report!.ReportFileName));
+            if (!string.Equals(Path.GetDirectoryName(candidate), reports,
+                    OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal) ||
+                !File.Exists(candidate)) return null;
+            return candidate;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
+    internal static bool IsSafeRetainedShadowReviewReportBasename(string? name) =>
+        IsSafeShadowReviewReportBasename(name) && name!.EndsWith(".json", StringComparison.OrdinalIgnoreCase);
 
     internal static bool IsSafeShadowReviewReportBasename(string? name)
     {
@@ -393,7 +547,7 @@ public sealed partial class MainWindow
     static string NonEmpty(string? value, string fallback) =>
         string.IsNullOrWhiteSpace(value) ? fallback : value;
 
-    static ShadowReviewSnapshot CreateSyntheticShadowReview(DateTimeOffset now)
+    internal static ShadowReviewSnapshot CreateSyntheticShadowReview(DateTimeOffset now)
     {
         var history = Enumerable.Range(0, 3)
             .Select(index => CreateSyntheticSummary(now.AddDays(-index)))
@@ -407,7 +561,23 @@ public sealed partial class MainWindow
             StartedUtc = now.AddMinutes(-2),
             LastSuccessUtc = history[0].CompletedUtc,
             NextAttemptUtc = now.AddDays(7),
-            History = history
+            History = history,
+            RetainedReports =
+            [
+                new ShadowReviewRetainedReport
+                {
+                    ReportFileName = "retained-unknown-completion.json",
+                    Detail = "Recovered from the synthetic preview fixture; completion could not be verified."
+                }
+            ],
+            Recovery = new ShadowReviewRecoveryInfo
+            {
+                Status = "ATTENTION",
+                CheckedUtc = now,
+                RecoveredCount = 1,
+                ScanIncomplete = true,
+                Detail = "A synthetic report could not be matched to a trusted completion marker."
+            }
         };
     }
 
@@ -477,3 +647,10 @@ internal sealed record ShadowReviewHistoryChoice(string RunId, string Label)
 {
     public override string ToString() => Label;
 }
+
+internal sealed record ShadowReviewRetainedReportChoice(string FileName, string Detail)
+{
+    public override string ToString() => FileName;
+}
+
+internal sealed record ShadowReviewRecoveryDisplay(string StatusText, bool NeedsAttention);

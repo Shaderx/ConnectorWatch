@@ -46,6 +46,25 @@ lock prevents duplicate review workers. Reports are outside the telemetry
 directory, and neither source recordings nor earlier reports are overwritten.
 Manual helper reports remain in their existing directories.
 
+Starting with 1.5.7, each accepted review also saves an immutable completion
+record under `completions`. The scheduler writes this record after the evaluator
+exits successfully and its report passes validation, before it updates
+`state.json`. The record binds the data directory, run, actual completion time,
+input cutoff, report digest, and compact summary.
+
+At startup, the scheduler checks these records and repairs missing or stale
+history. A recovered completion keeps its original completion time and weekly
+deadline. A newer distinct attempt keeps its failure or stopped retry deadline.
+If only the final snapshot write fails, the accepted completion stays in memory
+and the scheduler retries that write.
+
+Older reports without a completion record remain available in a separate
+completion-unverified list. Their filenames and readable contents cannot prove
+that the scheduler accepted completion. They do not enter completed history or
+change its schedule. Existing accepted history remains valid. Scans are bounded;
+the dashboard reports incomplete scans or recovery problems instead of claiming
+that every retained file was checked.
+
 The dashboard snapshot is limited to 256 KiB. Long warning lists and detail text
 are shortened in summaries, with a note directing readers to the full report.
 Older cached summaries can be omitted to keep the snapshot within that limit.

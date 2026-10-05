@@ -2,7 +2,7 @@
 
 ConnectorWatch is an experimental Windows monitor for the 16-pin input-voltage trend of a supported RTX 5090 setup. It consists of a Windows WPF dashboard and a headless .NET 8 daemon. The daemon owns all GPU access, records timestamped telemetry, and evaluates voltage changes within comparable load bands. The dashboard reads the daemon's files and control endpoint.
 
-Version **1.5.6** remains experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Private readings require a signed maintainer decision for the exact board, driver and embedded reader. Multiple GPUs fail closed. The [physical validation record](VALIDATION.md) and [driver catalog](DRIVER-CATALOG.md) describe those separate boundaries.
+Version **1.5.7** remains experimental. The direct native reader was physically validated on one ASUS TUF RTX 5090 configuration. Private readings require a signed maintainer decision for the exact board, driver and embedded reader. Multiple GPUs fail closed. The [physical validation record](VALIDATION.md) and [driver catalog](DRIVER-CATALOG.md) describe those separate boundaries.
 
 ![Synthetic dashboard preview](dashboard.png)
 
@@ -116,6 +116,12 @@ support the comparison. Simulated detection results describe software tests,
 not connector damage probability. Live alerts and accepted references remain
 unchanged. See [prediction reviews](PREDICTION-REVIEW.md) for report locations,
 scheduling, and interpretation.
+
+The app checks saved review history when the scheduler starts. It can restore
+completed reviews from the completion records saved by version 1.5.7 and later.
+Older reports without a completion record appear separately as completion
+unverified. You can open them, but they do not change the review schedule or
+become completed history. Recovery diagnostics appear in the same panel.
 
 The live cards show 16-pin voltage, connector or comparison power, PCIe voltage, and the change from the current reference. History can show 15 minutes, one hour, or 24 hours, with an optional PCIe overlay. Missing readings remain gaps. Minima and maxima are preserved so short dips are not hidden by display averaging. Hover over a point for its exact observation. Open a warning to inspect the time at which it occurred, then use **Back to live** to return to the current range.
 

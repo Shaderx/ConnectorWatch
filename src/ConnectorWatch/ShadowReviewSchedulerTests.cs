@@ -24,7 +24,11 @@ public static class ShadowReviewSchedulerTests
         try
         {
             StoreReaderTests(root, Check);
+            ShadowReviewRecoveryStoreTests.Run(root, Check);
+            ShadowReviewRecoveryRegressionTests.Run(root, Check);
             SuccessRetryAndRestartTests(root, Check);
+            CompletionPersistenceTests(root, Check);
+            CompletionClockRollbackTests(root, Check);
             ReportValidationTests(root, Check);
             AbandonedRunTests(root, Check);
             SingleWriterAndCancellationTests(root, Check);
@@ -431,6 +435,145 @@ public static class ShadowReviewSchedulerTests
                 "real child writes only to the isolated review store");
         }
         finally { scheduler.Dispose(); }
+    }
+
+    static void CompletionPersistenceTests(string root, Action<bool, string> check)
+    {
+        string folder = Path.Combine(root, "completion-persistence");
+        string data = Path.Combine(folder, "telemetry");
+        string store = Path.Combine(folder, "review-store");
+        string statePath = Path.Combine(store, "state.json");
+        Directory.CreateDirectory(data);
+        Directory.CreateDirectory(store);
+        var clock = new TestClock(Utc(2026, 9, 28, 12));
+        DateTimeOffset completedUtc = clock.Now;
+        int calls = 0, failedWrites = 0;
+        FileStream? deniedSnapshot = null;
+        var scheduler = new ShadowReviewScheduler(data, store, (message, _) =>
+        {
+            if (message.StartsWith("Could not persist the shadow review snapshot;", StringComparison.Ordinal))
+                Interlocked.Increment(ref failedWrites);
+        }, () => clock.Now, (request, _) =>
+        {
+            Interlocked.Increment(ref calls);
+            File.WriteAllText(request.ReportPath, BuildReport(request.InputCutoffUtc));
+            // RUNNING has already been saved. Block only its later replacement.
+            deniedSnapshot = new FileStream(statePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            return Task.FromResult(new ShadowReviewProcessResult(0, "", ""));
+        }, TimeSpan.FromMilliseconds(15), TimeSpan.FromSeconds(3));
+        scheduler.Start(CancellationToken.None);
+        ShadowReviewSnapshot accepted;
+        try
+        {
+            check(SpinWait.SpinUntil(() => Volatile.Read(ref failedWrites) >= 2, TimeSpan.FromSeconds(15)),
+                "accepted completion survives both immediate and later blocked snapshot writes");
+            check(Directory.GetFiles(Path.Combine(store, "completions"), "*.completion.json").Length == 1,
+                "completion receipt is durable before the snapshot can be replaced");
+            deniedSnapshot!.Dispose();
+            deniedSnapshot = null;
+            accepted = WaitForSnapshot(store, data, value => value.Status == "COMPLETED", "accepted projection retry");
+            check(calls == 1 && accepted.History.Length == 1 && accepted.LastSuccessUtc == completedUtc &&
+                  accepted.NextAttemptUtc == completedUtc + ShadowReviewScheduler.ReviewPeriod,
+                "projection retry retains the accepted result and original weekly deadline without another child");
+
+            ShadowReviewStore.WriteAtomic(statePath, new ShadowReviewSnapshot
+            {
+                DataDirectory = data, Status = "WAITING", Detail = "Simulated stale projection.",
+                UpdatedUtc = clock.Now,
+            });
+            clock.Advance(ShadowReviewScheduler.RecoveryPeriod + TimeSpan.FromSeconds(1));
+            var repaired = WaitForSnapshot(store, data,
+                value => value.Status == "COMPLETED" && value.History.Length == 1 && value.Recovery.CheckedUtc == clock.Now,
+                "periodic stale projection repair");
+            check(calls == 1 && repaired.NextAttemptUtc == accepted.NextAttemptUtc && repaired.UpdatedUtc == accepted.UpdatedUtc,
+                "idle reconciliation restores the authoritative projection without changing review time or deadline");
+        }
+        finally
+        {
+            deniedSnapshot?.Dispose();
+            scheduler.Dispose();
+        }
+
+        foreach (string fault in new[] { "missing", "corrupt", "running" })
+        {
+            if (fault == "missing") File.Delete(statePath);
+            else if (fault == "corrupt") File.WriteAllText(statePath, "{incomplete");
+            else ShadowReviewStore.WriteAtomic(statePath, accepted with
+            {
+                Status = "RUNNING", Detail = "Interrupted before final projection.",
+                UpdatedUtc = clock.Now, ActiveRunId = accepted.History[0].RunId,
+                LastAttemptRunId = accepted.History[0].RunId, LastSuccessUtc = null, History = [],
+                NextAttemptUtc = clock.Now + ShadowReviewScheduler.FailureRetryPeriod,
+            });
+            int restartedCalls = 0;
+            using var restarted = NewScheduler(data, store, clock, (_, _) =>
+            {
+                Interlocked.Increment(ref restartedCalls);
+                throw new InvalidOperationException("A valid receipt must recover before launching another child.");
+            });
+            restarted.Start(CancellationToken.None);
+            var recovered = WaitForSnapshot(store, data,
+                value => value.Status == "COMPLETED" && value.History.Length == 1, fault + " receipt restart");
+            check(restartedCalls == 0 && recovered.LastSuccessUtc == completedUtc &&
+                  recovered.NextAttemptUtc == completedUtc + ShadowReviewScheduler.ReviewPeriod &&
+                  recovered.Recovery.RecoveredCount == 1,
+                fault + " snapshot recovers the durable completion before abandoned-run handling or child launch");
+        }
+
+        string blockedStore = Path.Combine(folder, "blocked-completion-store");
+        Directory.CreateDirectory(blockedStore);
+        File.WriteAllText(Path.Combine(blockedStore, "completions"), "Block the receipt directory.");
+        using var blocked = NewScheduler(data, blockedStore, clock, (request, _) =>
+        {
+            File.WriteAllText(request.ReportPath, BuildReport(request.InputCutoffUtc));
+            return Task.FromResult(new ShadowReviewProcessResult(0, "", ""));
+        });
+        blocked.Start(CancellationToken.None);
+        var failed = WaitForSnapshot(blockedStore, data, value => value.Status == "FAILED", "receipt publication failure");
+        check(failed.History.Length == 0 && failed.LastSuccessUtc is null && failed.LastAttemptRunId is not null &&
+              failed.NextAttemptUtc == clock.Now + ShadowReviewScheduler.FailureRetryPeriod,
+            "receipt failure before commitment keeps the six-hour retry and does not accept the report");
+    }
+
+    static void CompletionClockRollbackTests(string root, Action<bool, string> check)
+    {
+        string folder = Path.Combine(root, "completion-clock-rollback");
+        string data = Path.Combine(folder, "telemetry");
+        string store = Path.Combine(folder, "review-store");
+        Directory.CreateDirectory(data);
+        var clock = new TestClock(Utc(2026, 9, 28, 12));
+        DateTimeOffset started = clock.Now;
+        ShadowReviewSnapshot accepted;
+        using (var scheduler = NewScheduler(data, store, clock, (request, _) =>
+        {
+            File.WriteAllText(request.ReportPath, BuildReport(request.InputCutoffUtc));
+            clock.Advance(TimeSpan.FromHours(-2));
+            return Task.FromResult(new ShadowReviewProcessResult(0, "", ""));
+        }))
+        {
+            scheduler.Start(CancellationToken.None);
+            accepted = WaitForSnapshot(store, data, value => value.Status == "COMPLETED", "clock rollback completion");
+            check(accepted.StartedUtc == started && accepted.LastSuccessUtc == clock.Now && accepted.LastSuccessUtc < started &&
+                  accepted.NextAttemptUtc == clock.Now + ShadowReviewScheduler.ReviewPeriod,
+                "a clock rollback during evaluation keeps actual completion time and its weekly deadline");
+        }
+        ShadowReviewStore.WriteAtomic(Path.Combine(store, "state.json"), accepted with
+        {
+            Status = "RUNNING", ActiveRunId = accepted.History[0].RunId,
+            LastAttemptRunId = accepted.History[0].RunId, History = [], LastSuccessUtc = started,
+            UpdatedUtc = started, NextAttemptUtc = started + ShadowReviewScheduler.FailureRetryPeriod,
+        });
+        int calls = 0;
+        using var restarted = NewScheduler(data, store, clock, (_, _) =>
+        {
+            Interlocked.Increment(ref calls);
+            throw new InvalidOperationException("The matching receipt must finish the rollback attempt.");
+        });
+        restarted.Start(CancellationToken.None);
+        var recovered = WaitForSnapshot(store, data, value => value.Status == "COMPLETED", "clock rollback receipt recovery");
+        check(calls == 0 && recovered.LastSuccessUtc == clock.Now &&
+              recovered.NextAttemptUtc == clock.Now + ShadowReviewScheduler.ReviewPeriod,
+            "matching receipt identity restores a completion earlier than the saved success timestamp");
     }
 
     static ShadowReviewScheduler NewScheduler(string data, string store, TestClock clock,
