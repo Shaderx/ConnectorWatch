@@ -145,6 +145,7 @@ public static class ReferenceLifecycleTests
                 new ReferenceStartupContext(AllowVerifiedDriverContinuity: true)).Compatibility ==
             ReferenceCompatibility.MISMATCH,
             "verified driver continuity does not allow load source changes");
+        LegacyDriverInvalidationRecovery(acceptedDriverJson, approvedDriver, now);
 
         var mismatchIdentity = Identity(AnalysisLoadSource.NVML_BOARD_POWER);
         var mismatch = ReferencePersistence.Load(persistedJson, mismatchIdentity, now);
@@ -271,6 +272,90 @@ public static class ReferenceLifecycleTests
                 windowMaxAgeSeconds: 1800,
                 maxAgeSeconds: 5,
                 sampleSeconds: 1));
+
+    static void LegacyDriverInvalidationRecovery(string acceptedJson,
+        ReferenceIdentity current, DateTimeOffset now)
+    {
+        var acceptedDocument = ReferencePersistence.Deserialize(acceptedJson);
+        string frozen = JsonSerializer.Serialize(acceptedDocument.Accepted);
+        foreach (bool qualified in new[] { true, false })
+        foreach (var compatibility in new[] { ReferenceCompatibility.MISMATCH, ReferenceCompatibility.RESTART })
+        {
+            var currentCandidate = Candidate(current, now, 11.7, 11.6);
+            if (!qualified)
+                currentCandidate = new ReferenceCandidateModel(current, currentCandidate.Bins,
+                    ReferenceCandidateOrigin.LEARNED, 1, 5, now, now, false);
+            string progressDetail = qualified
+                ? "A qualified candidate is available; explicit acceptance is still required."
+                : "A candidate is still learning and is not eligible for acceptance.";
+            var legacy = InvalidDocument(acceptedDocument, current, currentCandidate,
+                compatibility, progressDetail);
+            var firstRestart = ReferencePersistence.Load(ReferencePersistence.Serialize(legacy),
+                current, now, new ReferenceStartupContext(IsRestart: true,
+                    AllowVerifiedDriverContinuity: true));
+            Check(firstRestart.Lifecycle.Snapshot().CanAnalyze,
+                "verified legacy candidate-detail driver invalidation recovers after restart");
+            var secondRestart = ReferencePersistence.Load(ReferencePersistence.Serialize(firstRestart.Lifecycle),
+                current, now.AddMinutes(1), new ReferenceStartupContext(IsRestart: true,
+                    AllowVerifiedDriverContinuity: true));
+            Check(secondRestart.Lifecycle.Snapshot().CanAnalyze &&
+                JsonSerializer.Serialize(secondRestart.Lifecycle.Accepted) == frozen,
+                "two verified restarts preserve the original accepted driver, bins and acceptance record");
+            Check(!ReferencePersistence.Load(ReferencePersistence.Serialize(legacy), current, now,
+                    new ReferenceStartupContext(IsRestart: true)).Lifecycle.Snapshot().CanAnalyze,
+                "legacy candidate-detail recovery still requires current signed approval");
+            Check(!ReferencePersistence.Load(ReferencePersistence.Serialize(legacy),
+                    DriverIdentity("617.42", abiProfile: "A612-A613-v2"), now,
+                    new ReferenceStartupContext(IsRestart: true,
+                        AllowVerifiedDriverContinuity: true)).Lifecycle.Snapshot().CanAnalyze,
+                "legacy candidate-detail recovery rejects changed measurement semantics");
+        }
+        var knownMismatch = ReferencePersistence.Load(acceptedJson, current, now).Lifecycle;
+        string originalReason = knownMismatch.Detail;
+        knownMismatch.SetCandidate(Candidate(current, now, 11.7, 11.6));
+        Check(knownMismatch.State == ReferenceLifecycleState.REFERENCE_INVALID &&
+            knownMismatch.Compatibility == ReferenceCompatibility.MISMATCH &&
+            knownMismatch.Detail == originalReason,
+            "candidate publication preserves an unresolved driver invalidation reason");
+
+        var unrelated = new ReferenceLifecycle(current, now);
+        unrelated.MarkInvalid(now, "unrelated explicit invalidation");
+        var explicitInvalid = InvalidDocument(acceptedDocument, current,
+            Candidate(current, now, 11.7, 11.6), ReferenceCompatibility.MISMATCH, unrelated.Detail);
+        foreach (bool degraded in new[] { false, true })
+        {
+            var held = ReferencePersistence.Load(ReferencePersistence.Serialize(explicitInvalid),
+                current, now, new ReferenceStartupContext(IsRestart: true, IsDegraded: degraded,
+                    AllowVerifiedDriverContinuity: true)).Lifecycle;
+            held.SetCandidate(Candidate(current, now, 11.7, 11.6));
+            var restartedHeld = ReferencePersistence.Load(ReferencePersistence.Serialize(held),
+                current, now, new ReferenceStartupContext(IsRestart: true,
+                    AllowVerifiedDriverContinuity: true)).Lifecycle;
+            Check(restartedHeld.State == ReferenceLifecycleState.REFERENCE_INVALID &&
+                restartedHeld.Compatibility == ReferenceCompatibility.MISMATCH &&
+                restartedHeld.Detail == unrelated.Detail,
+                "unrelated invalidation survives candidate publication and healthy or degraded restarts");
+        }
+        var inconsistent = InvalidDocument(acceptedDocument, current,
+            Candidate(current, now, 11.7, 11.6), ReferenceCompatibility.MISMATCH,
+            "A candidate is still learning and is not eligible for acceptance.");
+        Check(!ReferencePersistence.Load(ReferencePersistence.Serialize(inconsistent), current, now,
+                new ReferenceStartupContext(AllowVerifiedDriverContinuity: true)).Lifecycle.Snapshot().CanAnalyze,
+            "legacy progress detail must match candidate qualification");
+        var sameDriver = InvalidDocument(acceptedDocument, acceptedDocument.Identity!,
+            Candidate(acceptedDocument.Identity!, now, 11.7, 11.6), ReferenceCompatibility.MISMATCH,
+            "A qualified candidate is available; explicit acceptance is still required.");
+        Check(!ReferencePersistence.Load(ReferencePersistence.Serialize(sameDriver), acceptedDocument.Identity!, now,
+                new ReferenceStartupContext(AllowVerifiedDriverContinuity: true)).Lifecycle.Snapshot().CanAnalyze,
+            "candidate-detail recovery requires an actual accepted-to-current driver transition");
+    }
+
+    static ReferencePersistenceDocument InvalidDocument(ReferencePersistenceDocument accepted,
+        ReferenceIdentity root, ReferenceCandidateModel candidate,
+        ReferenceCompatibility compatibility, string detail) =>
+        new(accepted.SchemaVersion, ReferenceLifecycleState.REFERENCE_INVALID,
+            compatibility, root, candidate, accepted.Accepted, accepted.Archived,
+            accepted.IncidentAcknowledgements, accepted.UpdatedAtUtc, detail);
 
     static ReferenceIdentity DriverIdentity(string driver,
         AnalysisLoadSource loadSource = AnalysisLoadSource.CONNECTOR_POWER,

@@ -36,6 +36,7 @@ public static class ConfidenceHistoryTests
         AcceptedReferenceReplayPreservesGatesAndGzip(report);
         AcceptedReplayKeepsVerifiedHistoryAcrossDriverTransitions(report);
         LegacyDailyHeaderCarriesUpgradeEvidence(report);
+        UnscoredComparableRowsKeepOneSourceContext(report);
     }
 
     /// <summary>
@@ -692,6 +693,55 @@ public static class ConfidenceHistoryTests
                 TelemetryStore.ParseCsv(RowWithExtension(day.AddHours(1), false).TrimEnd('\n')));
             report(point?.SourceIdentity.Contains("driver 617.42", StringComparison.Ordinal) == false,
                 "live telemetry reader recognizes identity appended under an older daily header");
+        }
+        finally { DeleteTemporaryDirectory(directory); }
+    }
+
+    static void UnscoredComparableRowsKeepOneSourceContext(Action<bool, string> report)
+    {
+        string directory = TemporaryDirectory("unscored-source-continuity");
+        try
+        {
+            DateTimeOffset now = new(2037, 2, 20, 12, 0, 0, TimeSpan.Zero);
+            DateTimeOffset day = UtcDay(now.AddDays(-2));
+            string accepted = DirectIdentityJson("616.92", "GPU-A");
+            string upgraded = DirectIdentityJson("617.42", "GPU-A");
+            WriteDriverTransitionReference(directory, upgraded, accepted,
+                "REFERENCE_ACCEPTED", "RESTART");
+            var content = new StringBuilder(Header);
+            for (int minute = 0; minute < 30; minute++)
+            {
+                DateTimeOffset start = day.AddHours(1).AddMinutes(minute * 2);
+                foreach (var row in Rows(start, 12, 11.9, 5, "GPU-A",
+                        DirectSource("GPU-A", "617.42"), identityJson: upgraded,
+                        driverUnvalidated: false))
+                    content.Append(Row(row));
+                foreach (string bin in new[] { "25", "" })
+                {
+                    var cells = TelemetryStore.ParseCsv(Row(start.AddSeconds(bin.Length == 0 ? 31 : 30),
+                        11.9, 12, "GPU-A", DirectSource("GPU-A", "617.42"),
+                        "CONNECTOR_POWER", "W", "HEALTHY", "VerifiedSourceTimestamp",
+                        "OUTSIDE_ANALYSIS_RANGE", upgraded, false).TrimEnd('\n'));
+                    cells[4] = "30"; cells[7] = bin; cells[8] = "";
+                    content.Append(string.Join(",", cells.Select(value => "\"" +
+                        value.Replace("\"", "\"\"") + "\""))).Append('\n');
+                }
+            }
+            File.WriteAllText(Path.Combine(directory, $"telemetry-{day:yyyy-MM-dd}.csv"), content.ToString());
+            string cachePath = Path.Combine(directory, "cache.json");
+            var history = new ConfidenceHistory(directory, cachePath, 25,
+                replayAcceptedReference: true);
+            history.RefreshAsync(now).GetAwaiter().GetResult();
+            var scored = history.Days.Where(record => record.ObservationCount > 0).ToArray();
+            report(scored.Length == 1 && scored[0].ObservationCount == 150 &&
+                scored[0].MinuteCount == 30 && history.Days.Count <= 3,
+                "comparable idle and missing-bin rows do not fragment the accepted source context or inflate evidence");
+            var restarted = new ConfidenceHistory(directory, cachePath, 25,
+                replayAcceptedReference: true);
+            restarted.RefreshAsync(now.AddMinutes(1)).GetAwaiter().GetResult();
+            report(restarted.Days.Count == history.Days.Count &&
+                restarted.Days.Single(record => record.ObservationCount > 0).ObservationCount == 150,
+                "unscored source continuity survives cache checkpoint and restart");
         }
         finally { DeleteTemporaryDirectory(directory); }
     }

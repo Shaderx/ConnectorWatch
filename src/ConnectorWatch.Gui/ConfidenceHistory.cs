@@ -23,7 +23,7 @@ public sealed class ConfidenceHistory
     // 97-day retained window gives it the preceding context at the boundary.
     public const int HistoryDays = 97;
     public static readonly TimeSpan CheckpointInterval = TimeSpan.FromMinutes(30);
-    const int CacheSchemaVersion = 5;
+    const int CacheSchemaVersion = 6;
     const int MaximumCsvRecordCharacters = 262_144;
     const int MaximumRowsPerDay = 2_000_000;
     const long MaximumCacheBytes = 64L * 1024 * 1024;
@@ -529,11 +529,14 @@ public sealed class ConfidenceHistory
                         out var acceptedReference, out var canonicalSourceIdentity))
                 {
                     observation.Reference = acceptedReference;
-                    observation.SourceIdentity = canonicalSourceIdentity;
                     if (string.Equals(observation.Status?.Trim(),
                             "LEARNING_REFERENCE", StringComparison.OrdinalIgnoreCase))
                         observation.Status = "LOAD_QUALIFIED";
                 }
+                // An idle or unaccepted bin cannot change the measurement
+                // source. Keep scoring eligibility separate from its identity.
+                if (canonicalSourceIdentity.Length > 0)
+                    observation.SourceIdentity = canonicalSourceIdentity;
             }
             var key = ObservationKey.For(observation);
             if (!rows.TryGetValue(key, out var previous) ||

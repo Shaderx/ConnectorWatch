@@ -660,6 +660,10 @@ public sealed class ReferenceLifecycle
 {
     const string IdentityMismatchInvalidationDetail =
         "Persisted reference identity does not match; explicit archive/migration is required.";
+    const string QualifiedCandidateDetail =
+        "A qualified candidate is available; explicit acceptance is still required.";
+    const string LearningCandidateDetail =
+        "A candidate is still learning and is not eligible for acceptance.";
     readonly ReferenceIdentity identity;
     readonly List<ArchivedReferenceModel> archived = [];
     readonly Dictionary<string, IncidentAcknowledgement> incidentAcknowledgements =
@@ -748,9 +752,8 @@ public sealed class ReferenceLifecycle
             : next;
         if (accepted is null && state != ReferenceLifecycleState.REFERENCE_INVALID)
             state = ReferenceLifecycleState.REFERENCE_UNVERIFIED;
-        detail = next.IsQualified
-            ? "A qualified candidate is available; explicit acceptance is still required."
-            : "A candidate is still learning and is not eligible for acceptance.";
+        if (state != ReferenceLifecycleState.REFERENCE_INVALID)
+            detail = next.IsQualified ? QualifiedCandidateDetail : LearningCandidateDetail;
         updatedAtUtc = next.LastObservedAtUtc;
         return Success(detail);
     }
@@ -884,6 +887,20 @@ public sealed class ReferenceLifecycle
         updatedAtUtc = persisted.UpdatedAtUtc;
         detail = string.IsNullOrWhiteSpace(context.Detail) ? persisted.Detail : context.Detail;
 
+        bool recoverIdentityMismatch = context.AllowVerifiedDriverContinuity &&
+            persisted.State == ReferenceLifecycleState.REFERENCE_INVALID &&
+            compatibility is ReferenceCompatibility.COMPATIBLE or ReferenceCompatibility.RESTART &&
+            IsKnownDriverMismatchInvalidation(persisted);
+        if (persisted.State == ReferenceLifecycleState.REFERENCE_INVALID && !recoverIdentityMismatch)
+        {
+            // Candidate publication and a restart cannot erase an unresolved
+            // invalidation or turn it into a recoverable source-health state.
+            state = ReferenceLifecycleState.REFERENCE_INVALID;
+            compatibility = ReferenceCompatibility.MISMATCH;
+            detail = persisted.Detail;
+            return;
+        }
+
         if (compatibility == ReferenceCompatibility.MISMATCH)
         {
             state = ReferenceLifecycleState.REFERENCE_INVALID;
@@ -904,12 +921,6 @@ public sealed class ReferenceLifecycle
             return;
         }
 
-        bool recoverIdentityMismatch = context.AllowVerifiedDriverContinuity &&
-            persisted.State == ReferenceLifecycleState.REFERENCE_INVALID &&
-            persisted.Compatibility == ReferenceCompatibility.MISMATCH &&
-            accepted is not null &&
-            string.Equals(persisted.Detail, IdentityMismatchInvalidationDetail,
-                StringComparison.Ordinal);
         state = recoverIdentityMismatch
             ? ReferenceLifecycleState.REFERENCE_ACCEPTED
             : persisted.State;
@@ -931,6 +942,25 @@ public sealed class ReferenceLifecycle
             compatibility = ReferenceCompatibility.MISMATCH;
             detail = "Persisted state claimed acceptance without an accepted model.";
         }
+    }
+
+    bool IsKnownDriverMismatchInvalidation(ReferencePersistenceDocument persisted)
+    {
+        if (persisted.Compatibility is not (ReferenceCompatibility.MISMATCH or ReferenceCompatibility.RESTART) ||
+            accepted is null || string.Equals(identity.Driver, accepted.Identity.Driver, StringComparison.Ordinal) ||
+            !MeasurementIdentityCompatibility.TryParse(identity.CanonicalJson, out var currentMeasurement) ||
+            currentMeasurement?.IsDirectNvidia != true)
+            return false;
+        if (string.Equals(persisted.Detail, IdentityMismatchInvalidationDetail, StringComparison.Ordinal))
+            return true;
+
+        // Older releases replaced the mismatch reason as learning continued.
+        // Accept only their exact progress text and matching learned candidate.
+        return candidate is { Origin: ReferenceCandidateOrigin.LEARNED } &&
+            persisted.Identity is not null && candidate.Identity.MatchesCritical(persisted.Identity) &&
+            string.Equals(persisted.Detail,
+                candidate.IsQualified ? QualifiedCandidateDetail : LearningCandidateDetail,
+                StringComparison.Ordinal);
     }
 
     ReferenceOperationResult Success(string message) =>

@@ -171,7 +171,8 @@ internal sealed class AcceptedReferenceReplay
         }
     }
 
-    /// <summary>Applies one accepted value when all replay identity gates match.</summary>
+    /// <summary>Recognizes a comparable source and applies an accepted value
+    /// when the row also has an accepted load bin.</summary>
     public bool TryApply(string rowGpuUuid, string rowSource, string rowLoadSource,
         string rowLoadUnit, int? rowBin, string? rowIdentityJson,
         bool? rowDriverUnvalidated, out double reference,
@@ -180,7 +181,6 @@ internal sealed class AcceptedReferenceReplay
         reference = default;
         canonicalSourceIdentity = "";
         if (!string.Equals(rowLoadSource, loadSource, StringComparison.Ordinal) ||
-            !rowBin.HasValue ||
             !MeasurementIdentityCompatibility.MatchesTelemetrySource(gpuUuid,
                 source, loadSource, rowGpuUuid, rowSource, rowLoadSource,
                 rowLoadUnit, out var legacySourceIdentity,
@@ -213,7 +213,7 @@ internal sealed class AcceptedReferenceReplay
             canonicalSourceIdentity = legacySourceIdentity;
         }
 
-        if (!bins.TryGetValue(rowBin.Value, out reference)) return false;
+        if (!rowBin.HasValue || !bins.TryGetValue(rowBin.Value, out reference)) return false;
 
         appliedRows++;
         return true;
