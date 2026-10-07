@@ -496,19 +496,32 @@ public sealed class TelemetryStore
     }
     public static PointSample? ParseSample(string[] headers, string[] cells)
     {
+        headers = ExtendLegacyIdentityHeaders(headers);
         string Get(string key) { int i = Array.IndexOf(headers, key); return i >= 0 && i < cells.Length ? cells[i] : ""; }
         if (!DateTimeOffset.TryParse(Get("timestamp_utc"), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var t) ||
             !DateTimeOffset.TryParse(Get("voltage_timestamp_utc"), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var sensor) ||
             Number(Get("input_voltage_v")) is not double v || v < 6 || v > 16) return null;
         double? pcie = null;
         try { using var ex = JsonDocument.Parse(Get("extra_voltages_json")); pcie = Snapshot.Num(ex.RootElement, "pcie_12v_v"); } catch (JsonException) { }
+        string gpuUuid = Get("gpu_uuid");
+        string electricalSource = FirstNonEmpty(Get("electrical_source"), Get("voltage_source"));
+        string analysisLoadSource = Get("analysis_power_source");
+        string loadUnit = Get("analysis_load_unit");
+        string sourceIdentity = ComposeSourceIdentity(gpuUuid, electricalSource,
+            analysisLoadSource, loadUnit);
+        if (MeasurementIdentityCompatibility.TryParse(Get("reference_identity_json"),
+                out var measurementIdentity) &&
+            MeasurementIdentityCompatibility.MatchesTelemetrySource(
+                measurementIdentity!.GpuUuid, measurementIdentity.Source,
+                measurementIdentity.AnalysisLoadSource, gpuUuid, electricalSource,
+                analysisLoadSource, loadUnit, out var canonicalSourceIdentity,
+                out _, out _))
+            sourceIdentity = canonicalSourceIdentity;
         var sample = new PointSample(t, sensor, v, pcie, Number(Get("analysis_power_w")),
             (int?)Number(Get("bin_w")), Get("status"), Number(Get("reference_v")),
             Number(Get("rolling_p05_v")), Number(Get("median_drop_v")), Get("detail"))
         {
-            SourceIdentity = ComposeSourceIdentity(Get("gpu_uuid"),
-                FirstNonEmpty(Get("electrical_source"), Get("voltage_source")),
-                Get("analysis_power_source"), Get("analysis_load_unit")),
+            SourceIdentity = sourceIdentity,
             FreshnessKind = FirstNonEmpty(Get("electrical_freshness_kind"), "Unknown"),
             AcquisitionHealth = FirstNonEmpty(Get("acquisition_health"), "Unknown"),
         };
@@ -516,6 +529,17 @@ public sealed class TelemetryStore
     }
     static string FirstNonEmpty(string preferred, string fallback) =>
         string.IsNullOrWhiteSpace(preferred) ? fallback : preferred;
+    internal static string[] ExtendLegacyIdentityHeaders(string[] headers)
+    {
+        // An upgrade can append new columns to an existing daily file.
+        // Recognize the former complete header without rewriting its bytes.
+        if (headers.Length == 42 && headers[0] == "timestamp_utc" &&
+            headers[24] == "electrical_source" && headers[28] == "analysis_load_unit" &&
+            headers[41] == "sample_age_seconds")
+            return headers.Concat(new[] { "reference_identity_json",
+                "driver_approval_unvalidated" }).ToArray();
+        return headers;
+    }
     static readonly object SourceIdentityCacheGate = new();
     static readonly Dictionary<string, string> SourceIdentityCache = new(StringComparer.Ordinal);
     const int SourceIdentityCacheCapacity = 256;

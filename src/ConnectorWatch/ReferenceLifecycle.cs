@@ -475,7 +475,8 @@ public sealed record IncidentAcknowledgement
 public sealed record ReferenceStartupContext(
     [property: JsonPropertyName("is_restart")] bool IsRestart = false,
     [property: JsonPropertyName("is_degraded")] bool IsDegraded = false,
-    [property: JsonPropertyName("detail")] string Detail = "");
+    [property: JsonPropertyName("detail")] string Detail = "",
+    [property: JsonPropertyName("allow_verified_driver_continuity")] bool AllowVerifiedDriverContinuity = false);
 
 public sealed record ReferenceStatusSnapshot(
     [property: JsonPropertyName("state")] ReferenceLifecycleState State,
@@ -626,12 +627,24 @@ public static class ReferenceCompatibilityClassifier
         // snapshot would let a malformed document with a changed root
         // identity appear compatible, and checking only the root would allow
         // an embedded candidate/snapshot from another model to be used.
-        if (!current.MatchesCritical(persisted.Identity) ||
-            persisted.Candidate is not null &&
-                !current.MatchesCritical(persisted.Candidate.Identity) ||
-            persisted.Accepted is not null &&
-                !current.MatchesCritical(persisted.Accepted.Identity))
-            return ReferenceCompatibility.MISMATCH;
+        bool identitiesMatch = current.MatchesCritical(persisted.Identity) &&
+            (persisted.Candidate is null ||
+                current.MatchesCritical(persisted.Candidate.Identity)) &&
+            (persisted.Accepted is null ||
+                current.MatchesCritical(persisted.Accepted.Identity));
+        if (!identitiesMatch)
+        {
+            bool measurementCompatible = context?.AllowVerifiedDriverContinuity == true &&
+                MeasurementIdentityCompatibility.MatchesMeasurement(current.CanonicalJson,
+                    persisted.Identity.CanonicalJson) &&
+                (persisted.Candidate is null ||
+                    MeasurementIdentityCompatibility.MatchesMeasurement(current.CanonicalJson,
+                        persisted.Candidate.Identity.CanonicalJson)) &&
+                (persisted.Accepted is null ||
+                    MeasurementIdentityCompatibility.MatchesMeasurement(current.CanonicalJson,
+                        persisted.Accepted.Identity.CanonicalJson));
+            if (!measurementCompatible) return ReferenceCompatibility.MISMATCH;
+        }
         if (context?.IsDegraded == true) return ReferenceCompatibility.DEGRADED;
         if (context?.IsRestart == true) return ReferenceCompatibility.RESTART;
         return ReferenceCompatibility.COMPATIBLE;
@@ -645,6 +658,8 @@ public static class ReferenceCompatibilityClassifier
 /// </summary>
 public sealed class ReferenceLifecycle
 {
+    const string IdentityMismatchInvalidationDetail =
+        "Persisted reference identity does not match; explicit archive/migration is required.";
     readonly ReferenceIdentity identity;
     readonly List<ArchivedReferenceModel> archived = [];
     readonly Dictionary<string, IncidentAcknowledgement> incidentAcknowledgements =
@@ -872,7 +887,7 @@ public sealed class ReferenceLifecycle
         if (compatibility == ReferenceCompatibility.MISMATCH)
         {
             state = ReferenceLifecycleState.REFERENCE_INVALID;
-            detail = "Persisted reference identity does not match; explicit archive/migration is required.";
+            detail = IdentityMismatchInvalidationDetail;
             return;
         }
         if (compatibility == ReferenceCompatibility.LEGACY)
@@ -889,7 +904,17 @@ public sealed class ReferenceLifecycle
             return;
         }
 
-        state = persisted.State;
+        bool recoverIdentityMismatch = context.AllowVerifiedDriverContinuity &&
+            persisted.State == ReferenceLifecycleState.REFERENCE_INVALID &&
+            persisted.Compatibility == ReferenceCompatibility.MISMATCH &&
+            accepted is not null &&
+            string.Equals(persisted.Detail, IdentityMismatchInvalidationDetail,
+                StringComparison.Ordinal);
+        state = recoverIdentityMismatch
+            ? ReferenceLifecycleState.REFERENCE_ACCEPTED
+            : persisted.State;
+        if (recoverIdentityMismatch)
+            detail = "Previously accepted reference restored after verified driver approval; accepted values remain frozen.";
         if (state == ReferenceLifecycleState.REFERENCE_STALE && accepted is not null &&
             compatibility is ReferenceCompatibility.COMPATIBLE or ReferenceCompatibility.RESTART)
         {

@@ -8,7 +8,8 @@ internal sealed record RuntimeSessionOverrides
 {
     internal required Func<DateTimeOffset> UtcNow { get; init; }
     internal required Func<Gpu> ReadGpu { get; init; }
-    internal required IVoltageSource VoltageSource { get; init; }
+    internal required IVoltageSource? VoltageSource { get; init; }
+    internal string? SourceSetupError { get; init; }
     internal Func<long> MonotonicTimestamp { get; init; } = Stopwatch.GetTimestamp;
     internal bool SkipSampleWait { get; init; }
     internal bool SkipBackgroundMaintenance { get; init; }

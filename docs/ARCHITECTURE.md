@@ -35,7 +35,7 @@ The default public configuration selects `VoltageSource: "direct"` and `Analysis
 
 The newline-delimited JSON adapter reads at most the newest 128 KiB from the file tail. When that window begins inside a record it discards the partial leading bytes, ignores an unterminated append, and returns the newest complete non-empty record. A single record larger than the bound is unavailable unless a later complete record fits in the window; the adapter never rescans an unbounded growing file.
 
-The analyzer groups eligible samples into 25 W bins. It waits for stable samples after a load transition, learns a per-bin median and fifth percentile, and publishes a candidate snapshot. Candidate values remain outside comparison until accepted through an identity-bound operator command or the saved `AutoAcceptReference` policy (enabled by default). The GUI exposes manual acceptance and the automatic policy; the daemon persists and executes the policy even when the GUI is closed. Automatic acceptance requires a qualified learned candidate, valid identity and source, and no accepted model; it cannot migrate legacy evidence or replace an accepted baseline. Both paths freeze the snapshot and a robust differential voltage model fitted from qualified evidence using one labelled load proxy and available operating-condition features. Later learning can produce a separate candidate without mutating accepted artifacts. `accept-reference`, `migrate-reference`, `archive-reference`, and `set-auto-accept-reference` commands are instance-checked by the current-user control endpoint. A source degradation leaves accepted evidence available for forensics but marks it stale and prevents comparison; a GPU/source/configuration mismatch marks it invalid.
+The analyzer groups eligible samples into 25 W bins. It waits for stable samples after a load transition, learns a per-bin median and fifth percentile, and publishes a candidate snapshot. Candidate values remain outside comparison until accepted through an identity-bound operator command or the saved `AutoAcceptReference` policy (enabled by default). The GUI exposes manual acceptance and the automatic policy; the daemon persists and executes the policy even when the GUI is closed. Automatic acceptance requires a qualified learned candidate, valid identity and source, and no accepted model; it cannot migrate legacy evidence or replace an accepted baseline. Both paths freeze the snapshot and a robust differential voltage model fitted from qualified evidence using one labelled load proxy and available operating-condition features. Later learning can produce a separate candidate without mutating accepted artifacts. `accept-reference`, `migrate-reference`, `archive-reference`, and `set-auto-accept-reference` commands are instance-checked by the current-user control endpoint. A source degradation leaves accepted evidence available for forensics but marks it stale and prevents comparison. GPU, source, or measurement-configuration changes mark it invalid. Candidate identity remains strict. A separate measurement comparison permits continuity across an exact signed approval for a direct NVIDIA driver version only when GPU UUID, board, reader ABI profile, load source, model and feature versions, schema, and qualification settings still match. The accepted bins and identity remain frozen. Later approved driver upgrades can use the same accepted evidence; pending or developer-mode approval cannot authorize that continuity.
 
 The differential model emits expected voltage, residual, and an explicitly unit-labelled descriptive slope. A fast residual detector and a time-aware EWMA detector consume that output. Missing samples, insufficient coverage, poor conditioning, discontinuities, and stale sources remain explicit states rather than being filled or reinterpreted. Detector transitions latch incidents with deterministic identifiers and bounded pre-trigger, trigger, and post-trigger windows. Acknowledgement and resolution are separate operator records and neither mutates a reference. The reported slope is not represented as connector resistance.
 
@@ -65,9 +65,19 @@ withdrawn approval pauses private acquisition while public telemetry continues.
 A verified refresh can start or stop that session without reinstalling the app.
 Driver replacement flushes and restarts the monitoring session with its actual
 driver identity; catalog revision changes alone do not change reference identity.
+Historical comparison uses a canonical direct-source cohort that omits the
+driver token while retaining channel, GPU UUID, load source, and unit. This
+preserves chart continuity across approved driver versions without changing raw
+telemetry or accepted identity. Full recorded measurement identities must match
+when present. Legacy rows retain their available source and bin-width gates.
+Rows marked unvalidated remain excluded from cross-driver replay; a later
+approval permits new captures without changing those recorded flags.
 
 Native setup and integrity failures remain distinct from approval pauses. A
 missing library or failed public identity check leaves private readings unavailable.
+A failed public identity check also suppresses identity-bound persistence, so an
+unavailable placeholder cannot replace the accepted reference or its model,
+incident ledger, baseline mirror, and watchdog state.
 A private call failure or possible native timeout remains terminal: the application
 does not retry that call or unload a library while an in-flight call may own its
 buffers. No path writes a hardware setting. See [driver approvals](DRIVER-CATALOG.md)

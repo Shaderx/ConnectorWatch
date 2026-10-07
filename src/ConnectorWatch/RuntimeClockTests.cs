@@ -11,6 +11,7 @@ public static class RuntimeClockTests
         RunSession([last, corrected, corrected.AddMilliseconds(200), corrected.AddMilliseconds(400)],
             rollback: true);
         RunSession([last, last.AddSeconds(1), last.AddSeconds(2)], rollback: false);
+        UnavailableDirectIdentityPreservesFiles(last);
 
         var tracker = new AnalysisCoverageTracker(TimeSpan.FromMinutes(30));
         tracker.Record(CoverageObservation.AnalyzedAt(last));
@@ -128,6 +129,66 @@ public static class RuntimeClockTests
             var rows = File.ReadAllLines(Path.Combine(data, $"telemetry-{timestamps[0]:yyyy-MM-dd}.csv"));
             Check(rows.Length == timestamps.Length + 1,
                 "all observations remain persisted after the coverage boundary");
+        }
+        finally { Directory.Delete(folder, recursive: true); }
+    }
+
+    static void UnavailableDirectIdentityPreservesFiles(DateTimeOffset now)
+    {
+        string folder = Path.Combine(Path.GetTempPath(), "ConnectorWatch-unavailable-identity-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(folder);
+        try
+        {
+            var config = new Config
+            {
+                GpuUuid = "GPU-00000000-0000-0000-0000-000000000001",
+                DataDirectory = folder,
+                VoltageSource = "direct",
+                AnalysisLoadSource = "CONNECTOR_POWER",
+                DesktopAlerts = false,
+                AutoAcceptReference = false,
+                StableSamples = 1,
+                BaselineSamples = 5,
+                WindowSamples = 3,
+            };
+            string configPath = Path.Combine(folder, "config.json");
+            File.WriteAllText(configPath, JsonSerializer.Serialize(config));
+            var identity = Program.BuildReferenceIdentity(config, "direct",
+                DirectNvRails.Describe(config.GpuUuid, "616.92"),
+                AnalysisLoadSource.CONNECTOR_POWER, "616.92");
+            var reference = new ReferenceLifecycle(identity, now);
+            reference.SetCandidate(ReferenceCandidateModel.Learned(identity,
+                new Dictionary<int, ReferenceBinStatistics> { [425] = new(425, 12.1, 12.0) },
+                5, 5, now.AddMinutes(-10), now.AddMinutes(-9), true));
+            reference.AcceptCandidate(now.AddMinutes(-8), "fixture");
+            var original = new Dictionary<string, string>
+            {
+                ["reference.json"] = ReferencePersistence.Serialize(reference),
+                ["baseline.json"] = JsonSerializer.Serialize(new Saved("original", new Dictionary<int, Bin>
+                    { [425] = new() { Reference = 12.1, ReferenceP05 = 12.0 } })),
+                ["differential-model.json"] = "{\"original_artifact\":true}",
+                ["incidents.json"] = new IncidentLedger(identity.VersionedKey).ToJson(),
+                ["power-limit-watchdog.json"] = new PowerLimitWatchdog(identity: identity.VersionedKey).SerializeState(),
+            };
+            foreach (var pair in original) File.WriteAllText(Path.Combine(folder, pair.Key), pair.Value);
+            int exit = Program.RunSession(["--config", configPath, "--samples", "2"],
+                new RuntimeSessionOverrides
+                {
+                    UtcNow = () => now,
+                    ReadGpu = () => new Gpu(440, 60, 95, 450),
+                    VoltageSource = null,
+                    SourceSetupError = "Public NVIDIA identity unavailable",
+                    SkipSampleWait = true,
+                    SkipBackgroundMaintenance = true,
+                    DiagnosticLogDirectory = Path.Combine(folder, "logs"),
+                });
+            Check(exit == 0, "unavailable public identity permits a status-only monitoring session");
+            foreach (var pair in original)
+                Check(File.ReadAllText(Path.Combine(folder, pair.Key)) == pair.Value,
+                    "unavailable identity leaves " + pair.Key + " unchanged through flush and shutdown");
+            using var status = JsonDocument.Parse(File.ReadAllText(Path.Combine(folder, "status.json")));
+            Check(!status.RootElement.GetProperty("acquisition").GetProperty("analysis_available").GetBoolean(),
+                "unavailable public identity admits no live analysis");
         }
         finally { Directory.Delete(folder, recursive: true); }
     }

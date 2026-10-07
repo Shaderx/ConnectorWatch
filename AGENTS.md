@@ -20,3 +20,9 @@ For triage, use the default role mapping in
 
 For terminology and design work, follow the single-context reading rules in
 [docs/agents/domain.md](docs/agents/domain.md).
+
+### Driver verification
+
+For driver-version updates, HWiNFO comparisons, or new catalog approvals, follow
+[docs/agents/driver-verification.md](docs/agents/driver-verification.md). Use
+the standing authorization only after full idle/workload validation passes.

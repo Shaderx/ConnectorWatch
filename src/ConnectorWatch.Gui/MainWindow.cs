@@ -609,6 +609,13 @@ public sealed partial class MainWindow : Window
             var selection = (settings.ConfidenceCohort, settings.ConfidenceRangeDays, now.UtcDateTime.Date, confidenceReadBusy, config.ShiftVolts, store.Current?.ReferenceState ?? "");
             if (ReferenceEquals(days, confidenceRenderedDays) && selection == confidenceRenderedSelection) return;
             var groups = days.Where(d => !string.IsNullOrWhiteSpace(d.Cohort)).GroupBy(d => d.Cohort).ToArray();
+            string migratedCohort = MigrateConfidenceCohort(settings.ConfidenceCohort,
+                groups.Select(group => group.Key));
+            if (!string.Equals(migratedCohort, settings.ConfidenceCohort, StringComparison.Ordinal))
+            {
+                settings.ConfidenceCohort = migratedCohort;
+                if (!demo) SaveSettings();
+            }
             foreach (var group in groups)
             {
                 if (confidenceCohort.Items.OfType<ConfidenceCohortChoice>().Any(c => c.Key == group.Key)) continue;
@@ -676,6 +683,23 @@ public sealed partial class MainWindow : Window
             confidencePlot.InvalidateVisual();
         }
         finally { renderingConfidence = false; }
+    }
+    internal static string MigrateConfidenceCohort(string selected, IEnumerable<string> available)
+    {
+        var choices = available.Distinct(StringComparer.Ordinal).ToArray();
+        if (choices.Contains(selected, StringComparer.Ordinal)) return selected;
+        int binIndex = selected.LastIndexOf("|bin=", StringComparison.Ordinal);
+        if (binIndex < 0) return selected;
+        var parts = selected[..binIndex].Split(" | ", StringSplitOptions.None);
+        if (parts.Length != 4 || !MeasurementIdentityCompatibility.MatchesTelemetrySource(
+                parts[0], parts[1], parts[2], parts[0], parts[1], parts[2], parts[3],
+                out var canonicalSource, out var acceptedDriver, out _) ||
+            acceptedDriver.Length == 0)
+            return selected;
+        string candidate = canonicalSource + selected[binIndex..];
+        var matches = choices.Where(choice => string.Equals(choice, candidate,
+            StringComparison.Ordinal)).ToArray();
+        return matches.Length == 1 ? matches[0] : selected;
     }
     void RenderElectricalTrend(DateTimeOffset from, DateTimeOffset to)
     {

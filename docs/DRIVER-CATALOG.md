@@ -49,7 +49,7 @@ The embedded private reader scope is profile `A612-A613-v1`, reader version `1.0
 
 Entries decide only an exact `DriverIdentity(VendorId, DeviceId, SubsystemId, Os, Architecture, DriverVersion)` and reader profile. There is one entry per exact identity/profile scope. A `revoked` decision blocks that scope even when the cached catalog has expired and even in developer mode. An approval outside its signed reader or application range does not start the reader. Older clients report that a newer compatible application or reader is required; newer untested clients remain outside the approved scope.
 
-`DriverCatalogPayload.Parse` is the strict publication-time parser. `DriverCatalogPayload.ParseVerified` accepts only a `VerifiedSignedMetadata` result for runtime use. Protected publication should additionally enforce evidence ownership, maintainer authorization, revision monotonicity, and that renewal-only changes do not introduce decisions.
+`DriverCatalogPayload.Parse` is the strict publication-time parser. `DriverCatalogPayload.ParseVerified` accepts only a `VerifiedSignedMetadata` result for runtime use. For new approvals, follow [the driver verification procedure](agents/driver-verification.md), which requires full independent evidence, exact payload review, evidence ownership, maintainer authorization, and revision monotonicity. Renewal-only changes must not introduce decisions.
 
 ## Cache, refresh, and failure behavior
 
@@ -66,7 +66,7 @@ Offline operation can use a previously verified, unexpired cache. Once it expire
 1. Generate and protect an ECDSA P-256 signing key outside the repository and ordinary build jobs.
 2. Inject only the reviewed SPKI public key and key ID into the signed application build.
 3. Validate the catalog with `DriverCatalogPayload.Parse`, supported profile `A612-A613-v1`, evidence hashes, and a revision greater than the published watermark. The separate bootstrap policy is restricted to revision 1 and the two exact public attestation entries.
-4. Review and explicitly authorize the exact payload SHA-256.
+4. Review and explicitly authorize the exact payload SHA-256. For a new approval after full verification PASS, the agent performs this step under the [standing authorization](agents/driver-verification.md) and completes publication without requesting approval again.
 5. Sign the exact payload bytes in 64-byte IEEE-P1363 form, construct the immutable envelope, and verify it with the release build before upload.
 6. Publish the immutable revisioned catalog asset first and the discovery pointer last. Do not overwrite old revisions.
 7. Keep the 30-day catalog renewed weekly. Publish a higher-revision revocation immediately when evidence changes.

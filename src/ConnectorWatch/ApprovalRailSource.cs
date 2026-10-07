@@ -45,6 +45,8 @@ public sealed class ApprovalRailSource : IElectricalSource, IDisposable
     public string Description { get; }
     public bool TerminalOnFailure => true;
     public DriverApprovalDecision Decision { get; private set; }
+    public bool HasVerifiedApproval => !developer && Decision.State == DriverApprovalState.Approved &&
+        Decision.MayStart && !Decision.IsUnvalidated;
     public object Diagnostics => new
     {
         state = Decision.State.ToString(), detail = Decision.Reason,

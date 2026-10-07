@@ -1093,6 +1093,7 @@ public static class Program
             if (runtimeOverrides is not null)
             {
                 voltageSource = runtimeOverrides.VoltageSource;
+                sourceSetupError = runtimeOverrides.SourceSetupError;
             }
             else if (sourceMode == "none")
             {
@@ -1166,6 +1167,8 @@ public static class Program
             }
             var referenceIdentity = BuildReferenceIdentity(c, sourceMode, providerIdentity, analysisLoadSource,
                 directSource?.DriverVersion ?? "external-source");
+            bool identityBoundPersistenceAllowed = !string.Equals(providerIdentity,
+                "direct NVIDIA rails unavailable", StringComparison.Ordinal);
             bool hasPersistedReference = File.Exists(referencePath) || File.Exists(baselinePath);
             string? persistedReferenceJson = File.Exists(referencePath)
                 ? File.ReadAllText(referencePath)
@@ -1175,12 +1178,18 @@ public static class Program
                 new ReferenceStartupContext(
                     IsRestart: hasPersistedReference,
                     IsDegraded: voltageSource is null || sourceSetupError is not null,
-                    Detail: sourceSetupError ?? ""));
+                    Detail: sourceSetupError ?? "",
+                    AllowVerifiedDriverContinuity: directSource?.HasVerifiedApproval == true));
             var lifecycle = referenceLoad.Lifecycle;
             var referenceGate = new object();
             analysis = new Analysis(c, BuildAnalysisBins(lifecycle, saved));
-            var differentialIdentity = BuildDifferentialIdentity(referenceIdentity);
-            var differentialOptions = BuildDifferentialOptions(c, referenceIdentity);
+            ReferenceIdentity measurementIdentity = lifecycle.Accepted is { } acceptedReference &&
+                MeasurementIdentityCompatibility.MatchesMeasurement(referenceIdentity.CanonicalJson,
+                    acceptedReference.Identity.CanonicalJson)
+                ? acceptedReference.Identity
+                : referenceIdentity;
+            var differentialIdentity = BuildDifferentialIdentity(measurementIdentity);
+            var differentialOptions = BuildDifferentialOptions(c, measurementIdentity);
             var differentialRuntime = new DifferentialModelRuntime(differentialOptions,
                 BuildResidualDetectorOptions(c, differentialIdentity));
             string differentialModelPath = Path.Combine(data, "differential-model.json");
@@ -1189,8 +1198,10 @@ public static class Program
                 ? "Waiting for a qualified learned reference candidate."
                 : "Automatic acceptance is disabled.";
             long autoPreviewLearningGeneration = -1;
-            if (lifecycle.Snapshot().CanAnalyze && File.Exists(differentialModelPath))
+            bool TryLoadDifferentialArtifact()
             {
+                if (!lifecycle.Snapshot().CanAnalyze || differentialRuntime.Artifact is not null ||
+                    !File.Exists(differentialModelPath)) return false;
                 try
                 {
                     var persistedArtifact = DifferentialModelPersistence.Deserialize(
@@ -1199,7 +1210,11 @@ public static class Program
                         persistedArtifact.LoadProxy != differentialOptions.LoadProxy)
                         differentialModelDetail = "Persisted differential artifact identity does not match; it remains inactive.";
                     else
+                    {
                         differentialRuntime.Load(persistedArtifact);
+                        differentialModelDetail = null;
+                        return true;
+                    }
                 }
                 catch (Exception ex) when (ex is FormatException or NotSupportedException or
                     InvalidDataException or ArgumentException or IOException)
@@ -1208,14 +1223,14 @@ public static class Program
                     // migrate a malformed, old, or mismatched file at startup.
                     differentialModelDetail = "Persisted differential artifact is unavailable: " + ex.Message;
                 }
+                return false;
             }
-            else if (File.Exists(differentialModelPath))
-            {
+            if (!TryLoadDifferentialArtifact() && File.Exists(differentialModelPath) &&
+                string.IsNullOrWhiteSpace(differentialModelDetail))
                 differentialModelDetail = "Differential artifact is held inactive until a matching accepted reference is available.";
-            }
 
             string incidentsPath = Path.Combine(data, "incidents.json");
-            string incidentIdentity = referenceIdentity.VersionedKey;
+            string incidentIdentity = measurementIdentity.VersionedKey;
             IncidentLedger incidentLedger;
             string? incidentLoadDetail = null;
             if (File.Exists(incidentsPath))
@@ -1263,6 +1278,7 @@ public static class Program
             string BaselineMirror() => JsonSerializer.Serialize(new Saved(identity, analysis.Bins), Json);
             void PersistReferenceLocked()
             {
+                if (!identityBoundPersistenceAllowed) return;
                 Atomic(referencePath, ReferencePersistence.Serialize(lifecycle));
                 // Keep the historical shape available to existing GUI builds
                 // and package consumers. It is only a mirror; lifecycle state
@@ -1271,14 +1287,49 @@ public static class Program
             }
             void PersistDifferentialModelLocked()
             {
+                if (!identityBoundPersistenceAllowed) return;
                 if (differentialRuntime.Artifact is not null)
                     Atomic(differentialModelPath,
                         DifferentialModelPersistence.Serialize(differentialRuntime.Artifact));
             }
-            void PersistIncidentsLocked() =>
-                Atomic(incidentsPath, incidentLedger.ToJson());
-            void PersistPowerLimitWatchdogLocked() =>
-                Atomic(powerLimitWatchdogPath, powerLimitWatchdog.SerializeState());
+            bool TryRestoreReferenceAfterApproval(DateTimeOffset atUtc,
+                ElectricalSample? electrical, Voltage? voltage,
+                DateTimeOffset? previousSensorTimestamp)
+            {
+                if (directSource?.HasVerifiedApproval != true ||
+                    IsSourceDegraded(electrical, voltage, sourceSetupError) ||
+                    !HasAdvancingSensorTimestamp(previousSensorTimestamp, voltage!.Timestamp) ||
+                    lifecycle.Snapshot().CanAnalyze || lifecycle.Accepted is not { } heldAccepted ||
+                    !MeasurementIdentityCompatibility.MatchesMeasurement(
+                        referenceIdentity.CanonicalJson, heldAccepted.Identity.CanonicalJson))
+                    return false;
+
+                var restored = ReferencePersistence.Load(ReferencePersistence.Serialize(lifecycle),
+                    referenceIdentity, atUtc,
+                    new ReferenceStartupContext(IsRestart: hasPersistedReference,
+                        IsDegraded: false,
+                        AllowVerifiedDriverContinuity: true)).Lifecycle;
+                if (!restored.Snapshot().CanAnalyze || restored.Accepted is not { } accepted ||
+                    !accepted.Identity.MatchesCritical(heldAccepted.Identity))
+                    return false;
+
+                lifecycle = restored;
+                analysis.ApplyAccepted(accepted);
+                autoPreviewLearningGeneration = -1;
+                _ = TryLoadDifferentialArtifact();
+                PersistReferenceLocked();
+                return true;
+            }
+            void PersistIncidentsLocked()
+            {
+                if (identityBoundPersistenceAllowed)
+                    Atomic(incidentsPath, incidentLedger.ToJson());
+            }
+            void PersistPowerLimitWatchdogLocked()
+            {
+                if (identityBoundPersistenceAllowed)
+                    Atomic(powerLimitWatchdogPath, powerLimitWatchdog.SerializeState());
+            }
             ReferenceOperationResult ApplyAcceptedLocked(DateTimeOffset acceptedAtUtc,
                 string actor, string note, bool explicitLegacyMigration)
             {
@@ -1488,6 +1539,7 @@ public static class Program
                 bool newSensor = false;
                 lock (referenceGate)
                 {
+                    _ = TryRestoreReferenceAfterApproval(now, electrical, v, lastSensor);
                     powerLimitResult = powerLimitWatchdog.Observe(
                         BuildPowerLimitObservation(now, g, incidentIdentity,
                             c.DesiredPowerCapWatts, electrical),
@@ -1678,7 +1730,9 @@ public static class Program
                     pollTiming.ConsecutiveIdenticalObservations, coverage.CoveragePercent,
                     coverage.EligibleLoadedCount, coverage.AnalyzedLoadedCount,
                     coverage.CurrentUnanalyzedLoadedSeconds, coverage.LongestUnanalyzedLoadedSeconds,
-                    progressContract.LastCompletedSampleMonotonic, progressContract.SampleAgeSeconds) + "\n";
+                    progressContract.LastCompletedSampleMonotonic, progressContract.SampleAgeSeconds,
+                    referenceIdentity.CanonicalJson,
+                    directSource is null ? null : directSource.Decision.IsUnvalidated) + "\n";
                 storage.Add(now, row);
                 var progress = analysisProgress;
                 var state = new
@@ -1787,7 +1841,8 @@ public static class Program
                         PersistDifferentialModelLocked();
                         PersistIncidentsLocked();
                         PersistPowerLimitWatchdogLocked();
-                        storage.Flush(clock.Elapsed.TotalSeconds, latestState, BaselineMirror());
+                        storage.Flush(clock.Elapsed.TotalSeconds, latestState, BaselineMirror(),
+                            persistBaseline: identityBoundPersistenceAllowed);
                     }
                 }
                 if (terminalFailure != null)
@@ -1814,7 +1869,8 @@ public static class Program
             }
             lock (referenceGate)
             {
-                if (latestState != null) storage.Flush(clock.Elapsed.TotalSeconds, latestState, BaselineMirror());
+                if (latestState != null) storage.Flush(clock.Elapsed.TotalSeconds, latestState, BaselineMirror(),
+                    persistBaseline: identityBoundPersistenceAllowed);
                 PersistReferenceLocked();
                 PersistDifferentialModelLocked();
                 PersistIncidentsLocked();

@@ -16,7 +16,8 @@ public static class ConfidenceHistoryTests
 {
     const string Header = "timestamp_utc,gpu_uuid,input_voltage_v,voltage_timestamp_utc," +
         "analysis_power_w,analysis_power_source,voltage_source,bin_w,reference_v,status," +
-        "electrical_source,electrical_freshness_kind,analysis_load_unit,acquisition_health\n";
+        "electrical_source,electrical_freshness_kind,analysis_load_unit,acquisition_health," +
+        "reference_identity_json,driver_approval_unvalidated\n";
 
     public static void Run(Action<bool, string> report)
     {
@@ -33,6 +34,8 @@ public static class ConfidenceHistoryTests
         CompressedHistoryMatchesPlainAndArchiveConversion(report);
         AcceptedReferenceReplayUsesCurrentModel(report);
         AcceptedReferenceReplayPreservesGatesAndGzip(report);
+        AcceptedReplayKeepsVerifiedHistoryAcrossDriverTransitions(report);
+        LegacyDailyHeaderCarriesUpgradeEvidence(report);
     }
 
     /// <summary>
@@ -575,6 +578,190 @@ public static class ConfidenceHistoryTests
         finally { DeleteTemporaryDirectory(directory); }
     }
 
+    static void AcceptedReplayKeepsVerifiedHistoryAcrossDriverTransitions(
+        Action<bool, string> report)
+    {
+        string directory = TemporaryDirectory("accepted-driver-continuity");
+        try
+        {
+            DateTimeOffset now = new(2037, 2, 20, 12, 0, 0, TimeSpan.Zero);
+            DateTimeOffset day = UtcDay(now.AddDays(-2));
+            const string gpu = "GPU-A";
+            string acceptedIdentity = DirectIdentityJson("616.92", gpu);
+            string rootIdentity = DirectIdentityJson("617.42", gpu);
+            WriteDriverTransitionReference(directory, rootIdentity,
+                acceptedIdentity, state: "REFERENCE_INVALID",
+                compatibility: "MISMATCH");
+
+            var rows = Rows(day.AddHours(1), 12.0, 11.9, 5, gpu,
+                    DirectSource(gpu, "616.92"), status: "NO_SHIFT_DETECTED",
+                    identityJson: acceptedIdentity, driverUnvalidated: false)
+                .Concat(Rows(day.AddHours(2), 12.0, 11.9, 5, gpu,
+                    DirectSource(gpu, "617.42"), status: "NO_SHIFT_DETECTED",
+                    identityJson: rootIdentity, driverUnvalidated: false))
+                .Concat(Rows(day.AddHours(3), 12.0, 11.9, 5, gpu,
+                    DirectSource(gpu, "617.42"), status: "NO_SHIFT_DETECTED",
+                    identityJson: DirectIdentityJson("617.42", gpu,
+                        abiProfile: "A612-A613-v2"), driverUnvalidated: false))
+                .Concat(Rows(day.AddHours(4), 12.0, 11.9, 5, gpu,
+                    DirectSource(gpu, "617.42"), status: "NO_SHIFT_DETECTED",
+                    identityJson: DirectIdentityJson("617.42", gpu,
+                        binWatts: 50), driverUnvalidated: false))
+                .Concat(Rows(day.AddHours(5), 12.0, 11.9, 5, gpu,
+                    DirectSource(gpu, "617.42"), status: "NO_SHIFT_DETECTED",
+                    identityJson: rootIdentity, driverUnvalidated: true))
+                .Concat(Rows(day.AddHours(6), 12.0, 11.9, 5, "GPU-B",
+                    DirectSource("GPU-B", "617.42"), status: "NO_SHIFT_DETECTED",
+                    identityJson: DirectIdentityJson("617.42", "GPU-B"),
+                    driverUnvalidated: false))
+                .Concat(Rows(day.AddHours(7), 12.0, 11.9, 5, gpu,
+                    DirectSource(gpu, "617.42"), status: "NO_SHIFT_DETECTED",
+                    identityJson: "{malformed", driverUnvalidated: false));
+            WriteRows(directory, day, rows);
+
+            var history = new ConfidenceHistory(directory,
+                Path.Combine(directory, "confidence-replay-history.json"), 25,
+                replayAcceptedReference: true);
+            history.RefreshAsync(now).GetAwaiter().GetResult();
+
+            var scored = history.Days.Where(record => record.ObservationCount > 0).ToArray();
+            report(scored.Length == 1 && scored[0].ObservationCount == 10 &&
+                scored[0].MedianDropMv is double drop && Math.Abs(drop - 100) < .001 &&
+                scored[0].Cohort.Contains("GPU-A | direct NVIDIA rails", StringComparison.Ordinal) &&
+                !scored[0].Cohort.Contains("driver 616.92", StringComparison.Ordinal) &&
+                !scored[0].Cohort.Contains("driver 617.42", StringComparison.Ordinal),
+                "invalid current lifecycle still replays the frozen accepted model and joins two approved driver runs");
+            report(history.Status.Contains("matched 10", StringComparison.OrdinalIgnoreCase),
+                "verified cross-driver history reports all matched accepted rows");
+            string oldSelection = "GPU-A | " + DirectSource(gpu, "616.92") +
+                " | CONNECTOR_POWER | W|bin=425W";
+            report(MainWindow.MigrateConfidenceCohort(oldSelection,
+                    history.Days.Select(record => record.Cohort)) == scored[0].Cohort,
+                "saved driver-bearing comparison selection migrates to its exact canonical cohort");
+            report(MainWindow.MigrateConfidenceCohort(oldSelection, new[] { "GPU-B|bin=425W" }) == oldSelection,
+                "unmatched saved comparison selection stays unchanged");
+        }
+        finally { DeleteTemporaryDirectory(directory); }
+    }
+
+    static void LegacyDailyHeaderCarriesUpgradeEvidence(Action<bool, string> report)
+    {
+        string directory = TemporaryDirectory("legacy-header-driver-evidence");
+        try
+        {
+            DateTimeOffset now = new(2037, 2, 20, 12, 0, 0, TimeSpan.Zero);
+            DateTimeOffset day = UtcDay(now.AddDays(-2));
+            string accepted = DirectIdentityJson("616.92", "GPU-A");
+            string upgraded = DirectIdentityJson("617.42", "GPU-A");
+            WriteDriverTransitionReference(directory, upgraded, accepted,
+                "REFERENCE_ACCEPTED", "RESTART");
+            string[] headers = new string[42];
+            for (int index = 0; index < headers.Length; index++) headers[index] = "unused_" + index;
+            headers[0] = "timestamp_utc"; headers[1] = "gpu_uuid";
+            headers[3] = "input_voltage_v"; headers[4] = "voltage_timestamp_utc";
+            headers[5] = "analysis_power_w"; headers[6] = "analysis_power_source";
+            headers[10] = "voltage_source"; headers[12] = "bin_w";
+            headers[13] = "reference_v"; headers[17] = "status";
+            headers[24] = "electrical_source"; headers[25] = "electrical_freshness_kind";
+            headers[28] = "analysis_load_unit"; headers[29] = "acquisition_health";
+            headers[41] = "sample_age_seconds";
+            string RowWithExtension(DateTimeOffset time, bool unvalidated)
+            {
+                var cells = new string[44];
+                Array.Fill(cells, "");
+                cells[0] = cells[4] = time.ToString("O"); cells[1] = "GPU-A";
+                cells[3] = "11.9"; cells[5] = cells[12] = "425";
+                cells[6] = "CONNECTOR_POWER"; cells[10] = cells[24] = DirectSource("GPU-A", "617.42");
+                cells[13] = "12"; cells[17] = "NO_SHIFT_DETECTED";
+                cells[25] = "VerifiedSourceTimestamp"; cells[28] = "W";
+                cells[29] = "HEALTHY"; cells[42] = upgraded;
+                cells[43] = unvalidated.ToString();
+                return string.Join(",", cells.Select(value => "\"" + value.Replace("\"", "\"\"") + "\"")) + "\n";
+            }
+            string path = Path.Combine(directory, $"telemetry-{day:yyyy-MM-dd}.csv");
+            string original = string.Join(",", headers) + "\n" +
+                string.Concat(Enumerable.Range(0, 5).Select(index => RowWithExtension(day.AddHours(1).AddSeconds(index), false))) +
+                string.Concat(Enumerable.Range(0, 5).Select(index => RowWithExtension(day.AddHours(2).AddSeconds(index), true)));
+            File.WriteAllText(path, original);
+            var history = new ConfidenceHistory(directory, Path.Combine(directory, "cache.json"), 25,
+                replayAcceptedReference: true);
+            history.RefreshAsync(now).GetAwaiter().GetResult();
+            report(history.Days.Sum(record => record.ObservationCount) == 5 && File.ReadAllText(path) == original,
+                "existing daily header reads appended upgrade identity and bypass flags without rewriting telemetry");
+            var point = TelemetryStore.ParseSample(headers,
+                TelemetryStore.ParseCsv(RowWithExtension(day.AddHours(1), false).TrimEnd('\n')));
+            report(point?.SourceIdentity.Contains("driver 617.42", StringComparison.Ordinal) == false,
+                "live telemetry reader recognizes identity appended under an older daily header");
+        }
+        finally { DeleteTemporaryDirectory(directory); }
+    }
+
+    static string DirectSource(string gpu, string driver) =>
+        $"direct NVIDIA rails (PCIe +12V and 12VHPWR; A612/A613; driver {driver}; UUID {gpu})";
+
+    static string DirectIdentityJson(string driver, string gpu,
+        string abiProfile = "A612-A613-v1", int binWatts = 25) =>
+        System.Text.Json.JsonSerializer.Serialize(new
+        {
+            identity_version = 1,
+            gpu_uuid = gpu,
+            board = "NVIDIA-target-2B8510DE-89EE1043",
+            driver,
+            source = DirectSource(gpu, driver),
+            abi_profile = abiProfile,
+            analysis_load_source = "CONNECTOR_POWER",
+            feature_version = "electrical-v1",
+            model_version = "trend-v1",
+            schema_version = 3,
+            qualification = new
+            {
+                bin_watts = binWatts,
+                min_analysis_watts = 100,
+                stable_samples = 5,
+                baseline_samples = 20,
+                window_samples = 10,
+                window_max_age_seconds = 1800,
+                max_age_seconds = 5,
+                sample_seconds = 1,
+                shift_volts = .2,
+                sudden_droop_volts = .25,
+                sustain_samples = 1,
+                load_boundary_hysteresis_watts = 0,
+                coarse_confirmation_seconds = 0,
+                coarse_confirmation_samples = 1,
+                gross_under_voltage_v = (double?)null,
+                gross_over_voltage_v = (double?)null,
+            },
+        });
+
+    static void WriteDriverTransitionReference(string directory,
+        string rootIdentityJson, string acceptedIdentityJson,
+        string state, string compatibility)
+    {
+        using var root = System.Text.Json.JsonDocument.Parse(rootIdentityJson);
+        using var accepted = System.Text.Json.JsonDocument.Parse(acceptedIdentityJson);
+        string json = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            schema_version = 1,
+            state,
+            compatibility,
+            identity = root.RootElement,
+            accepted = new
+            {
+                identity = accepted.RootElement,
+                bins = new Dictionary<string, object>
+                {
+                    ["425"] = new { reference_volts = 12.0, is_qualified = true },
+                },
+                accepted_at_utc = "2037-01-01T00:00:00Z",
+                accepted_by = "fixture",
+                acceptance_note = "",
+            },
+        });
+        File.WriteAllText(Path.Combine(directory, "reference.json"), json,
+            new UTF8Encoding(false));
+    }
+
     static void ConvertTelemetryToGzip(string directory, DateTimeOffset day)
     {
         string plain = Path.Combine(directory,
@@ -644,10 +831,12 @@ public static class ConfidenceHistoryTests
     static RowSpec[] Rows(DateTimeOffset start, double reference,
         double voltage, int count, string gpu = "GPU-A", string electrical = "connector",
         string loadSource = "CONNECTOR_POWER", string unit = "W", string health = "HEALTHY",
-        string freshness = "VerifiedSourceTimestamp", string status = "NO_SHIFT_DETECTED") =>
+        string freshness = "VerifiedSourceTimestamp", string status = "NO_SHIFT_DETECTED",
+        string identityJson = "", bool? driverUnvalidated = null) =>
         Enumerable.Range(0, count).Select(index => start.AddSeconds(index))
             .Select(time => new RowSpec(time, voltage, reference, gpu, electrical,
-            loadSource, unit, health, freshness, status)).ToArray();
+            loadSource, unit, health, freshness, status, identityJson,
+            driverUnvalidated)).ToArray();
 
     static RowSpec[] QualifyingRows(DateTimeOffset start, double reference,
         double voltage) => Enumerable.Range(0, 10)
@@ -656,16 +845,21 @@ public static class ConfidenceHistoryTests
 
     static string Row(RowSpec row) =>
         Row(row.Time, row.Voltage, row.Reference, row.Gpu, row.Electrical,
-            row.LoadSource, row.Unit, row.Health, row.Freshness, row.Status);
+            row.LoadSource, row.Unit, row.Health, row.Freshness, row.Status,
+            row.IdentityJson, row.DriverUnvalidated);
 
     static string Row(DateTimeOffset time, double voltage, double reference,
         string gpu, string electrical, string loadSource, string unit,
-        string health, string freshness, string status = "NO_SHIFT_DETECTED") =>
+        string health, string freshness, string status = "NO_SHIFT_DETECTED",
+        string identityJson = "", bool? driverUnvalidated = null) =>
         string.Join(',', time.ToString("O", CultureInfo.InvariantCulture), gpu,
             voltage.ToString("R", CultureInfo.InvariantCulture),
             time.ToString("O", CultureInfo.InvariantCulture), "425", loadSource,
             electrical, "425", reference.ToString("R", CultureInfo.InvariantCulture),
-            status, electrical, freshness, unit, health) + "\n";
+            status, electrical, freshness, unit, health) + "," +
+            (identityJson.Length == 0 ? "" : "\"" + identityJson.Replace("\"", "\"\"",
+                StringComparison.Ordinal) + "\"") + "," +
+            (driverUnvalidated?.ToString().ToLowerInvariant() ?? "") + "\n";
 
     static void WriteRows(string directory, DateTimeOffset sensorTime,
         IEnumerable<RowSpec> rows, string suffix = "")
@@ -682,7 +876,7 @@ public static class ConfidenceHistoryTests
     {
         string binJson = string.Join(",", bins.Select(bin =>
             $"\"{bin.Bin}\":{{\"reference_volts\":{bin.Reference.ToString("R", CultureInfo.InvariantCulture)},\"is_qualified\":true}}"));
-        string json = $"{{\"schema_version\":1,\"state\":\"REFERENCE_ACCEPTED\",\"compatibility\":\"RESTART\",\"identity\":{{\"gpu_uuid\":\"{gpuUuid}\",\"source\":\"{source}\",\"analysis_load_source\":\"{loadSource}\",\"qualification\":{{\"bin_watts\":25}}}},\"accepted\":{{\"identity\":{{\"gpu_uuid\":\"{gpuUuid}\",\"source\":\"{source}\",\"analysis_load_source\":\"{loadSource}\",\"qualification\":{{\"bin_watts\":25}}}},\"bins\":{{{binJson}}},\"accepted_at_utc\":\"2036-01-01T00:00:00Z\"}}}}";
+        string json = $"{{\"schema_version\":1,\"state\":\"REFERENCE_ACCEPTED\",\"compatibility\":\"RESTART\",\"identity\":{{\"gpu_uuid\":\"{gpuUuid}\",\"source\":\"{source}\",\"analysis_load_source\":\"{loadSource}\",\"qualification\":{{\"bin_watts\":25}}}},\"accepted\":{{\"identity\":{{\"gpu_uuid\":\"{gpuUuid}\",\"source\":\"{source}\",\"analysis_load_source\":\"{loadSource}\",\"qualification\":{{\"bin_watts\":25}}}},\"bins\":{{{binJson}}},\"accepted_at_utc\":\"2036-01-01T00:00:00Z\",\"accepted_by\":\"fixture\"}}}}";
         File.WriteAllText(Path.Combine(directory, "reference.json"), json,
             new UTF8Encoding(false));
     }
@@ -704,5 +898,6 @@ public static class ConfidenceHistoryTests
 
     readonly record struct RowSpec(DateTimeOffset Time, double Voltage,
         double Reference, string Gpu, string Electrical, string LoadSource,
-        string Unit, string Health, string Freshness, string Status = "NO_SHIFT_DETECTED");
+        string Unit, string Health, string Freshness, string Status = "NO_SHIFT_DETECTED",
+        string IdentityJson = "", bool? DriverUnvalidated = null);
 }

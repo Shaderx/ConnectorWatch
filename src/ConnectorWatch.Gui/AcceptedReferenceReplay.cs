@@ -21,15 +21,23 @@ internal sealed class AcceptedReferenceReplay
     readonly string gpuUuid;
     readonly string source;
     readonly string loadSource;
+    readonly double acceptedBinWatts;
+    readonly double currentBinWatts;
+    readonly MeasurementIdentitySnapshot? measurementIdentity;
     readonly IReadOnlyDictionary<int, double> bins;
     int appliedRows;
 
     AcceptedReferenceReplay(string gpuUuid, string source, string loadSource,
+        double acceptedBinWatts, double currentBinWatts,
+        MeasurementIdentitySnapshot? measurementIdentity,
         IReadOnlyDictionary<int, double> bins, string cacheKey)
     {
         this.gpuUuid = gpuUuid;
         this.source = source;
         this.loadSource = loadSource;
+        this.acceptedBinWatts = acceptedBinWatts;
+        this.currentBinWatts = currentBinWatts;
+        this.measurementIdentity = measurementIdentity;
         this.bins = bins;
         CacheKey = cacheKey;
     }
@@ -39,9 +47,9 @@ internal sealed class AcceptedReferenceReplay
     public int BinCount => bins.Count;
 
     /// <summary>
-    /// Loads the current accepted model.  A missing, malformed, unaccepted, or
-    /// incompatible model is returned as a failure so retrospective callers
-    /// can fail closed instead of showing a stale replay.
+    /// Loads the frozen accepted model independently of the current lifecycle
+    /// state. The lifecycle can be pending, degraded, or invalid while the
+    /// accepted snapshot remains valid historical evidence.
     /// </summary>
     public static bool TryLoad(string path, double binWatts,
         out AcceptedReferenceReplay? replay, out string error)
@@ -69,17 +77,21 @@ internal sealed class AcceptedReferenceReplay
                 return false;
             }
 
-            if (!TryString(document.RootElement, "state", out var state) ||
-                !string.Equals(state, "REFERENCE_ACCEPTED", StringComparison.OrdinalIgnoreCase))
+            if (!TryInt(document.RootElement, "schema_version", out int schemaVersion) ||
+                schemaVersion != 1 ||
+                !TryString(document.RootElement, "state", out var state) ||
+                state.ToUpperInvariant() is not ("REFERENCE_UNVERIFIED" or
+                    "REFERENCE_ACCEPTED" or "REFERENCE_STALE" or "REFERENCE_INVALID"))
             {
-                error = "accepted reference is not in REFERENCE_ACCEPTED state";
+                error = "accepted reference lifecycle schema or state is invalid";
                 return false;
             }
 
             if (!TryString(document.RootElement, "compatibility", out var compatibility) ||
-                compatibility is not ("COMPATIBLE" or "RESTART"))
+                compatibility.ToUpperInvariant() is not ("LEGACY" or "COMPATIBLE" or
+                    "MISMATCH" or "DEGRADED" or "RESTART"))
             {
-                error = "accepted reference is missing a compatible lifecycle state" +
+                error = "accepted reference lifecycle compatibility is invalid" +
                     (compatibility.Length == 0 ? "" : " (" + compatibility + ")");
                 return false;
             }
@@ -102,10 +114,16 @@ internal sealed class AcceptedReferenceReplay
 
             if (!TryObject(identity, "qualification", out var qualification) ||
                 !TryNumber(qualification, "bin_watts", out var persistedBinWatts) ||
-                !double.IsFinite(persistedBinWatts) || persistedBinWatts <= 0 ||
-                Math.Abs(persistedBinWatts - binWatts) > 1e-9)
+                !double.IsFinite(persistedBinWatts) || persistedBinWatts <= 0)
             {
-                error = "accepted reference bin width is incompatible";
+                error = "accepted reference bin width is invalid";
+                return false;
+            }
+
+            if (!TryString(accepted, "accepted_by", out _) ||
+                !TryString(accepted, "accepted_at_utc", out _))
+            {
+                error = "accepted reference has no frozen acceptance record";
                 return false;
             }
 
@@ -139,8 +157,10 @@ internal sealed class AcceptedReferenceReplay
                 CanonicalObject(binsElement);
             string cacheKey = Convert.ToHexString(SHA256.HashData(
                 Encoding.UTF8.GetBytes(canonical)));
+            MeasurementIdentityCompatibility.TryParse(identity,
+                out var measurementIdentity);
             replay = new AcceptedReferenceReplay(gpuUuid, source, loadSource,
-                bins, cacheKey);
+                persistedBinWatts, binWatts, measurementIdentity, bins, cacheKey);
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or
@@ -153,15 +173,47 @@ internal sealed class AcceptedReferenceReplay
 
     /// <summary>Applies one accepted value when all replay identity gates match.</summary>
     public bool TryApply(string rowGpuUuid, string rowSource, string rowLoadSource,
-        string rowLoadUnit, int? rowBin, out double reference)
+        string rowLoadUnit, int? rowBin, string? rowIdentityJson,
+        bool? rowDriverUnvalidated, out double reference,
+        out string canonicalSourceIdentity)
     {
         reference = default;
-        if (!string.Equals(rowGpuUuid, gpuUuid, StringComparison.OrdinalIgnoreCase) ||
-            !string.Equals(rowSource, source, StringComparison.Ordinal) ||
-            !string.Equals(rowLoadSource, loadSource, StringComparison.Ordinal) ||
-            !string.Equals(rowLoadUnit, "W", StringComparison.OrdinalIgnoreCase) ||
-            !rowBin.HasValue || !bins.TryGetValue(rowBin.Value, out reference))
+        canonicalSourceIdentity = "";
+        if (!string.Equals(rowLoadSource, loadSource, StringComparison.Ordinal) ||
+            !rowBin.HasValue ||
+            !MeasurementIdentityCompatibility.MatchesTelemetrySource(gpuUuid,
+                source, loadSource, rowGpuUuid, rowSource, rowLoadSource,
+                rowLoadUnit, out var legacySourceIdentity,
+                out var acceptedDriver, out var rowDriver))
             return false;
+
+        bool hasRowIdentity = MeasurementIdentityCompatibility.TryParse(
+            rowIdentityJson, out var rowMeasurement);
+        if (!hasRowIdentity && !string.IsNullOrWhiteSpace(rowIdentityJson))
+            return false;
+        if (measurementIdentity is not null && hasRowIdentity)
+        {
+            if (!MeasurementIdentityCompatibility.MatchesMeasurement(
+                    measurementIdentity, rowMeasurement!) ||
+                rowDriverUnvalidated == true && measurementIdentity.IsDirectNvidia &&
+                    !string.Equals(measurementIdentity.Driver, rowMeasurement!.Driver,
+                        StringComparison.Ordinal))
+                return false;
+            canonicalSourceIdentity = measurementIdentity.CanonicalSourceKey;
+        }
+        else
+        {
+            // Old CSV files do not carry qualification and profile identity.
+            // Keep their prior gates when the active bin width still matches.
+            if (Math.Abs(currentBinWatts - acceptedBinWatts) > 1e-9 ||
+                rowDriverUnvalidated == true && acceptedDriver.Length > 0 &&
+                    rowDriver.Length > 0 && !string.Equals(acceptedDriver, rowDriver,
+                        StringComparison.Ordinal))
+                return false;
+            canonicalSourceIdentity = legacySourceIdentity;
+        }
+
+        if (!bins.TryGetValue(rowBin.Value, out reference)) return false;
 
         appliedRows++;
         return true;
@@ -191,6 +243,17 @@ internal sealed class AcceptedReferenceReplay
                 value = property.Value.GetString()?.Trim() ?? "";
                 return value.Length > 0;
             }
+        return false;
+    }
+
+    static bool TryInt(JsonElement parent, string name, out int value)
+    {
+        value = default;
+        if (parent.ValueKind != JsonValueKind.Object) return false;
+        foreach (var property in parent.EnumerateObject())
+            if (string.Equals(property.Name, name, StringComparison.OrdinalIgnoreCase))
+                return property.Value.ValueKind == JsonValueKind.Number &&
+                    property.Value.TryGetInt32(out value);
         return false;
     }
 

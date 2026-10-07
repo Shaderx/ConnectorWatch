@@ -86,6 +86,66 @@ public static class ReferenceLifecycleTests
             recovered.Lifecycle.Snapshot().CanAnalyze,
             "matching healthy restart recovers a previously stale accepted model");
 
+        var acceptedDriver = DriverIdentity("616.92");
+        var approvedDriver = DriverIdentity("617.42");
+        var nextApprovedDriver = DriverIdentity("618.00");
+        var acceptedDriverLifecycle = new ReferenceLifecycle(acceptedDriver, now);
+        Check(acceptedDriverLifecycle.SetCandidate(Candidate(acceptedDriver, now, 12.1, 12.0)).Succeeded &&
+            acceptedDriverLifecycle.AcceptCandidate(now, "operator").Succeeded,
+            "direct NVIDIA fixture accepted before driver upgrade");
+        var acceptedDriverJson = ReferencePersistence.Serialize(acceptedDriverLifecycle);
+        Check(acceptedDriver.MatchesCritical(acceptedDriver) &&
+            !approvedDriver.MatchesCritical(acceptedDriver),
+            "strict reference identity still includes driver version");
+        var unapprovedTransition = ReferencePersistence.Load(acceptedDriverJson, approvedDriver, now,
+            new ReferenceStartupContext(AllowVerifiedDriverContinuity: false));
+        Check(unapprovedTransition.Compatibility == ReferenceCompatibility.MISMATCH &&
+            unapprovedTransition.Lifecycle.State == ReferenceLifecycleState.REFERENCE_INVALID,
+            "driver transition without verified approval remains invalid");
+        var approvedTransition = ReferencePersistence.Load(acceptedDriverJson, approvedDriver, now,
+            new ReferenceStartupContext(AllowVerifiedDriverContinuity: true));
+        Check(approvedTransition.Compatibility == ReferenceCompatibility.COMPATIBLE &&
+            approvedTransition.Lifecycle.State == ReferenceLifecycleState.REFERENCE_ACCEPTED &&
+            approvedTransition.Lifecycle.Accepted?.Identity.Driver == "616.92" &&
+            approvedTransition.Lifecycle.Accepted.Bins[425].ReferenceVolts == 12.1,
+            "approved driver transition retains the frozen accepted reference");
+        var secondTransition = ReferencePersistence.Load(acceptedDriverJson, nextApprovedDriver, now,
+            new ReferenceStartupContext(AllowVerifiedDriverContinuity: true));
+        Check(secondTransition.Lifecycle.Snapshot().CanAnalyze &&
+            secondTransition.Lifecycle.Accepted?.Identity.Driver == "616.92",
+            "accepted reference remains available across successive approved driver versions");
+
+        var invalidatedTransition = ReferencePersistence.Load(acceptedDriverJson, approvedDriver, now);
+        var recoveredTransition = ReferencePersistence.Load(
+            ReferencePersistence.Serialize(invalidatedTransition.Lifecycle), approvedDriver, now,
+            new ReferenceStartupContext(AllowVerifiedDriverContinuity: true));
+        Check(invalidatedTransition.Lifecycle.State == ReferenceLifecycleState.REFERENCE_INVALID &&
+            recoveredTransition.Lifecycle.State == ReferenceLifecycleState.REFERENCE_ACCEPTED &&
+            recoveredTransition.Lifecycle.Accepted?.Identity.Driver == "616.92",
+            "verified approval recovers the known driver-mismatch invalidation without rewriting accepted identity");
+        var unrelatedInvalid = new ReferenceLifecycle(approvedDriver,
+            ReferencePersistence.Deserialize(ReferencePersistence.Serialize(invalidatedTransition.Lifecycle)), now,
+            new ReferenceStartupContext(AllowVerifiedDriverContinuity: true));
+        unrelatedInvalid.MarkInvalid(now, "unrelated structural invalidation");
+        var unrelatedInvalidReload = ReferencePersistence.Load(
+            ReferencePersistence.Serialize(unrelatedInvalid), approvedDriver, now,
+            new ReferenceStartupContext(AllowVerifiedDriverContinuity: true));
+        Check(unrelatedInvalidReload.Lifecycle.State == ReferenceLifecycleState.REFERENCE_INVALID,
+            "verified approval does not recover an unrelated invalid lifecycle state");
+        Check(!new ReferenceLifecycle(approvedDriver, now).SetCandidate(
+                Candidate(acceptedDriver, now, 12.1, 12.0)).Succeeded,
+            "strict candidate identity rejects a pre-upgrade driver candidate");
+        Check(ReferencePersistence.Load(acceptedDriverJson,
+                DriverIdentity("617.42", abiProfile: "A612-A613-v2"), now,
+                new ReferenceStartupContext(AllowVerifiedDriverContinuity: true)).Compatibility ==
+            ReferenceCompatibility.MISMATCH,
+            "verified driver continuity does not allow ABI profile changes");
+        Check(ReferencePersistence.Load(acceptedDriverJson,
+                DriverIdentity("617.42", loadSource: AnalysisLoadSource.NVML_BOARD_POWER), now,
+                new ReferenceStartupContext(AllowVerifiedDriverContinuity: true)).Compatibility ==
+            ReferenceCompatibility.MISMATCH,
+            "verified driver continuity does not allow load source changes");
+
         var mismatchIdentity = Identity(AnalysisLoadSource.NVML_BOARD_POWER);
         var mismatch = ReferencePersistence.Load(persistedJson, mismatchIdentity, now);
         Check(mismatch.Compatibility == ReferenceCompatibility.MISMATCH &&
@@ -211,6 +271,21 @@ public static class ReferenceLifecycleTests
                 windowMaxAgeSeconds: 1800,
                 maxAgeSeconds: 5,
                 sampleSeconds: 1));
+
+    static ReferenceIdentity DriverIdentity(string driver,
+        AnalysisLoadSource loadSource = AnalysisLoadSource.CONNECTOR_POWER,
+        string abiProfile = "A612-A613-v1") =>
+        ReferenceIdentity.Create(
+            gpuUuid: "GPU-00000000-0000-0000-0000-000000000001",
+            board: "ASUS-TUF-RTX-5090",
+            driver: driver,
+            source: $"direct NVIDIA rails (NVIDIA-SMI; driver {driver}; UUID GPU-00000000-0000-0000-0000-000000000001)",
+            abiProfile: abiProfile,
+            analysisLoadSource: loadSource,
+            featureVersion: "electrical-v1",
+            modelVersion: "trend-v1",
+            schemaVersion: 3,
+            qualification: Identity(loadSource).Qualification);
 
     static ReferenceCandidateModel Candidate(ReferenceIdentity identity,
         DateTimeOffset atUtc, double referenceVolts, double p05Volts) =>

@@ -23,7 +23,7 @@ public sealed class ConfidenceHistory
     // 97-day retained window gives it the preceding context at the boundary.
     public const int HistoryDays = 97;
     public static readonly TimeSpan CheckpointInterval = TimeSpan.FromMinutes(30);
-    const int CacheSchemaVersion = 4;
+    const int CacheSchemaVersion = 5;
     const int MaximumCsvRecordCharacters = 262_144;
     const int MaximumRowsPerDay = 2_000_000;
     const long MaximumCacheBytes = 64L * 1024 * 1024;
@@ -504,7 +504,8 @@ public sealed class ConfidenceHistory
         {
             if (headers is null)
             {
-                headers = TelemetryStore.ParseCsv(record).Select((name, index) => (name, index))
+                headers = TelemetryStore.ExtendLegacyIdentityHeaders(
+                    TelemetryStore.ParseCsv(record)).Select((name, index) => (name, index))
                     .GroupBy(item => NormalizeHeader(item.name)).ToDictionary(group => group.Key, group => group.First().index);
                 continue;
             }
@@ -523,9 +524,12 @@ public sealed class ConfidenceHistory
                         observation.ElectricalSource,
                         observation.AnalysisPowerSource,
                         observation.LoadUnit,
-                        observation.Bin, out var acceptedReference))
+                        observation.Bin, observation.ReferenceIdentityJson,
+                        observation.DriverApprovalUnvalidated,
+                        out var acceptedReference, out var canonicalSourceIdentity))
                 {
                     observation.Reference = acceptedReference;
+                    observation.SourceIdentity = canonicalSourceIdentity;
                     if (string.Equals(observation.Status?.Trim(),
                             "LEARNING_REFERENCE", StringComparison.OrdinalIgnoreCase))
                         observation.Status = "LOAD_QUALIFIED";
@@ -609,6 +613,8 @@ public sealed class ConfidenceHistory
         string electrical = FirstNonEmpty(Get("electrical_source"), Get("voltage_source"));
         string loadSource = Get("analysis_power_source", "analysis_load_source");
         string loadUnit = Get("analysis_load_unit", "load_unit");
+        bool? driverUnvalidated = bool.TryParse(Get("driver_approval_unvalidated"),
+            out bool unvalidated) ? unvalidated : null;
         observation = new RawObservation
         {
             HostTime = host,
@@ -627,6 +633,8 @@ public sealed class ConfidenceHistory
             FreshnessKind = FirstNonEmpty(Get("electrical_freshness_kind", "freshness_kind"), "Unknown"),
             AcquisitionHealth = FirstNonEmpty(Get("acquisition_health", "health"), "Unknown"),
             LoadUnit = NormalizeIdentity(loadUnit),
+            ReferenceIdentityJson = Get("reference_identity_json"),
+            DriverApprovalUnvalidated = driverUnvalidated,
         };
         return true;
     }
@@ -1070,6 +1078,8 @@ public sealed class ConfidenceHistory
         public string FreshnessKind { get; set; } = "Unknown";
         public string AcquisitionHealth { get; set; } = "Unknown";
         public string LoadUnit { get; set; } = "Unknown";
+        public string ReferenceIdentityJson { get; set; } = "";
+        public bool? DriverApprovalUnvalidated { get; set; }
     }
 
     sealed class CachedFile
