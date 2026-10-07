@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "proposal_status": "maintainer_review_required",
+  "evidence_sha256": "8cb00d22101ca67c1f0796b55607d14f7b4f85da3fed962dc54bbd5bf819e373",
+  "scope_sha256": "dbd016bde93eba1c9859e0edd86cc990fbc7c34bfa6b05feef3f32396093d539",
+  "proposed_entry": {
+    "vendor_id": "10DE",
+    "device_id": "2B85",
+    "subsystem_id": "89EE1043",
+    "os": "windows",
+    "architecture": "x64",
+    "driver_version": "617.42",
+    "reader_profile": "A612-A613-v1",
+    "minimum_reader_version": "1.0.0",
+    "maximum_reader_version_exclusive": "1.1.0",
+    "minimum_app_version": "1.5.7",
+    "maximum_app_version_exclusive": "2.0.0",
+    "decision": "approved",
+    "evidence_sha256": "8cb00d22101ca67c1f0796b55607d14f7b4f85da3fed962dc54bbd5bf819e373",
+    "decision_utc": "2026-10-07T06:51:13Z",
+    "rationale": "Validated native structure and independent idle/workload rail comparisons; maintainer authorization pending."
+  }
+}
