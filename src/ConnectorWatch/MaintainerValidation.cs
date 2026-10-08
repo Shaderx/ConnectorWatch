@@ -197,7 +197,7 @@ public sealed class DriverCatalogEntryProposal
     public string Decision { get; set; } = "approved";
     public string EvidenceSha256 { get; set; } = "";
     public DateTimeOffset DecisionUtc { get; set; }
-    public string Rationale { get; set; } = "Validated native structure and independent idle/workload rail comparisons; maintainer authorization pending.";
+    public string Rationale { get; set; } = "Validated native structure, independent idle/workload rail comparisons, sensor response, and timing.";
 }
 
 public sealed record BootstrapDriverApproval(
