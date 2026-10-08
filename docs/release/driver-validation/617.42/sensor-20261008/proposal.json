@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "proposal_status": "maintainer_review_required",
+  "evidence_sha256": "6eb8407f7311ada444d26b80e46ce67c4991f2e82fbba06e3bbba3c81054e303",
+  "scope_sha256": "edc911b2d89bb19143bfee6e37fd7d03c4fe2812944075a355fc9636a5ea3968",
+  "proposed_entry": {
+    "vendor_id": "10DE",
+    "device_id": "2B85",
+    "subsystem_id": "89EE1043",
+    "os": "windows",
+    "architecture": "x64",
+    "driver_version": "617.42",
+    "reader_profile": "A612-A613-v1",
+    "minimum_reader_version": "1.0.0",
+    "maximum_reader_version_exclusive": "1.1.0",
+    "minimum_app_version": "1.5.11",
+    "maximum_app_version_exclusive": "2.0.0",
+    "decision": "approved",
+    "evidence_sha256": "6eb8407f7311ada444d26b80e46ce67c4991f2e82fbba06e3bbba3c81054e303",
+    "decision_utc": "2026-10-08T09:19:08Z",
+    "rationale": "Validated native structure, independent idle/workload rail comparisons, sensor response, and timing."
+  }
+}
