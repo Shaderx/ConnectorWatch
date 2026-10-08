@@ -60,6 +60,12 @@ public static class TelemetryPhaseOneTests
             !AcquisitionHealth.FromElectricalSample(hostOnlyElectrical, t0, true, false,
                 sensorCharacterized: true).FreshnessKnown,
             "host-only timestamp keeps freshness uncertainty visible");
+        var validatedHostOnly = AcquisitionHealth.FromElectricalSample(hostOnlyElectrical, t0, true, false,
+            sensorCharacterized: true, hostTimingVerified: true);
+        Check(validatedHostOnly.Status == AcquisitionHealthStatus.HEALTHY &&
+            validatedHostOnly.HostTimingVerified && !validatedHostOnly.FreshnessKnown &&
+            validatedHostOnly.SourceTimestampUtc is null,
+            "signed host timing validation is separate from native timestamp certainty");
         var futureElectrical = freshElectrical with
         {
             Freshness = FreshnessMetadata.SourceTimestamp(t0.AddSeconds(1), t0, 5)

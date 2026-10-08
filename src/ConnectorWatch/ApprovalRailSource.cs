@@ -52,6 +52,7 @@ public sealed class ApprovalRailSource : IElectricalSource, IDisposable
         state = Decision.State.ToString(), detail = Decision.Reason,
         driver_version = DriverVersion, catalog_revision = Decision.CatalogRevision,
         expires_utc = Decision.Expires, unvalidated = Decision.IsUnvalidated,
+        sensor_validation = Decision.SensorValidation,
         last_checked_utc = approvals.LastCheckedUtc, last_error = approvals.LastError,
     };
 

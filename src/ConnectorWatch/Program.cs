@@ -1022,6 +1022,7 @@ public static class Program
                 ShadowReviewSchedulerTests.Run();
                 return 0;
             }
+            if (DifferentialModelRepairCommand.TryHandle(args, out var repairExit)) return repairExit;
             if (ShadowPredictionCommand.TryHandle(args, out var predictionExit)) return predictionExit;
             if (ReleaseSignatureVerificationCommand.TryHandle(args, out var signatureExit)) return signatureExit;
             if (ReleaseTrustPreparation.TryRun(args, out var trustExit)) return trustExit;
@@ -1394,6 +1395,34 @@ public static class Program
                             AutoAcceptReference: enabled);
                     }
 
+                    if (command == "import-differential-model-repair")
+                    {
+                        if (!lifecycle.Snapshot().CanAnalyze || lifecycle.Accepted is null)
+                            return new(false, "An active accepted reference is required before model repair import.",
+                                lifecycle.State.WireName());
+                        if (string.IsNullOrWhiteSpace(request.Note))
+                            return new(false, "The repair candidate path is required.",
+                                lifecycle.State.WireName());
+                        try
+                        {
+                            var imported = DifferentialModelRepairCommand.ImportPackage(
+                                request.Note, differentialModelPath,
+                                Path.Combine(data, "differential-model-repair-receipt.json"),
+                                lifecycle.Accepted, differentialRuntime.Artifact,
+                                differentialOptions, now);
+                            differentialRuntime.Load(imported);
+                            differentialModelDetail = null;
+                            return new(true, "Fitted differential model repair imported.",
+                                lifecycle.State.WireName());
+                        }
+                        catch (Exception ex) when (ex is IOException or InvalidDataException or
+                            ArgumentException or FormatException or NotSupportedException or
+                            JsonException or UnauthorizedAccessException)
+                        {
+                            return new(false, ex.Message, lifecycle.State.WireName());
+                        }
+                    }
+
                     ReferenceOperationResult operation;
                     if (command is "accept-reference" or "migrate-reference")
                     {
@@ -1700,6 +1729,7 @@ public static class Program
                     electrical.Freshness.Kind != FreshnessKind.Unavailable &&
                     (!electrical.Freshness.AgeSeconds.HasValue ||
                      electrical.Freshness.AgeSeconds is double sampleAge && sampleAge >= 0 && double.IsFinite(sampleAge));
+                var sensorValidation = directSource?.Decision.SensorValidation ?? SensorValidationSnapshot.NotRun();
                 var acquisition = AcquisitionHealth.Evaluate(new AcquisitionHealthInput(
                     MonitorRunning: terminalFailure is null,
                     SourceConfigured: voltageSource is not null,
@@ -1708,14 +1738,15 @@ public static class Program
                     Fresh: electrical?.Freshness.IsFresh == true,
                     PowerAvailable: analysisPower.HasValue,
                     NativeFailure: terminalFailure is not null && voltageSource?.TerminalOnFailure == true,
-                    SensorCharacterized: false,
+                    SensorCharacterized: sensorValidation.EvidenceState == "VERIFIED" && sensorValidation.ResponseState == "PASS",
                     AnalysisAvailable: analyzed,
                     HostTimestampUtc: now,
                     SourceTimestampUtc: electrical?.Freshness.SourceTimestampUtc,
                     SampleAgeSeconds: electrical?.Freshness.AgeSeconds,
                     Source: voltageSource?.Description ?? "",
                     Detail: detail,
-                    FreshnessVerified: electrical?.Freshness.TimestampVerified == true),
+                    FreshnessVerified: electrical?.Freshness.TimestampVerified == true,
+                    HostTimingVerified: sensorValidation.EvidenceState == "VERIFIED" && sensorValidation.TimingState == "PASS"),
                     detectorAvailability);
                 string analysisPowerSource = analysisLoadSource.WireName();
                 string row = Csv.Line(now.ToString("O"), c.GpuUuid, g.Power, v?.Volts, v?.Timestamp.ToString("O"), analysisPower,

@@ -33,32 +33,39 @@ the change under the existing profile.
    worktree at that commit. Keep existing untracked data intact. The validator
    rejects a dirty source tree.
 3. Record an independent HWiNFO oracle for the exact GPU. Include idle and
-   workload phases with at least two paired samples each. Each sample must
+   workload phases with at least two unique paired samples each. Each sample must
    include independent voltage and current for PCIe +12 V and 12VHPWR. Use the
    existing workspace recorder at `W:/Monitoring/GPU/tools/HwinfoOracle`, outside
    the ConnectorWatch worktree. Its `--all-readings-for-sensor-id E0002000` option
    inspects the confirmed dGPU sensor; confirm the parent sensor identity before
    using its readings. Keep raw recorder output, timestamps, sensor labels, units,
    phase boundaries, and pairing notes outside the source worktree. Build the
-   `-OracleInput` JSON in the shape documented in `MAINTAINER-APPROVALS.md`; pair
-   each HWiNFO measurement with its corresponding guarded A613 response from the
-   same stable phase. The recorder's raw JSONL is not this oracle input. If current is
-   derived from independent HWiNFO power and voltage, record that derivation and
-   its provenance. Never derive independent values from the native reader or fill
-   missing readings. If either rail lacks an independent voltage or current
-   basis, stop without approval.
+   `-OracleInput` JSON in the shape documented in `MAINTAINER-APPROVALS.md`. Set
+   `pairing_provenance` to the confirmed HWiNFO shared-memory sensor, sensor ID,
+   pairing method, units, and current derivation. Each sample must include a
+   unique `pair_id`, the native A613 timestamp, the HWiNFO reading timestamp, the
+   HWiNFO header poll timestamp, and the HWiNFO polling period in milliseconds.
+   Pair each reading with its guarded A613 response from the same stable phase.
+   The recorder's raw JSONL is not this oracle input. Never derive independent
+   values from the native reader or fill missing readings. If either rail lacks
+   an independent voltage or current basis, stop without approval.
 4. Close HWiNFO and other hardware-monitoring tools. Run
    `scripts/Validate-Driver.ps1` in the clean worktree with `-GpuUuid`,
-   `-AcknowledgePrivateProbe`, the approved metadata response hash, and
-   `-OracleInput` for the recorded oracle. Follow the command example in
-   `MAINTAINER-APPROVALS.md` and write output outside the source worktree.
+   `-AcknowledgePrivateProbe`, the approved metadata response hash,
+   `-Samples 12`, `-IntervalMilliseconds 1000`, and `-OracleInput` for the
+   recorded oracle. Follow the command example in `MAINTAINER-APPROVALS.md` and
+   write output outside the source worktree.
 5. Review the paired readings, their provenance, phase timing, and the recorded
    tolerances. Confirm the agent's full verification decision is PASS. Continue
    only if the command exits successfully, `evidence.json` has outcome
    `full_validation_passed`, every check and all four phase/rail comparisons
-   pass, and `proposal.json` exists with decision `approved`. Verify its
-   evidence and scope digests. Structural passes, failed checks, missing
-   proposals, and revoked decisions end this route.
+   pass, `sensor_validation.response.passed` and
+   `sensor_validation.timing.passed` are both `true`, and `proposal.json` exists
+   with decision `approved`. Check the recorded current rise, pair coverage,
+   sample count and span, mean interval, variance, standard deviation, maximum
+   deviation, read duration, pair separation, and HWiNFO header age. Verify the
+   proposal's evidence and scope digests. Structural passes, failed checks,
+   missing proposals, and revoked decisions end this route.
 
 ## Prepare and publish
 
@@ -103,10 +110,11 @@ the change under the existing profile.
 12. Wait for completion. Download the immutable release payload and envelope,
     plus the `catalog-current.json` discovery asset. Verify the envelope with
     the pinned key and confirm the discovery bytes equal the immutable envelope.
-    Confirm the payload digest equals the prepared digest and its published
-    entry exactly matches the proposed decision, scope, ranges, and evidence
-    hash. Confirm the workflow commit adds only the two transport files and has
-    the tested commit as parent.
+    Download each approved entry's `evidence-<sha256>.json` asset from both
+    catalog releases and verify its exact digest. Confirm the payload digest
+    equals the prepared digest and its published entry exactly matches the
+    proposed decision, scope, ranges, and evidence hash. Confirm the workflow
+    commit adds only the two transport files and has the tested commit as parent.
 13. Refresh driver approval in the installed app. Confirm acquisition resumes
     and the accepted baseline, model, and historical comparison retain their
     provenance and continuity. If an older app requires archival solely for a

@@ -170,6 +170,13 @@ jobs:
           }
           $assets = @('artifacts/driver-catalog/catalog.payload.json', 'artifacts/driver-catalog/catalog.envelope.json')
           if (Test-Path -LiteralPath 'artifacts/driver-catalog/driver-approval-attestation.json') { $assets += 'artifacts/driver-catalog/driver-approval-attestation.json' }
+          $payload = Get-Content -Raw -LiteralPath 'artifacts/driver-catalog/catalog.payload.json' | ConvertFrom-Json -Depth 40
+          foreach ($entry in $payload.entries | Where-Object { $_.decision -eq 'approved' }) {
+            $evidenceAsset = "artifacts/driver-catalog/evidence-$($entry.evidence_sha256).json"
+            if (-not (Test-Path -LiteralPath $evidenceAsset -PathType Leaf)) { throw "Approved evidence asset is missing: $evidenceAsset" }
+            $assets += $evidenceAsset
+          }
+          $assets = @($assets | Select-Object -Unique)
           gh release upload $tag @assets --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Could not upload immutable catalog assets; discovery remains unchanged.' }
           gh release edit $tag --draft=false --latest=false
@@ -187,5 +194,13 @@ jobs:
             gh release create $pointerTag --target $env:GITHUB_SHA --title 'ConnectorWatch driver catalog discovery' --notes 'Mutable discovery pointer. Clients authenticate the referenced immutable envelope and enforce monotonic revisions.' --latest=false
             if ($LASTEXITCODE -ne 0) { throw 'Could not create catalog discovery release.' }
           }
-          gh release upload $pointerTag artifacts/driver-catalog/catalog-current.json --clobber
+          $assets = @('artifacts/driver-catalog/catalog-current.json')
+          $payload = Get-Content -Raw -LiteralPath 'artifacts/driver-catalog/catalog.payload.json' | ConvertFrom-Json -Depth 40
+          foreach ($entry in $payload.entries | Where-Object { $_.decision -eq 'approved' }) {
+            $evidenceAsset = "artifacts/driver-catalog/evidence-$($entry.evidence_sha256).json"
+            if (-not (Test-Path -LiteralPath $evidenceAsset -PathType Leaf)) { throw "Approved evidence asset is missing: $evidenceAsset" }
+            $assets += $evidenceAsset
+          }
+          $assets = @($assets | Select-Object -Unique)
+          gh release upload $pointerTag @assets --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Could not publish the catalog discovery alias.' }

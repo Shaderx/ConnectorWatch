@@ -69,7 +69,8 @@ public sealed class DriverApprovalDecision
 
     internal DriverApprovalDecision(DriverApprovalState state, bool mayStart, string reason,
         long catalogRevision, DateTimeOffset? expires, bool isUnvalidated,
-        DriverIdentity identity, string profile, string readerVersion, string appVersion)
+        DriverIdentity identity, string profile, string readerVersion, string appVersion,
+        SensorValidationSnapshot? sensorValidation = null)
     {
         State = state;
         MayStart = mayStart;
@@ -81,6 +82,7 @@ public sealed class DriverApprovalDecision
         _profile = profile;
         _readerVersion = readerVersion;
         _appVersion = appVersion;
+        SensorValidation = sensorValidation ?? SensorValidationSnapshot.NotRun();
     }
 
     public DriverApprovalState State { get; }
@@ -89,6 +91,7 @@ public sealed class DriverApprovalDecision
     public long CatalogRevision { get; }
     public DateTimeOffset? Expires { get; }
     public bool IsUnvalidated { get; }
+    public SensorValidationSnapshot SensorValidation { get; }
 
     public void RequireApplicable(DriverIdentity identity, string profile, string readerVersion,
         string appVersion, DateTimeOffset? now = null)

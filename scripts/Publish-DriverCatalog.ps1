@@ -96,6 +96,7 @@ if ($BootstrapAttestationPath) {
 }
 
 $entriesByScope = [ordered]@{}
+$evidenceSourcesByDigest = @{}
 if ($PreviousEnvelopePath) {
     $previous = Read-VerifiedPreviousPayload ([IO.Path]::GetFullPath($PreviousEnvelopePath)) $PreviousKeySpkiBase64 $PreviousKeyId
     if ($previous.payload_type -ne 'connectorwatch-driver-catalog' -or $previous.schema_version -ne 1) {
@@ -113,6 +114,7 @@ $proposalPropertyNames = @('schema_version', 'proposal_status', 'evidence_sha256
 $entryPropertyNames = @('vendor_id', 'device_id', 'subsystem_id', 'os', 'architecture', 'driver_version',
     'reader_profile', 'minimum_reader_version', 'maximum_reader_version_exclusive', 'minimum_app_version',
     'maximum_app_version_exclusive', 'decision', 'evidence_sha256', 'decision_utc', 'rationale')
+$projectPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../src/ConnectorWatch/ConnectorWatch.csproj'))
 
 if ($BootstrapAttestationPath) {
     $attestationPath = [IO.Path]::GetFullPath($BootstrapAttestationPath)
@@ -128,6 +130,7 @@ if ($BootstrapAttestationPath) {
     }
     $attestation = [Text.Encoding]::UTF8.GetString($attestationBytes) | ConvertFrom-Json -Depth 40
     $attestationHash = Get-Sha256Hex $attestationBytes
+    $evidenceSourcesByDigest[$attestationHash] = $attestationBytes
     # ConvertFrom-Json can materialize UTC strings as DateTime. Parsing its
     # culture-formatted string would discard Kind and apply the host zone twice.
     $approvalUtc = Get-UtcTimestamp $attestation.approval_utc
@@ -179,9 +182,13 @@ foreach ($proposalInput in $ProposalPaths) {
         if ($evidence.schema_version -ne 1 -or $evidence.evidence_type -ne 'connectorwatch-driver-validation' -or
             $evidence.outcome -ne 'full_validation_passed' -or @($evidence.checks | Where-Object { -not $_.passed }).Count -ne 0 -or
             @($evidence.independent_comparisons).Count -ne 4 -or
-            @($evidence.independent_comparisons | Where-Object { -not $_.passed }).Count -ne 0) {
+            @($evidence.independent_comparisons | Where-Object { -not $_.passed }).Count -ne 0 -or
+            $evidence.PSObject.Properties.Name -notcontains 'sensor_validation') {
             throw "Approval evidence is not a complete passing idle/workload validation: $evidencePath"
         }
+        & dotnet run --project $projectPath -c Release --no-launch-profile --no-restore -- --validate-driver-validation-evidence $evidencePath --evidence-sha256 $proposal.evidence_sha256
+        if ($LASTEXITCODE -ne 0) { throw "Approval evidence did not pass the measured sensor response and timing profiles: $evidencePath" }
+        $evidenceSourcesByDigest[$proposal.evidence_sha256] = $evidenceBytes
     } elseif ($evidence.schema_version -ne 1 -or $evidence.evidence_type -ne 'connectorwatch-driver-revocation' -or
         $evidence.outcome -ne 'revocation_supported' -or [string]::IsNullOrWhiteSpace($entry.rationale)) {
         throw "Revocation requires a reason and a connectorwatch-driver-revocation evidence record: $evidencePath"
@@ -221,6 +228,35 @@ $payloadSha256 = Get-Sha256Hex $payloadBytes
 $projectPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../src/ConnectorWatch/ConnectorWatch.csproj'))
 & dotnet run --project $projectPath -c Release --no-launch-profile --no-restore -- --validate-driver-catalog-payload $payloadPath
 if ($LASTEXITCODE -ne 0) { throw 'The shipping catalog parser rejected the proposed payload.' }
+
+$validationDirectory = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../docs/release/driver-validation'))
+$validationEvidencePaths = if (Test-Path -LiteralPath $validationDirectory -PathType Container) {
+    @(Get-ChildItem -LiteralPath $validationDirectory -Filter 'evidence.json' -File -Recurse)
+} else { @() }
+$bootstrapEvidencePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../docs/release/driver-approval-attestation.json'))
+foreach ($approvedEntry in $payload.entries | Where-Object { $_.decision -eq 'approved' }) {
+    $digest = [string]$approvedEntry.evidence_sha256
+    if (-not $evidenceSourcesByDigest.ContainsKey($digest)) {
+        if (Test-Path -LiteralPath $bootstrapEvidencePath -PathType Leaf) {
+            $candidateBytes = [IO.File]::ReadAllBytes($bootstrapEvidencePath)
+            if ((Get-Sha256Hex $candidateBytes) -ceq $digest) {
+                $evidenceSourcesByDigest[$digest] = $candidateBytes
+            }
+        }
+        foreach ($candidate in $validationEvidencePaths) {
+            if ($evidenceSourcesByDigest.ContainsKey($digest)) { break }
+            $candidateBytes = [IO.File]::ReadAllBytes($candidate.FullName)
+            if ((Get-Sha256Hex $candidateBytes) -ceq $digest) {
+                $evidenceSourcesByDigest[$digest] = $candidateBytes
+            }
+        }
+        if (-not $evidenceSourcesByDigest.ContainsKey($digest)) {
+            throw "Approved catalog evidence bytes are missing for digest $digest."
+        }
+    }
+    [IO.File]::WriteAllBytes((Join-Path $outputRoot "evidence-$digest.json"),
+        [byte[]]$evidenceSourcesByDigest[$digest])
+}
 
 $authorizationRequest = [ordered]@{
     schema_version = 1

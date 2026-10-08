@@ -147,6 +147,7 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
                     "migrate-reference" when identityMatches => true,
                     "archive-reference" when identityMatches => true,
                     "set-auto-accept-reference" when identityMatches => true,
+                    "import-differential-model-repair" when identityMatches => true,
                     "acknowledge-incident" when identityMatches &&
                         !string.IsNullOrWhiteSpace(request.IncidentId) => true,
                     "resolve-incident" when identityMatches &&
@@ -155,7 +156,7 @@ public sealed class ControlServer : IDisposable, IAsyncDisposable
                 };
                 referenceCommandRequested = identityMatches && command is
                     ("accept-reference" or "migrate-reference" or "archive-reference" or
-                     "set-auto-accept-reference");
+                     "set-auto-accept-reference" or "import-differential-model-repair");
                 incidentCommandRequested = identityMatches && command is
                     ("acknowledge-incident" or "resolve-incident");
                 stopRequested = ok && command == "stop";

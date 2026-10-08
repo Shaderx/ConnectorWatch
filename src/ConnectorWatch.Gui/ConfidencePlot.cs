@@ -23,7 +23,7 @@ public sealed class ConfidencePlot : Plot
             var time = From.AddSeconds((To - From).TotalSeconds * f);
             var point = Points.MinBy(p => Math.Abs((p.Day.AddHours(12) - time).TotalSeconds))!;
             ToolTip = $"{point.Day:dd MMM yyyy} (UTC day)\n" + (point.Score.HasValue
-                ? $"Degradation confidence: {point.Score:F0}%\n{point.EvidenceDays} comparable days in the previous week\nTypical recorded-reference drop: {point.MedianDropMv:F1} mV\n" + (point.Unverified ? "Sensor timing or reference remains unverified." : "Based on recorded measurement metadata.")
+                ? $"Degradation confidence: {point.Score:F0}%\n{point.EvidenceDays} comparable days in the previous week\nTypical recorded-reference drop: {point.MedianDropMv:F1} mV\n" + (point.Unverified ? "Some observations in this period used host poll time or an unverified reference." : "Based on recorded measurement metadata.")
                 : "No score: " + Reason(point.Reason, point.EvidenceDays));
         };
     }

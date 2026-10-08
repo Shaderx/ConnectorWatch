@@ -142,6 +142,7 @@ public static class Tests
         Check(DesktopAlerts.ShouldNotify("SUDDEN_DROOP") && DesktopAlerts.ShouldNotify("BASELINE_SHIFT") &&
             DesktopAlerts.ShouldNotify("VOLTAGE_UNAVAILABLE") && !DesktopAlerts.ShouldNotify("NO_SHIFT_DETECTED"),
             "desktop alert status filter");
+        DifferentialModelRepairTests.Run();
         ControlServerTests.Run();
         HybridStorageTests.Run();
         TelemetryCompressionTests.Run();

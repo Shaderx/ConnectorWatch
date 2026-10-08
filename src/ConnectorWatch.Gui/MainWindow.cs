@@ -325,7 +325,7 @@ public sealed partial class MainWindow : Window
         if (demo) message = "Synthetic demonstration — charts and warnings below are test data.";
         bannerText.Text = message; bannerText.Foreground = alert ? Palette.Red : !fresh || QualitySummary(s).Length > 0 || store.ReadError.Length > 0 ? Palette.Amber : Palette.Muted;
         banner.Background = Palette.Panel; banner.BorderBrush = alert ? Palette.Red : Palette.Line; banner.BorderThickness = new Thickness(1);
-        powerPath.Text = $"Source path  {SourceLabel(s)}\n16-pin  {FormatValue(s?.ConnectorVoltage ?? s?.Voltage, "V", 3)}  ·  {FormatValue(s?.ConnectorCurrent ?? s?.Current, "A", 2)}  ·  {FormatValue(s?.ConnectorPower ?? (s?.ElectricalSource.Length == 0 ? s?.Power : null), "W", 1)}\nPCIe  {FormatValue(s?.PcieVoltage ?? s?.Pcie, "V", 3)}  ·  {FormatValue(s?.PcieCurrent ?? s?.PcieCurrent, "A", 2)}  ·  {FormatValue(s?.PciePower, "W", 1)}\nSelected analysis load  {FormatValue(s?.AnalysisLoadValue, s?.AnalysisLoadUnit, 1)}  ·  {SourceLabel(s?.AnalysisLoadSource)}  ·  {s?.AnalysisLoadStatus ?? "UNAVAILABLE"}";
+        powerPath.Text = $"Source path  {SourceLabel(s)}\n16-pin  {FormatValue(s?.ConnectorVoltage ?? s?.Voltage, "V", 3)}  ·  {FormatValue(s?.ConnectorCurrent ?? s?.Current, "A", 2)}  ·  {FormatValue(s?.ConnectorPower ?? (s?.ElectricalSource.Length == 0 ? s?.Power : null), "W", 1)}\nPCIe  {FormatValue(s?.PcieVoltage ?? s?.Pcie, "V", 3)}  ·  {FormatValue(s?.PcieCurrent ?? s?.PcieCurrent, "A", 2)}  ·  {FormatValue(s?.PciePower, "W", 1)}\nSelected analysis load  {FormatValue(s?.AnalysisLoadValue, s?.AnalysisLoadUnit, 1)}  ·  {SourceLabel(s?.AnalysisLoadSource)}  ·  {s?.AnalysisLoadStatus ?? "UNAVAILABLE"}\n{SensorValidationText(s)}";
         degradation.Text = QualityDetails(s) + (string.IsNullOrEmpty(s?.ApprovalState) ? "" :
             $"\nDriver {s.DriverVersion} · catalog {s.CatalogRevision?.ToString() ?? "unavailable"} · {s.ApprovalDetail}" +
             $"\nLast approval check: {s.ApprovalCheckedUtc?.ToLocalTime().ToString("g") ?? "not checked"}" +
@@ -499,13 +499,60 @@ public sealed partial class MainWindow : Window
         string quality = QualitySummary(s);
         if (quality.Length > 0) return "Telemetry degraded: " + quality + ".";
         var notes = new List<string>();
-        if (s.ElectricalStatus == "UNVERIFIED" || s.AnalysisLoadStatus == "UNVERIFIED") notes.Add("Sensor update timing is unverified.");
-        if (s.AcquisitionStatus == "SENSOR_UNCHARACTERIZED") notes.Add("Sensor response has not been characterized.");
+        bool responseVerified = s.SensorValidationEvidenceState == "VERIFIED" && s.SensorResponseState == "PASS";
+        bool timingVerified = s.SensorValidationEvidenceState == "VERIFIED" && s.SensorTimingState == "PASS";
+        if (responseVerified && timingVerified)
+            notes.Add("Sensor validation PASS · response PASS · host timing PASS.");
+        else
+        {
+            if (responseVerified) notes.Add("Sensor response verified.");
+            if (timingVerified) notes.Add("Host timing verified.");
+        }
+        if ((s.ElectricalStatus == "UNVERIFIED" || s.AnalysisLoadStatus == "UNVERIFIED") && !timingVerified)
+            notes.Add("Sensor update timing is unverified.");
+        if (s.AcquisitionStatus == "SENSOR_UNCHARACTERIZED" && !responseVerified)
+            notes.Add("Sensor response has not been characterized.");
+        if ((s.SensorResponseState == "FAIL" || s.SensorTimingState == "FAIL" ||
+             s.SensorValidationEvidenceState is "MISSING_EVIDENCE" or "REJECTED") &&
+            !string.IsNullOrWhiteSpace(s.SensorValidationDetail))
+            notes.Add(s.SensorValidationDetail);
         if (s.DifferentialModelState is "" or "UNAVAILABLE") notes.Add("Differential analysis unavailable: no model loaded.");
         else if (!s.DifferentialModelFitted) notes.Add("Differential model is not fitted yet.");
         if (s.ReferenceCompatibility == "LEGACY") notes.Add("Saved reference is unverified; analysis needs an accepted compatible reference.");
         string activity = s.Status == "OUTSIDE_ANALYSIS_RANGE" ? $"Waiting for steady connector load above {minWatts} W." : Friendly(s.Status) + ".";
         return "Receiving telemetry. " + activity + (notes.Count > 0 ? " " + string.Join(" ", notes) : " Aggregate rail readings do not certify connector safety.");
+    }
+    internal static string SensorValidationText(Snapshot? s)
+    {
+        if (s == null || string.IsNullOrWhiteSpace(s.SensorValidationEvidenceState)) return "Sensor validation: not available.";
+        string response = s.SensorResponseState == "PASS" ? "Sensor response verified" :
+            s.SensorResponseState == "FAIL" ? "Sensor response failed" : "Sensor response not verified";
+        string timing = s.SensorTimingState == "PASS" ? "host timing verified" :
+            s.SensorTimingState == "FAIL" ? "host timing failed" : "host timing not verified";
+        if (s.SensorValidationEvidenceState == "LEGACY")
+            return "Sensor validation: this approved entry predates measured response and timing evidence.";
+        if (s.SensorValidationEvidenceState is "MISSING_EVIDENCE" or "REJECTED")
+            return "Sensor validation: " + (string.IsNullOrWhiteSpace(s.SensorValidationDetail)
+                ? "evidence unavailable; refresh driver approvals."
+                : s.SensorValidationDetail);
+        if (s.SensorValidationEvidenceState != "VERIFIED") return "Sensor validation: not evaluated.";
+        string timingMetrics = s.SensorMeanIntervalSeconds is double mean &&
+            s.SensorIntervalStandardDeviationSeconds is double deviation &&
+            s.SensorIntervalVarianceSecondsSquared is double variance
+            ? $"Mean cadence {mean:F3} s · variance {variance:F6} s² · standard deviation {deviation * 1000:F1} ms"
+            : "Measured cadence metrics unavailable";
+        string pairMetrics = s.SensorMaximumPairSeparationSeconds is double pairMaximum
+            ? $" · maximum oracle pair separation {pairMaximum * 1000:F1} ms"
+            : "";
+        string readMetrics = s.SensorMeanReadDurationMilliseconds is double readMean &&
+            s.SensorP95ReadDurationMilliseconds is double readP95 &&
+            s.SensorMaximumReadDurationMilliseconds is double readMaximum
+            ? $" · native read duration mean/P95/max {readMean:F1}/{readP95:F1}/{readMaximum:F1} ms"
+            : "";
+        string basis = s.SensorTimingBasis.Length > 0 ? "Timestamp basis: host observation." : "";
+        string detail = s.SensorResponseState == "FAIL" || s.SensorTimingState == "FAIL"
+            ? " " + s.SensorValidationDetail : "";
+        return $"{response} · {timing}. {timingMetrics}{pairMetrics}{readMetrics}. {basis}{detail}".Trim();
     }
     internal static (string Value, string Caption, string EmptyText) ConfidenceWaitingDisplay(
         IReadOnlyList<ConfidenceDay> days, string cohort, string referenceState = "",
@@ -674,7 +721,7 @@ public sealed partial class MainWindow : Window
             }
             if (confidenceConfigurationError)
                 confidencePlot.EmptyText = "Confidence unavailable: configure a finite positive voltage-shift threshold.";
-            confidenceDetails.Text = (demo ? "Synthetic demonstration." : "EDC retrospective accepted-reference comparison. Historical days are replayed against the current accepted reference; the current UTC day remains provisional.") + "\nApproximate load matching. Each day needs 10 sampled minutes across at least 30 minutes.\nConfidence combines the size, persistence and number of comparable days in the last week.\nThe voltage-drop threshold is " + (config.ShiftVolts * 1000).ToString("F0", CultureInfo.InvariantCulture) + " mV; this policy is not a calibrated failure probability. Sensor freshness may remain unverified. These readings cannot isolate the cause.\n" + (demo ? "" : confidenceHistory?.Status ?? "Waiting for recorded data.");
+            confidenceDetails.Text = (demo ? "Synthetic demonstration." : "EDC retrospective accepted-reference comparison. Historical days are replayed against the current accepted reference; the current UTC day remains provisional.") + "\nApproximate load matching. Each day needs 10 sampled minutes across at least 30 minutes.\nConfidence combines the size, persistence and number of comparable days in the last week.\nThe voltage-drop threshold is " + (config.ShiftVolts * 1000).ToString("F0", CultureInfo.InvariantCulture) + " mV; this policy is not a calibrated failure probability. Historical timestamps and references retain their recorded verification status. These readings cannot isolate the cause.\n" + (demo ? "" : confidenceHistory?.Status ?? "Waiting for recorded data.");
             if (confidenceConfigurationError)
                 confidenceDetails.Text = "Confidence unavailable because ShiftVolts is not finite and positive. The confidence score is an operational evidence summary, not a calibrated failure probability.";
             confidenceDetails.ToolTip = settings.ConfidenceCohort;
@@ -721,7 +768,7 @@ public sealed partial class MainWindow : Window
         electricalTrend.From = from; electricalTrend.To = to;
         electricalTrend.Points = result.Points.Select(p => new TrendPlotPoint(p.Time, p.MedianDropMv, p.P05DropMv, p.P95DropMv,
             p.SegmentId, p.Count, $"{p.Count} unique observations over {p.SpanSeconds:F1}s\nLoad {p.LoadMin:F1}–{p.LoadMax:F1} W\nComparison {p.Reference:F4} V\n" +
-            (p.Unverified ? "Source timing or reference is unverified; count does not imply independent measurements." : "Source-timestamp metadata recorded; count does not imply independent measurements."))).ToArray();
+            (p.Unverified ? "Some observations use host poll time or an unverified reference; count does not imply independent measurements." : "Recorded source timestamps and reference metadata are available; count does not imply independent measurements."))).ToArray();
         electricalTrend.EmptyText = result.Reason switch {
             "NO_DATA" or "NO_LOAD_BIN" => "No comparable loaded observations in this range.",
             "REFERENCE_UNAVAILABLE" => "No recorded reference. Choose Initial observation to compare recorded voltages.",
@@ -730,10 +777,10 @@ public sealed partial class MainWindow : Window
         };
         var latest = result.Points.LastOrDefault(p => p.Supported);
         string band = chosen.HasValue ? $"{chosen}–{chosen + config.BinWatts} W load band" : "No eligible load band";
-        string comparison = initial ? result.AnchorTime.HasValue ? $"Initial observation at {result.AnchorTime.Value.LocalDateTime:HH:mm:ss}; zero is the starting observation" : "Waiting for an initial observation interval" : "Recorded reference; historical reference acceptance is not verified by CSV";
+        string comparison = initial ? result.AnchorTime.HasValue ? $"Initial observation at {result.AnchorTime.Value.LocalDateTime:HH:mm:ss}; zero is the starting observation" : "Waiting for an initial observation interval" : "Recorded reference value; CSV does not include its acceptance record.";
         electricalTrendSummary.Text = band + " · " + comparison + "\n" +
             (latest == null ? electricalTrend.EmptyText : $"Latest interval from {latest.Start.LocalDateTime:HH:mm}: {latest.MedianDropMv:+0.0;-0.0;0.0} mV drop · {latest.Count} observations · {latest.SpanSeconds:F1}s sampled span") +
-            "\nMost recent source context only. One-minute intervals; gaps are disconnected. Source-timing and legacy-reference limitations remain visible in hover details.";
+            "\nMost recent source context only. One-minute intervals; gaps are disconnected. Hover details show recorded observation timing and reference provenance.";
         electricalTrendSummary.ToolTip = "Comparison context (GPU, electrical source, load source, unit):\n" + result.ContextIdentity.Replace(" | ", "\n");
         electricalTrend.InvalidateVisual();
     }
@@ -813,7 +860,7 @@ public sealed partial class MainWindow : Window
         string time = s == null || s.Time == default ? "—" : s.Time.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
         string incidents = s == null ? "—" : $"{s.ActiveIncidentCount} active / {s.IncidentCount} total" + (s.LatestIncidentState.Length > 0 ? $" · latest {s.LatestIncidentState} {s.LatestIncidentStatus}" : "");
         string watchdog = s?.WatchdogAvailable == true ? $"{s.WatchdogStatus} · board {SourceLabel(s.WatchdogBoardStatus)} · read-only {Flag(true, s.WatchdogReadOnly)} · no safety certification {Flag(true, s.WatchdogNoSafetyCertification)}" : "Unavailable";
-        ShowText("Sensor details", $"GPU UUID\n{gpu}\n\nSource path\n{SourceLabel(s)}\nElectrical state\n{s?.ElectricalStatus ?? "UNAVAILABLE"} · freshness {s?.ElectricalFreshnessKind ?? "Unavailable"}\n16-pin  {FormatValue(s?.ConnectorVoltage ?? s?.Voltage, "V", 6)}  ·  {FormatValue(s?.ConnectorCurrent ?? s?.Current, "A", 3)}  ·  {FormatValue(s?.ConnectorPower ?? (s?.ElectricalSource.Length == 0 ? s?.Power : null), "W", 3)}\nPCIe  {FormatValue(s?.PcieVoltage ?? s?.Pcie, "V", 6)}  ·  {FormatValue(s?.PcieCurrent, "A", 3)}  ·  {FormatValue(s?.PciePower, "W", 3)}\nSelected analysis load  {FormatValue(s?.AnalysisLoadValue, s?.AnalysisLoadUnit, 3)} · {SourceLabel(s?.AnalysisLoadSource)} · {s?.AnalysisLoadStatus ?? "UNAVAILABLE"}\n\nModel\nReference {SourceLabel(s?.ReferenceState)} · compatibility {SourceLabel(s?.ReferenceCompatibility)}\nExpected {FormatValue(s?.ExpectedVoltage, "V", 6)} · observed {FormatValue(s?.ObservedVoltage, "V", 6)} · residual {FormatValue(s?.Residual, "V", 6)}\nModel slope {FormatValue(s?.DifferentialModelSlope ?? s?.DifferentialSlope, "V/unit", 6)} · detector {SourceLabel(s?.ResidualDetectorStatus)}\n\nIncidents\n{incidents}\n\nPower-limit watchdog\n{watchdog}\nConfigured limit {FormatValue(s?.WatchdogConfiguredLimit, "W", 1)} · observed limit {FormatValue(s?.WatchdogObservedLimit, "W", 1)} · board power {FormatValue(s?.WatchdogBoardPower ?? s?.BoardPower, "W", 1)}\n\nGPU temperature {FormatValue(s?.Temperature, "°C", 0)}  ·  utilization {FormatValue(s?.Utilization, "%", 0)}  ·  power limit {FormatValue(s?.Limit, "W", 0)}\n\nStatus\n{s?.Status ?? "UNAVAILABLE"}  ·  schema {s?.Schema}\n{s?.AcquisitionStatus} {s?.AcquisitionDetail}\n{s?.Detail}\n\nTimestamps are host polling time unless a verified source timestamp is shown. Native sensor freshness may be unverified. GPU temperature is not connector temperature. These readings do not certify connector safety.\n\nData directory\n{data}");
+        ShowText("Sensor details", $"GPU UUID\n{gpu}\n\nSource path\n{SourceLabel(s)}\nElectrical state\n{s?.ElectricalStatus ?? "UNAVAILABLE"} · freshness {s?.ElectricalFreshnessKind ?? "Unavailable"}\n16-pin  {FormatValue(s?.ConnectorVoltage ?? s?.Voltage, "V", 6)}  ·  {FormatValue(s?.ConnectorCurrent ?? s?.Current, "A", 3)}  ·  {FormatValue(s?.ConnectorPower ?? (s?.ElectricalSource.Length == 0 ? s?.Power : null), "W", 3)}\nPCIe  {FormatValue(s?.PcieVoltage ?? s?.Pcie, "V", 6)}  ·  {FormatValue(s?.PcieCurrent, "A", 3)}  ·  {FormatValue(s?.PciePower, "W", 3)}\nSelected analysis load  {FormatValue(s?.AnalysisLoadValue, s?.AnalysisLoadUnit, 3)} · {SourceLabel(s?.AnalysisLoadSource)} · {s?.AnalysisLoadStatus ?? "UNAVAILABLE"}\n\nModel\nReference {SourceLabel(s?.ReferenceState)} · compatibility {SourceLabel(s?.ReferenceCompatibility)}\nExpected {FormatValue(s?.ExpectedVoltage, "V", 6)} · observed {FormatValue(s?.ObservedVoltage, "V", 6)} · residual {FormatValue(s?.Residual, "V", 6)}\nModel slope {FormatValue(s?.DifferentialModelSlope ?? s?.DifferentialSlope, "V/unit", 6)} · detector {SourceLabel(s?.ResidualDetectorStatus)}\n\nIncidents\n{incidents}\n\nPower-limit watchdog\n{watchdog}\nConfigured limit {FormatValue(s?.WatchdogConfiguredLimit, "W", 1)} · observed limit {FormatValue(s?.WatchdogObservedLimit, "W", 1)} · board power {FormatValue(s?.WatchdogBoardPower ?? s?.BoardPower, "W", 1)}\n\nGPU temperature {FormatValue(s?.Temperature, "°C", 0)}  ·  utilization {FormatValue(s?.Utilization, "%", 0)}  ·  power limit {FormatValue(s?.Limit, "W", 0)}\n\nStatus\n{s?.Status ?? "UNAVAILABLE"}  ·  schema {s?.Schema}\n{s?.AcquisitionStatus} {s?.AcquisitionDetail}\n{s?.Detail}\n\n{SensorValidationText(s)}\nTimestamp basis: {(s?.SensorValidationEvidenceState == "VERIFIED" && s.SensorTimingState == "PASS" ? "host observation; measured cadence is shown above." : "host polling time unless a verified source timestamp is shown. Native sensor freshness may be unverified.")} GPU temperature is not connector temperature. These readings do not certify connector safety.\n\nData directory\n{data}");
     }
     static string Flag(bool available, bool value) => available ? value ? "yes" : "no" : "—";
     void ShowSettings()

@@ -5,8 +5,8 @@ param(
     [Parameter(Mandatory)] [ValidatePattern('^[0-9a-fA-F]{64}$')] [string] $ApprovedMetadataResponseSha256,
     [string] $OracleInput,
     [string] $OutputDirectory = (Join-Path $PSScriptRoot '../artifacts/driver-validation'),
-    [ValidateRange(2, 100)] [int] $Samples = 3,
-    [ValidateRange(0, 10000)] [int] $IntervalMilliseconds = 250,
+    [ValidateRange(2, 100)] [int] $Samples = 12,
+    [ValidateRange(0, 10000)] [int] $IntervalMilliseconds = 1000,
     [ValidateRange(10, 600)] [int] $ChildTimeoutSeconds = 120,
     [ValidateSet('Debug', 'Release')] [string] $Configuration = 'Release'
 )

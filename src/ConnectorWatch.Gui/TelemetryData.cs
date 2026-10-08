@@ -42,6 +42,19 @@ public sealed class Snapshot
     public long? CatalogRevision { get; set; }
     public DateTimeOffset? ApprovalCheckedUtc { get; set; }
     public bool DriverUnvalidated { get; set; }
+    public string SensorValidationEvidenceState { get; set; } = "";
+    public string SensorResponseState { get; set; } = "UNKNOWN";
+    public string SensorTimingState { get; set; } = "UNKNOWN";
+    public string SensorTimingBasis { get; set; } = "";
+    public double? SensorMeanIntervalSeconds { get; set; }
+    public double? SensorIntervalVarianceSecondsSquared { get; set; }
+    public double? SensorIntervalStandardDeviationSeconds { get; set; }
+    public double? SensorMeanPairSeparationSeconds { get; set; }
+    public double? SensorMaximumPairSeparationSeconds { get; set; }
+    public double? SensorMeanReadDurationMilliseconds { get; set; }
+    public double? SensorP95ReadDurationMilliseconds { get; set; }
+    public double? SensorMaximumReadDurationMilliseconds { get; set; }
+    public string SensorValidationDetail { get; set; } = "";
     public string GpuUuid { get; set; } = "";
     public double? Voltage { get; set; }
     public double? Pcie { get; set; }
@@ -169,6 +182,22 @@ public sealed class Snapshot
             s.CatalogRevision = (long?)Num(approval, "catalog_revision");
             s.ApprovalCheckedUtc = Date(approval, "last_checked_utc");
             s.DriverUnvalidated = Bool(approval, "unvalidated");
+            if (TryObject(approval, "sensor_validation", out var sensorValidation))
+            {
+                s.SensorValidationEvidenceState = Str(sensorValidation, "evidence_state");
+                s.SensorResponseState = Str(sensorValidation, "response_state");
+                s.SensorTimingState = Str(sensorValidation, "timing_state");
+                s.SensorTimingBasis = Str(sensorValidation, "timing_basis");
+                s.SensorMeanIntervalSeconds = Num(sensorValidation, "mean_interval_seconds");
+                s.SensorIntervalVarianceSecondsSquared = Num(sensorValidation, "interval_variance_seconds_squared");
+                s.SensorIntervalStandardDeviationSeconds = Num(sensorValidation, "interval_standard_deviation_seconds");
+                s.SensorMeanPairSeparationSeconds = Num(sensorValidation, "mean_pair_separation_seconds");
+                s.SensorMaximumPairSeparationSeconds = Num(sensorValidation, "maximum_pair_separation_seconds");
+                s.SensorMeanReadDurationMilliseconds = Num(sensorValidation, "mean_read_duration_milliseconds");
+                s.SensorP95ReadDurationMilliseconds = Num(sensorValidation, "p95_read_duration_milliseconds");
+                s.SensorMaximumReadDurationMilliseconds = Num(sensorValidation, "maximum_read_duration_milliseconds");
+                s.SensorValidationDetail = Str(sensorValidation, "detail");
+            }
         }
         if (TryObject(r, "voltage", out var v))
         {

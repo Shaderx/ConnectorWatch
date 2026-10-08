@@ -167,7 +167,8 @@ public sealed record AcquisitionHealthInput(
     double? SampleAgeSeconds = null,
     string Source = "",
     string Detail = "",
-    bool FreshnessVerified = true)
+    bool FreshnessVerified = true,
+    bool HostTimingVerified = false)
 {
     public bool FreshnessKnown => FreshnessVerified && TimestampValid;
     public bool CapabilityKnown => SensorCharacterized;
@@ -185,6 +186,7 @@ public sealed record AcquisitionHealthSnapshot(
     [property: JsonPropertyName("fresh")] bool Fresh,
     [property: JsonPropertyName("power_available")] bool PowerAvailable,
     [property: JsonPropertyName("sensor_characterized")] bool SensorCharacterized,
+    [property: JsonPropertyName("host_timing_verified")] bool HostTimingVerified,
     [property: JsonPropertyName("source")] string Source,
     [property: JsonPropertyName("host_timestamp_utc")] DateTimeOffset HostTimestampUtc,
     [property: JsonPropertyName("source_timestamp_utc")] DateTimeOffset? SourceTimestampUtc,
@@ -208,7 +210,7 @@ public static class AcquisitionHealth
             return AcquisitionHealthStatus.SOURCE_UNAVAILABLE;
         if (!input.TimestampValid) return AcquisitionHealthStatus.TIMESTAMP_INVALID;
         if (!input.Fresh) return AcquisitionHealthStatus.STALE;
-        if (!input.FreshnessKnown) return AcquisitionHealthStatus.SENSOR_UNCHARACTERIZED;
+        if (!input.FreshnessKnown && !input.HostTimingVerified) return AcquisitionHealthStatus.SENSOR_UNCHARACTERIZED;
         if (!input.PowerAvailable) return AcquisitionHealthStatus.POWER_UNAVAILABLE;
         if (!input.SensorCharacterized) return AcquisitionHealthStatus.SENSOR_UNCHARACTERIZED;
         return AcquisitionHealthStatus.HEALTHY;
@@ -231,6 +233,7 @@ public static class AcquisitionHealth
             input.Fresh,
             input.PowerAvailable,
             input.SensorCharacterized,
+            input.HostTimingVerified,
             input.Source,
             input.HostTimestampUtc.ToUniversalTime(),
             input.SourceTimestampUtc?.ToUniversalTime(),
@@ -249,7 +252,8 @@ public static class AcquisitionHealth
         bool sensorCharacterized = false,
         bool powerRequired = true,
         string source = "",
-        string detail = "")
+        string detail = "",
+        bool hostTimingVerified = false)
     {
         if (sample is null)
         {
@@ -265,7 +269,8 @@ public static class AcquisitionHealth
                 AnalysisAvailable: analysisAvailable,
                 HostTimestampUtc: hostTimestampUtc,
                 Detail: detail,
-                FreshnessVerified: false), null);
+                FreshnessVerified: false,
+                HostTimingVerified: hostTimingVerified), null);
         }
 
         var sourceName = string.IsNullOrWhiteSpace(source) ? sample.Source : source;
@@ -286,9 +291,10 @@ public static class AcquisitionHealth
             HostTimestampUtc: hostTimestampUtc,
             SourceTimestampUtc: sample.Freshness.SourceTimestampUtc,
             SampleAgeSeconds: sample.Freshness.AgeSeconds,
-            Source: sourceName,
-            Detail: detail,
-            FreshnessVerified: sample.Freshness.TimestampVerified), null);
+                Source: sourceName,
+                Detail: detail,
+            FreshnessVerified: sample.Freshness.TimestampVerified,
+            HostTimingVerified: hostTimingVerified), null);
     }
 
     static double? FiniteOrNull(double? value) =>

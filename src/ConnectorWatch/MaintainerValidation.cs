@@ -46,8 +46,8 @@ public sealed class MaintainerValidationRequest
     public string AppVersion { get; set; } = DirectNvRails.AppVersion;
     public string ToolCommit { get; set; } = "";
     public string ApprovedMetadataResponseSha256 { get; set; } = "";
-    public int SmokeSamples { get; set; } = 3;
-    public int SampleIntervalMilliseconds { get; set; } = 250;
+    public int SmokeSamples { get; set; } = SensorValidationPolicy.MinimumNativeSampleCount;
+    public int SampleIntervalMilliseconds { get; set; } = 1000;
     public MaintainerComparisonOracle? Oracle { get; set; }
 }
 
@@ -65,6 +65,7 @@ public sealed class MaintainerComparisonOracle
     public double VoltageAbsoluteToleranceV { get; set; } = 0.15;
     public double CurrentAbsoluteToleranceA { get; set; } = 1.0;
     public double CurrentRelativeTolerance { get; set; } = 0.10;
+    public MaintainerOraclePairingProvenance? PairingProvenance { get; set; }
     public List<MaintainerOraclePhase> Phases { get; set; } = [];
 }
 
@@ -80,6 +81,11 @@ public sealed class MaintainerOracleSample
     public int NativeReturnCode { get; set; }
     public string GuardStatus { get; set; } = "";
     public bool TimedOut { get; set; }
+    public string PairId { get; set; } = "";
+    public DateTimeOffset? NativeTimestampUtc { get; set; }
+    public DateTimeOffset? IndependentTimestampUtc { get; set; }
+    public DateTimeOffset? SourcePollTimestampUtc { get; set; }
+    public int? SourcePollPeriodMilliseconds { get; set; }
     public MaintainerIndependentReading Pcie12V { get; set; } = new();
     public MaintainerIndependentReading TwelveVHpwr { get; set; } = new();
 }
@@ -101,6 +107,7 @@ public sealed class MaintainerValidationEvidence
     public List<MaintainerSampleEvidence> SampleProgression { get; set; } = [];
     public List<MaintainerComparisonResult> IndependentComparisons { get; set; } = [];
     public List<MaintainerCheck> Checks { get; set; } = [];
+    public SensorValidationEvidence? SensorValidation { get; set; }
     public string Outcome { get; set; } = "failed";
     public string ApprovalAuthority { get; set; } = "none; maintainer review and digest authorization required";
 }
@@ -292,6 +299,7 @@ public static class MaintainerValidationCommand
     public const string CatalogValidationSwitch = "--validate-driver-catalog-payload";
     public const string CatalogEnvelopeValidationSwitch = "--validate-driver-catalog-envelope";
     public const string BootstrapAttestationValidationSwitch = "--validate-driver-approval-attestation";
+    public const string SensorEvidenceValidationSwitch = "--validate-driver-validation-evidence";
     public const string SelfTestSwitch = "--maintainer-validation-self-test";
     private const string ChildTokenEnvironment = "CONNECTORWATCH_MAINTAINER_CHILD_TOKEN";
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -308,6 +316,7 @@ public static class MaintainerValidationCommand
             !args.Contains(ChildSwitch, StringComparer.Ordinal) &&
             !args.Contains(CatalogValidationSwitch, StringComparer.Ordinal) &&
             !args.Contains(CatalogEnvelopeValidationSwitch, StringComparer.Ordinal) &&
+            !args.Contains(SensorEvidenceValidationSwitch, StringComparer.Ordinal) &&
             !args.Contains(BootstrapAttestationValidationSwitch, StringComparer.Ordinal) &&
             !args.Contains(SelfTestSwitch, StringComparer.Ordinal))
         {
@@ -319,6 +328,8 @@ public static class MaintainerValidationCommand
             ? RunSelfTests()
             : args.Contains(CatalogEnvelopeValidationSwitch, StringComparer.Ordinal)
                 ? ValidateCatalogEnvelope(args)
+            : args.Contains(SensorEvidenceValidationSwitch, StringComparer.Ordinal)
+                ? ValidateSensorEvidence(args)
             : args.Contains(BootstrapAttestationValidationSwitch, StringComparer.Ordinal)
                 ? ValidateBootstrapAttestation(args)
             : args.Contains(CatalogValidationSwitch, StringComparer.Ordinal)
@@ -365,6 +376,16 @@ public static class MaintainerValidationCommand
         return 0;
     }
 
+    private static int ValidateSensorEvidence(string[] args)
+    {
+        var path = Path.GetFullPath(RequiredOption(args, SensorEvidenceValidationSwitch));
+        var bytes = File.ReadAllBytes(path);
+        var expectedHash = RequiredOption(args, "--evidence-sha256");
+        var result = SensorValidationPolicy.ValidateStandaloneEvidence(bytes, expectedHash);
+        Console.WriteLine($"Driver validation evidence digest and sensor profiles verified: response {result.ResponseState}, timing {result.TimingState}.");
+        return result.ResponseState == "PASS" && result.TimingState == "PASS" ? 0 : 1;
+    }
+
     private static int RunParent(string[] args)
     {
         var outputRoot = Path.GetFullPath(RequiredOption(args, "--output"));
@@ -385,8 +406,8 @@ public static class MaintainerValidationCommand
             AppVersion = Option(args, "--app-version") ?? DirectNvRails.AppVersion,
             ToolCommit = RequiredOption(args, "--tool-commit"),
             ApprovedMetadataResponseSha256 = RequiredOption(args, "--approved-metadata-sha256").ToLowerInvariant(),
-            SmokeSamples = ParseInt(Option(args, "--samples"), 3, 2, 100),
-            SampleIntervalMilliseconds = ParseInt(Option(args, "--interval-ms"), 250, 0, 10_000),
+            SmokeSamples = ParseInt(Option(args, "--samples"), SensorValidationPolicy.MinimumNativeSampleCount, 2, 100),
+            SampleIntervalMilliseconds = ParseInt(Option(args, "--interval-ms"), 1000, 0, 10_000),
             Oracle = oracle,
         };
         ValidateRequest(request);
@@ -488,9 +509,11 @@ public static class MaintainerValidationCommand
     }
 
     internal static MaintainerValidationEvidence Capture(MaintainerValidationRequest request,
-        IMaintainerNativeProbe probe, string runId)
+        IMaintainerNativeProbe probe, string runId, Func<long>? monotonicTimestampProvider = null,
+        Action<int>? waitBeforeSample = null)
     {
         ValidateRequest(request);
+        monotonicTimestampProvider ??= Stopwatch.GetTimestamp;
         var identity = probe.Identity;
         var evidence = new MaintainerValidationEvidence
         {
@@ -526,14 +549,19 @@ public static class MaintainerValidationCommand
                 Sha256Hex(metadataOperation.Response), StringComparison.OrdinalIgnoreCase),
             "observed A612 response must match the recorded last-approved response digest"));
 
+        var monotonicTimestamps = new List<long>();
         if (metadata is not null)
         {
             for (var index = 0; index < request.SmokeSamples; index++)
             {
                 if (index > 0 && request.SampleIntervalMilliseconds > 0)
-                    Thread.Sleep(request.SampleIntervalMilliseconds);
+                {
+                    if (waitBeforeSample is null) Thread.Sleep(request.SampleIntervalMilliseconds);
+                    else waitBeforeSample(request.SampleIntervalMilliseconds);
+                }
                 var operation = probe.CaptureStatus(metadata.Mask);
                 evidence.NativeOperations.Add(OperationEvidence(operation, identity.GpuUuid));
+                monotonicTimestamps.Add(monotonicTimestampProvider());
                 try
                 {
                     if (!OperationPassed(operation)) throw new InvalidDataException("native status operation did not pass");
@@ -564,10 +592,32 @@ public static class MaintainerValidationCommand
             comparisonsPassed = CompareOracle(request.Oracle, evidence.Scope, metadata,
                 metadataOperation.Response,
                 evidence.IndependentComparisons, evidence.Checks);
+            if (comparisonsPassed)
+            {
+                try
+                {
+                    evidence.SensorValidation = SensorValidationPolicy.Evaluate(evidence.Scope, request.Oracle,
+                        metadata, evidence.IndependentComparisons, evidence.SampleProgression,
+                        evidence.NativeOperations, monotonicTimestamps, request.SampleIntervalMilliseconds);
+                    evidence.Checks.Add(Check("sensor_response_profile", evidence.SensorValidation.Response.Passed,
+                        evidence.SensorValidation.Response.Passed
+                            ? "idle and workload connector current response agrees across native and independent readings"
+                            : "idle/workload connector current response did not meet the minimum excitation and pair coverage"));
+                    evidence.Checks.Add(Check("sensor_timing_profile", evidence.SensorValidation.Timing.Passed,
+                        evidence.SensorValidation.Timing.Passed
+                            ? $"mean {evidence.SensorValidation.Timing.MeanIntervalSeconds:F3} s; standard deviation {evidence.SensorValidation.Timing.IntervalStandardDeviationSeconds * 1000:F1} ms; max deviation {evidence.SensorValidation.Timing.MaximumAbsoluteIntervalDeviationSeconds * 1000:F1} ms"
+                            : "host cadence or oracle pair timing exceeded its measured acceptance limits"));
+                }
+                catch (Exception ex) when (ex is InvalidDataException or FormatException or ArgumentException)
+                {
+                    evidence.Checks.Add(Check("sensor_validation_profile", false, ex.Message));
+                }
+            }
         }
         evidence.Outcome = !structuralPassed || evidence.Checks.Any(c => !c.Passed) ? "failed" :
             request.Oracle is null ? "provisional_structural_smoke_passed" :
-            comparisonsPassed ? "full_validation_passed" : "failed";
+            comparisonsPassed && evidence.SensorValidation is { Response.Passed: true, Timing.Passed: true } &&
+                evidence.Checks.All(c => c.Passed) ? "full_validation_passed" : "failed";
         return evidence;
     }
 
@@ -660,7 +710,8 @@ public static class MaintainerValidationCommand
         string evidenceHash, string scopeHash)
     {
         if (evidence.Outcome != "full_validation_passed" || evidence.Checks.Any(c => !c.Passed) ||
-            evidence.IndependentComparisons.Count != 4 || evidence.IndependentComparisons.Any(c => !c.Passed))
+            evidence.IndependentComparisons.Count != 4 || evidence.IndependentComparisons.Any(c => !c.Passed) ||
+            evidence.SensorValidation is not { Response.Passed: true, Timing.Passed: true })
             throw new InvalidOperationException("Only full passing evidence can produce an approved-entry proposal.");
         var scope = evidence.Scope;
         return new MaintainerApprovalProposal

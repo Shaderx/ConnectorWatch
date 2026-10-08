@@ -54,7 +54,8 @@ public static class ControlServerTests
             Check(release.Ok && !server.AlertsSuppressed, "control release restores alerts");
 
             server.ReferenceCommand = request => new ControlCommandResult(
-                true, request.Operator ?? request.ClientId, "REFERENCE_ACCEPTED");
+                true, request.Command == "import-differential-model-repair"
+                    ? request.Note ?? "" : request.Operator ?? request.ClientId, "REFERENCE_ACCEPTED");
             int refreshes = 0;
             server.ApprovalRefresh = () => { refreshes++; return new(true, "Checking approvals"); };
             Check(!SendAsync(server, new ControlRequest("refresh-driver-approvals", "gui-a", "old-instance"))
@@ -65,6 +66,17 @@ public static class ControlServerTests
                 hello.InstanceId, "operator", "reviewed")).GetAwaiter().GetResult();
             Check(accept.Ok && accept.ReferenceState == "REFERENCE_ACCEPTED" &&
                 accept.Detail == "operator", "identity-bound reference operator command");
+            var repairImport = SendAsync(server, new ControlRequest(
+                "import-differential-model-repair", "gui-a", hello.InstanceId,
+                Note: "candidate.json")).GetAwaiter().GetResult();
+            Check(repairImport.Ok && repairImport.ReferenceState == "REFERENCE_ACCEPTED" &&
+                repairImport.Detail == "candidate.json",
+                "identity-bound differential model repair command");
+            var staleRepairImport = SendAsync(server, new ControlRequest(
+                "import-differential-model-repair", "gui-a", "old-instance",
+                Note: "candidate.json")).GetAwaiter().GetResult();
+            Check(!staleRepairImport.Ok && staleRepairImport.ReferenceState == null,
+                "stale instance cannot import a differential model repair");
             var staleAccept = SendAsync(server, new ControlRequest("accept-reference", "gui-a",
                 "old-instance")).GetAwaiter().GetResult();
             Check(!staleAccept.Ok && staleAccept.ReferenceState == null,

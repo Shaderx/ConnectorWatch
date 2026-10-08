@@ -15,6 +15,8 @@ public sealed class DriverApprovalOptions
     public TimeSpan MaximumRefreshJitter { get; init; } = TimeSpan.FromMinutes(15);
     public int MaximumAttempts { get; init; } = 2;
     public string? BundledCatalogPath { get; init; }
+    public string? BundledSensorValidationDirectory { get; init; }
+    public bool EnableSensorEvidenceLookup { get; init; }
     public TimeSpan ShutdownWaitTimeout { get; init; } = TimeSpan.FromSeconds(3);
 
     internal void Validate()
@@ -59,6 +61,7 @@ public sealed class DriverApprovalService : IDisposable, IAsyncDisposable
     private readonly HttpClient _httpClient;
     private readonly bool _ownsHttpClient;
     private readonly TimeProvider _timeProvider;
+    private readonly SensorValidationEvidenceStore? _sensorEvidence;
     private readonly CancellationTokenSource _dispose = new();
     private Task<DriverCatalogRefreshResult>? _inflightRefresh;
     private Task? _refreshLoop;
@@ -85,6 +88,9 @@ public sealed class DriverApprovalService : IDisposable, IAsyncDisposable
         _timeProvider = timeProvider ?? TimeProvider.System;
         _httpClient = httpClient ?? new HttpClient();
         _ownsHttpClient = httpClient is null;
+        if (options.EnableSensorEvidenceLookup)
+            _sensorEvidence = new SensorValidationEvidenceStore(_dataDirectory,
+                options.BundledSensorValidationDirectory, _httpClient, options.RequestTimeout, _timeProvider);
         Directory.CreateDirectory(_dataDirectory);
         LoadPersistentState();
         _nextRefreshUtc = _timeProvider.GetUtcNow();
@@ -101,6 +107,8 @@ public sealed class DriverApprovalService : IDisposable, IAsyncDisposable
         {
             TrustKeys = DriverCatalogReleaseTrust.Keys,
             BundledCatalogPath = Path.Combine(AppContext.BaseDirectory, "trust", CacheFileName),
+            BundledSensorValidationDirectory = Path.Combine(AppContext.BaseDirectory, "trust", "driver-validation"),
+            EnableSensorEvidenceLookup = true,
         }, httpClient, timeProvider,
             startBackgroundRefresh: startBackgroundRefresh);
 
@@ -196,8 +204,12 @@ public sealed class DriverApprovalService : IDisposable, IAsyncDisposable
             return Decision(state, false, reason, catalog, false,
                 identity, profile, readerVersion, appVersion);
         }
+        var sensorValidation = _sensorEvidence?.Resolve(identity, entry, profile, readerVersion,
+            appVersion, catalog.CatalogRevision, _dispose.Token) ??
+            SensorValidationSnapshot.NotRun(entry.EvidenceSha256, catalog.CatalogRevision,
+                "Sensor validation evidence is not configured in this build.");
         return Decision(DriverApprovalState.Approved, true, entry.Rationale, catalog, false,
-            identity, profile, readerVersion, appVersion);
+            identity, profile, readerVersion, appVersion, sensorValidation);
     }
 
     private DriverApprovalDecision MissingDecision(string reason, DriverApprovalState state,
@@ -215,8 +227,8 @@ public sealed class DriverApprovalService : IDisposable, IAsyncDisposable
 
     private static DriverApprovalDecision Decision(DriverApprovalState state, bool mayStart, string reason,
         DriverCatalog catalog, bool unvalidated, DriverIdentity identity, string profile,
-        string readerVersion, string appVersion) => new(state, mayStart, reason, catalog.CatalogRevision,
-            catalog.ExpiresUtc, unvalidated, identity, profile, readerVersion, appVersion);
+        string readerVersion, string appVersion, SensorValidationSnapshot? sensorValidation = null) => new(state, mayStart, reason, catalog.CatalogRevision,
+            catalog.ExpiresUtc, unvalidated, identity, profile, readerVersion, appVersion, sensorValidation);
 
     private async Task<DriverCatalogRefreshResult> RefreshAndClearAsync()
     {

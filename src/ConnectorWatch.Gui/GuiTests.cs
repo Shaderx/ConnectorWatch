@@ -34,6 +34,25 @@ public static class GuiTests
         Check(approvedDriver.ApprovalState == "Revoked" && approvedDriver.CatalogRevision == 12 &&
             approvedDriver.DriverVersion == "999.99" && approvedDriver.ApprovalCheckedUtc.HasValue,
             "Driver approval diagnostics survive daemon-to-dashboard parsing");
+        var verifiedSensor = Snapshot.Parse("""
+            {"driver_approval":{"sensor_validation":{"evidence_state":"VERIFIED","response_state":"PASS","timing_state":"PASS","timing_basis":"host observation timestamps and independent oracle pairing","mean_interval_seconds":1.002,"interval_variance_seconds_squared":0.000016,"interval_standard_deviation_seconds":0.004,"maximum_pair_separation_seconds":0.795,"mean_read_duration_milliseconds":5.2,"p95_read_duration_milliseconds":7.0,"maximum_read_duration_milliseconds":8.0}},"acquisition":{"status":"HEALTHY","freshness_known":false,"host_timing_verified":true}}
+            """);
+        verifiedSensor.Status = "NO_SHIFT_DETECTED";
+        verifiedSensor.ElectricalStatus = "UNVERIFIED";
+        verifiedSensor.AnalysisLoadStatus = "UNVERIFIED";
+        verifiedSensor.DifferentialModelState = "FITTED";
+        verifiedSensor.DifferentialModelFitted = true;
+        var verifiedSensorText = MainWindow.SensorValidationText(verifiedSensor);
+        var verifiedSensorMessage = MainWindow.StatusMessage(verifiedSensor, true, 100);
+        Check(verifiedSensorText.Contains("Sensor response verified", StringComparison.Ordinal) &&
+            verifiedSensorText.Contains("host timing verified", StringComparison.Ordinal) &&
+            verifiedSensorText.Contains("variance", StringComparison.Ordinal) &&
+            verifiedSensorText.Contains("Timestamp basis: host observation", StringComparison.Ordinal),
+            "GUI presents response PASS, measured host cadence variance, and host-observation provenance");
+        Check(verifiedSensorMessage.Contains("Sensor validation PASS · response PASS · host timing PASS", StringComparison.Ordinal) &&
+            !verifiedSensorMessage.Contains("unverified", StringComparison.OrdinalIgnoreCase) &&
+            !verifiedSensorMessage.Contains("Aggregate rail readings do not certify", StringComparison.Ordinal),
+            "A measured validation PASS replaces the generic timing warning in the live banner");
         approvedDriver.Status = "DRIVER_AWAITING_APPROVAL";
         approvedDriver.ApprovalDetail = "This driver is awaiting maintainer approval.";
         Check(MainWindow.StatusMessage(approvedDriver, true, 100).Contains("awaiting maintainer approval") &&

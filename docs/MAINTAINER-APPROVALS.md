@@ -64,6 +64,9 @@ interfaces:
   -GpuUuid 'GPU-00000000-0000-0000-0000-000000000000' `
   -AcknowledgePrivateProbe `
   -ApprovedMetadataResponseSha256 '<last approved complete A612 SHA-256>' `
+  -OracleInput C:\driver-validation\oracle.json `
+  -Samples 12 `
+  -IntervalMilliseconds 1000 `
   -OutputDirectory C:\driver-validation
 ```
 
@@ -88,12 +91,28 @@ A structural run writes `NO-APPROVAL-PROPOSAL.txt` and has outcome
 
 ## Independent recorded oracle
 
-Full validation adds `-OracleInput <file>`. The oracle is a recorded, paired
+Full validation adds `-OracleInput <file>`. Use `-Samples 12 -IntervalMilliseconds 1000`
+for every approval. The oracle is a recorded, paired
 measurement set from an independent instrument. It must name the exact observed
-scope, contain exactly `idle` and `workload` phases with at least two samples
-per phase, and provide independent voltage/current readings for both PCIe +12 V
-and 12VHPWR. Every pair includes the corresponding guarded raw A613 response,
-so the shipping decoder performs the comparison rather than a parallel parser.
+scope, contain exactly `idle` and `workload` phases with at least two unique
+pairs per phase, and provide independent voltage/current readings for both PCIe
++12 V and 12VHPWR. Every pair includes the corresponding guarded raw A613
+response, so the shipping decoder performs the comparison rather than a parallel
+parser.
+
+Each new approval must pass both sensor-validation profiles. Response PASS
+requires all four existing phase/rail comparisons to pass and the mean native
+and independent 12VHPWR current to rise by at least 5 A from idle to workload.
+Host-timing PASS requires 12 successful native samples across at least 10
+seconds. The requested and measured nominal interval is one second. The sample
+standard deviation must be no more than 100 ms, and the largest interval
+deviation must be no more than 500 ms. Every pair must use a unique identifier
+and distinct native, HWiNFO reading, and HWiNFO header poll timestamps. The
+native and HWiNFO reading timestamps must be within one second. The HWiNFO
+reading timestamp must be at or after its header poll time and no more than its
+poll period plus one second later. The nested `sensor_validation` evidence
+records the exact thresholds, source provenance, metrics, and separate response
+and timing results.
 
 The oracle also records the SHA-256 of the last approved complete A612 response
 in `approved_metadata_response_sha256`. The live A612 response must match it.
@@ -117,6 +136,14 @@ Minimal shape (values are illustrative only):
   "voltage_absolute_tolerance_v": 0.15,
   "current_absolute_tolerance_a": 1.0,
   "current_relative_tolerance": 0.10,
+  "pairing_provenance": {
+    "source_name": "HWiNFO Shared Memory",
+    "sensor_id": "E0002000",
+    "pairing_method": "nearest_unused_by_read_timestamp",
+    "voltage_unit": "V",
+    "power_unit": "W",
+    "current_derivation": "rail_power_divided_by_rail_voltage"
+  },
   "phases": [
     {
       "name": "idle",
@@ -126,12 +153,17 @@ Minimal shape (values are illustrative only):
           "native_return_code": 0,
           "guard_status": "pass",
           "timed_out": false,
+          "pair_id": "idle-001",
+          "native_timestamp_utc": "2026-10-07T12:00:00.000Z",
+          "independent_timestamp_utc": "2026-10-07T12:00:00.100Z",
+          "source_poll_timestamp_utc": "2026-10-07T11:59:59.600Z",
+          "source_poll_period_milliseconds": 500,
           "pcie12_v": { "voltage_v": 12.05, "current_a": 0.50 },
           "twelve_v_hpwr": { "voltage_v": 12.02, "current_a": 1.50 }
         }
       ]
     },
-    { "name": "workload", "samples": ["same object shape; at least two samples"] }
+    { "name": "workload", "samples": ["same object shape; unique pairs; at least two samples"] }
   ]
 }
 ```
@@ -139,7 +171,8 @@ Minimal shape (values are illustrative only):
 The voltage mean must remain within the recorded absolute tolerance. Current
 must remain within either the absolute or relative tolerance. Scope mismatch,
 metadata mismatch, malformed raw responses, failed native operations, missing
-phases, or any failed comparison produces outcome `failed` and no proposal.
+phases, non-unique pairs, stale HWiNFO header timing, or any failed response or
+host-timing comparison produces outcome `failed` and no proposal.
 
 When all structural and independent checks pass, `proposal.json` contains an
 exact `approved` entry wrapped in `proposal_status:

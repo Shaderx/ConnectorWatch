@@ -187,6 +187,22 @@ internal static class StrictJson
         return value;
     }
 
+    public static double RequiredFiniteDouble(JsonElement element, string name)
+    {
+        if (!element.TryGetProperty(name, out var property) || property.ValueKind != JsonValueKind.Number ||
+            !property.TryGetDouble(out var value) || !double.IsFinite(value))
+            throw new InvalidDataException($"Required finite number property '{name}' is missing or malformed.");
+        return value;
+    }
+
+    public static bool RequiredBoolean(JsonElement element, string name)
+    {
+        if (!element.TryGetProperty(name, out var property) ||
+            property.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+            throw new InvalidDataException($"Required boolean property '{name}' is missing or malformed.");
+        return property.GetBoolean();
+    }
+
     public static DateTimeOffset RequiredUtcTimestamp(JsonElement element, string name)
     {
         var text = RequiredString(element, name, 40);
