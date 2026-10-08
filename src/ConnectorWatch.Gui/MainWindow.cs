@@ -691,8 +691,11 @@ public sealed partial class MainWindow : Window
         int binIndex = selected.LastIndexOf("|bin=", StringComparison.Ordinal);
         if (binIndex < 0) return selected;
         var parts = selected[..binIndex].Split(" | ", StringSplitOptions.None);
-        if (parts.Length != 4 || !MeasurementIdentityCompatibility.MatchesTelemetrySource(
-                parts[0], parts[1], parts[2], parts[0], parts[1], parts[2], parts[3],
+        if (parts.Length != 4) return selected;
+        string gpuUuid = parts[0].StartsWith("GPU-", StringComparison.OrdinalIgnoreCase)
+            ? parts[0].ToUpperInvariant() : parts[0];
+        if (!MeasurementIdentityCompatibility.MatchesTelemetrySource(
+                gpuUuid, parts[1], parts[2], gpuUuid, parts[1], parts[2], parts[3],
                 out var canonicalSource, out var acceptedDriver, out _) ||
             acceptedDriver.Length == 0)
             return selected;

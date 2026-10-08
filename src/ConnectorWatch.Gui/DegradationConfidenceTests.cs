@@ -157,6 +157,27 @@ public static class DegradationConfidenceTests
             waitingForSparseDay.Caption.Contains("10 sampled minutes", StringComparison.Ordinal),
             "Sparse day has a distinct exposure explanation");
 
+        const string savedUuid = "gpu-01234567-89ab-cdef-0123-456789abcdef";
+        string currentUuid = savedUuid.ToUpperInvariant();
+        string savedCohort = $"{savedUuid} | direct NVIDIA rails (PCIe +12V and 12VHPWR; A612/A613; driver 616.92; UUID {savedUuid}) | CONNECTOR_POWER | W|bin=200W";
+        string currentCohort = $"{currentUuid} | direct NVIDIA rails (PCIe +12V and 12VHPWR; A612/A613; UUID {currentUuid}) | CONNECTOR_POWER | W|bin=200W";
+        string otherBand = currentCohort.Replace("|bin=200W", "|bin=225W", StringComparison.Ordinal);
+        string migratedCohort = MainWindow.MigrateConfidenceCohort(savedCohort,
+            new[] { currentCohort, otherBand });
+        var savedKeyPoints = DegradationConfidence.Build(
+            new[] { Day(3, 300, cohort: currentCohort), Day(2, 300, cohort: currentCohort),
+                Day(1, 300, cohort: currentCohort) }, savedCohort, now, .2);
+        var migratedKeyPoints = DegradationConfidence.Build(
+            new[] { Day(3, 300, cohort: currentCohort), Day(2, 300, cohort: currentCohort),
+                Day(1, 300, cohort: currentCohort) }, migratedCohort, now, .2);
+        Check(migratedCohort == currentCohort,
+            "Saved driver-version cohort with lowercase UUID migrates to its canonical load cohort");
+        Check(Point(savedKeyPoints, 1).Reason == "MISSING" &&
+            Point(savedKeyPoints, 1).EvidenceDays == 0 &&
+            Point(migratedKeyPoints, 1).Score is > 0 &&
+            Point(migratedKeyPoints, 1).EvidenceDays == 3,
+            "Migrating the saved cohort restores its existing three-day confidence score");
+
         foreach (string status in new[]
         {
             "Retrospective confidence unavailable: accepted reference is missing",
